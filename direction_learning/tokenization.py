@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# CLS and SEP are not used at the moment
 DNA_VOCAB = {
     "PAD": 0,
     "CLS": 1,

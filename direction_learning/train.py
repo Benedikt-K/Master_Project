@@ -4,8 +4,9 @@ import argparse
 import random
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import torch
@@ -86,6 +87,51 @@ def split_groups(examples: list[DirectionExample], seed: int = 13, train_fractio
         "val": [index for group in val_groups for index in grouped_indices[group]],
         "test": [index for group in test_groups for index in grouped_indices[group]],
     }
+
+
+def make_subarray_augment_fn(prob: float = 1.0, seed: int = 42):
+    """Return an augment_fn that deletes a random subset of spacers (preserving order).
+
+    The augment_fn returns either the original example or a new DirectionExample
+    with a subset of spacers/repeats chosen uniformly by size and indices.
+    """
+    rng = random.Random(seed)
+
+    def augment_fn(example: DirectionExample) -> DirectionExample:
+        try:
+            if rng.random() >= float(prob):
+                return example
+
+            n = len(example.spacers)
+            # Nothing to drop if <=1 spacer
+            if n <= 1:
+                return example
+
+            # choose subset size between 1 and n-1 (so we produce a proper subarray)
+            k = rng.randint(1, n - 1)
+            keep_indices = sorted(rng.sample(range(n), k))
+            new_spacers = [example.spacers[i] for i in keep_indices]
+            new_repeats = [example.repeats[i] for i in keep_indices]
+
+            return DirectionExample(
+                array_name=example.array_name,
+                group_name=example.group_name,
+                agreement=example.agreement,
+                evor_direction=example.evor_direction,
+                label=example.label,
+                orientation_variant=example.orientation_variant,
+                source_variant=example.source_variant,
+                spacers=new_spacers,
+                repeats=new_repeats,
+                cas_subtype=example.cas_subtype,
+                left_flank=example.left_flank,
+                right_flank=example.right_flank,
+                source_json=example.source_json,
+            )
+        except Exception:
+            return example
+
+    return augment_fn
 
 
 def stratified_split_by_cas_subtype(
@@ -377,7 +423,7 @@ class DirectionTorchDataset(Dataset if Dataset is not object else object):
     Wraps a DirectionJsonlDataset and provides lazy encoding on-demand during
     iteration, allowing efficient memory usage with large datasets.
     """
-    def __init__(self, base_dataset: DirectionJsonlDataset, indices: list[int], vocab: dict[str, int]):
+    def __init__(self, base_dataset: DirectionJsonlDataset, indices: list[int], vocab: dict[str, int], augment_fn: Callable | None = None):
         """Initialize the PyTorch dataset.
         
         Args:
@@ -389,14 +435,31 @@ class DirectionTorchDataset(Dataset if Dataset is not object else object):
         self.base_dataset = base_dataset
         self.indices = indices
         self.vocab = vocab
+        # augment_fn: Callable that accepts a DirectionExample and returns
+        # either the original or an augmented DirectionExample. Only used
+        # for on-the-fly training augmentation (e.g., spacer-subset deletion).
+        self.augment_fn = augment_fn
 
     def __len__(self) -> int:
         """Return number of examples in this split."""
         return len(self.indices)
 
     def __getitem__(self, index: int) -> dict:
-        """Get and encode a single example by index."""
+        """Get and encode a single example by index.
+
+        Applies `augment_fn` (if present) before encoding so augmentation
+        is applied only at data-loading time.
+        """
         example = self.base_dataset[self.indices[index]]
+        if self.augment_fn is not None:
+            try:
+                aug = self.augment_fn(example)
+                # If augment_fn returns None or something falsy, fall back to original
+                if aug:
+                    example = aug
+            except Exception:
+                # Any augmentation error should not crash data loading; fall back.
+                pass
         return encode_example(example, vocab=self.vocab, include_flanks=self.base_dataset.include_flanks)
 
 
@@ -714,11 +777,42 @@ def main() -> int:
         default=0.0,
         help="Optional fraction of the combined train+test split to hold out as a test set (e.g. 0.1 for 10%%).",
     )
+    parser.add_argument(
+        "--augment_subarrays",
+        action="store_true",
+        help="If set, perform on-the-fly spacer-subset augmentation (train only).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_prob",
+        type=float,
+        default=1.0,
+        help="Per-example probability to apply spacer-subset augmentation (0.0-1.0).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_mode",
+        type=str,
+        default="enumerate",
+        choices=["random", "enumerate"],
+        help="Augmentation mode: 'random' (per-sample random subset) or 'enumerate' (add all subarrays to train set).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_min_spacers",
+        type=int,
+        default=2,
+        help="Minimum number of spacers to keep when enumerating subarrays (default 2).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_max_per_array",
+        type=int,
+        default=256,
+        help="Maximum number of augmented subarrays to add per original array in enumerate mode (default 256; <=0 means unlimited).",
+    )
     args = parser.parse_args()
 
     _require_torch()
 
     base_dataset = DirectionJsonlDataset(args.jsonl, include_flanks=args.include_flanks)
+    base_len = len(base_dataset.records)
     vocab = build_vocab_from_jsonl(args.jsonl)
 
     dataset_label_counts = Counter(example.label for example in base_dataset.records)
@@ -777,7 +871,87 @@ def main() -> int:
 
         val_indices = splits["val"]
 
-    train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab)
+    # Build augmentation function (applied only to training dataset)
+    augment_fn = None
+    if getattr(args, "augment_subarrays", False):
+        if args.augment_subarrays_mode == "random":
+            augment_fn = make_subarray_augment_fn(prob=args.augment_subarrays_prob, seed=args.seed)
+            print(f"Augmentation: random subarray sampling enabled (prob={args.augment_subarrays_prob})")
+        else:
+            # enumerate mode: add a random mix of distinct subarrays per array, up to the cap
+            max_per_array = args.augment_subarrays_max_per_array
+            min_spacers = max(1, args.augment_subarrays_min_spacers)
+            base_rng = random.Random(args.seed)
+            new_indices: list[int] = []
+            orig_train_len = len(train_indices)
+            print(
+                "Augmentation: enumerate mode (randomized order) for "
+                f"{orig_train_len} train examples (min_spacers={min_spacers}, "
+                f"max_per_array={max_per_array if max_per_array > 0 else 'unlimited'})"
+            )
+
+            capped_arrays = 0
+            total_added = 0
+
+            for orig_idx in list(train_indices):
+                ex = base_dataset.records[orig_idx]
+                n = len(ex.spacers)
+                if n <= min_spacers:
+                    continue
+
+                # Randomly sample distinct subarrays until the cap is reached.
+                # This gives a random ordering of subarrays instead of lexicographic enumeration.
+                local_rng = random.Random(base_rng.randint(0, 2**31 - 1))
+                seen: set[tuple[int, ...]] = set()
+                sampled: list[tuple[int, ...]] = []
+                target = max_per_array if max_per_array > 0 else 0
+                max_attempts = max(100, (target if target > 0 else 1) * 50)
+                attempts = 0
+
+                while (target <= 0 or len(sampled) < target) and attempts < max_attempts:
+                    attempts += 1
+                    k = local_rng.randint(min_spacers, n - 1)
+                    keep = tuple(sorted(local_rng.sample(range(n), k)))
+                    if keep not in seen:
+                        seen.add(keep)
+                        sampled.append(keep)
+
+                if target > 0 and len(sampled) >= target:
+                    capped_arrays += 1
+
+                for keep in sampled:
+                    new_spacers = [ex.spacers[i] for i in keep]
+                    new_repeats = [ex.repeats[i] for i in keep]
+                    new_ex = DirectionExample(
+                        array_name=ex.array_name,
+                        group_name=ex.group_name,
+                        agreement=ex.agreement,
+                        evor_direction=ex.evor_direction,
+                        label=ex.label,
+                        orientation_variant=ex.orientation_variant,
+                        source_variant=ex.source_variant,
+                        spacers=new_spacers,
+                        repeats=new_repeats,
+                        cas_subtype=ex.cas_subtype,
+                        left_flank=ex.left_flank,
+                        right_flank=ex.right_flank,
+                        source_json=ex.source_json,
+                    )
+                    base_dataset.records.append(new_ex)
+                    new_indices.append(len(base_dataset.records) - 1)
+                    total_added += 1
+
+            # extend train_indices with new augmented example indices
+            train_indices = list(train_indices) + new_indices
+            cap_note = f"; cap_hit_on={capped_arrays} arrays" if capped_arrays > 0 else ""
+            print(
+                f"Augmentation: enumerate added {total_added} examples to dataset (size {len(base_dataset.records)}; "
+                f"train size {len(train_indices)}{cap_note})"
+            )
+            # No on-the-fly augment_fn used in enumerate mode
+            augment_fn = None
+
+    train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn)
     val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab)
     test_dataset = DirectionTorchDataset(base_dataset, test_indices, vocab) if test_indices else None
 
@@ -786,6 +960,9 @@ def main() -> int:
     train_label_counts = Counter(base_dataset.records[i].label for i in train_indices)
     val_label_counts = Counter(base_dataset.records[i].label for i in val_indices)
     print(f"Label distribution train={dict(train_label_counts)} val={dict(val_label_counts)}")
+    if test_indices:
+        test_label_counts = Counter(base_dataset.records[i].label for i in test_indices)
+        print(f"Label distribution test={dict(test_label_counts)}")
     if len(train_label_counts) < 2 or len(val_label_counts) < 2:
         raise ValueError(
             "Train/validation split contains only a single class."
@@ -826,13 +1003,15 @@ def main() -> int:
             patience_counter += 1
         
         es_marker = " (BEST)" if patience_counter == 0 else (" (STOP)" if patience_counter >= args.early_stopping_patience else "")
+        timestamp = datetime.now().strftime('%H:%M:%S')
         print(
             (
-                "epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f}{es_marker} "
+                "[{timestamp}] epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f}{es_marker} "
                 "val_accuracy={val_accuracy:.4f} val_f1={val_f1:.4f} "
                 "val_pos_rate={val_pos_rate:.4f} val_pred_pos_rate={val_pred_pos_rate:.4f} "
                 "val_majority_baseline_acc={val_baseline:.4f}"
             ).format(
+                timestamp=timestamp,
                 epoch=epoch,
                 train_loss=train_loss,
                 val_loss=val_loss,
