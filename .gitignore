@@ -1,0 +1,18 @@
+# ignore data folders
+crispr_comparison_results/
+out-sp_style_clusters/
+sp_style_clusters/
+output_dataset_10k/
+test_out/
+
+# ignore logs
+logs/
+*.log
+
+# ignore cache
+__pycache__/
+
+# ignore preliminary files
+extraced_arrays.txt
+*.sh
+*.json

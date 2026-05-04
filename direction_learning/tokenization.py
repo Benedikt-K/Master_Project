@@ -13,6 +13,7 @@ DNA_VOCAB = {
     "N": 7,
 }
 
+# Precompute translation table for reverse complement
 DNA_COMPLEMENT = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
 
 
@@ -39,8 +40,7 @@ def normalize_dna(sequence: str) -> str:
     """Normalize DNA sequence to uppercase and replace invalid bases with N.
     
     Converts all bases to uppercase and replaces any non-standard bases
-    (anything not A, C, G, T) with N (ambiguous base). Useful for cleaning
-    sequence input before tokenization.
+    (anything not A, C, G, T) with N (ambiguous base).
     
     Args:
         sequence: DNA sequence string (may contain lowercase, gaps, etc).

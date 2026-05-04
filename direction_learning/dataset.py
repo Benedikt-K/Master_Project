@@ -12,11 +12,11 @@ LABEL_TO_ID = {"Forward": 1, "Reverse": 0}
 
 @dataclass(frozen=True)
 class DirectionExample:
-    """Immutable container for a single CRISPR array direction example.
+    """Immutable container for a single CRISPR array direction data sample.
     
     Stores an ordered array of spacers and repeats along with metadata needed
-    for transformer-based direction prediction. Includes agreement status with
-    CCF/evOr, the true direction label, and optionally flanking sequences.
+    for transformer-based direction prediction. Includes agreement status of
+    CCF and evOr, the predicted direction label of evOr, and optionally flanking sequences.
     """
     array_name: str
     group_name: str
@@ -27,23 +27,23 @@ class DirectionExample:
     source_variant: str
     spacers: list[str]
     repeats: list[str]
-    cas_subtype: str = ""  # CRISPR subtype (e.g., I-F, I-E, I-C) for stratification
+    cas_subtype: str = ""
     left_flank: str = ""
     right_flank: str = ""
     source_json: str = ""
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
-    """Load records from a JSONL file (one JSON object per line).
+    """Load records from a JSONL file.
     
-    Reads a JSONL (JSON Lines) file where each line is a valid JSON object.
+    Reads a JSONL file.
     Skips empty lines and returns a list of dictionaries.
     
     Args:
         path: Path to the JSONL file.
         
     Returns:
-        list[dict[str, Any]]: List of parsed JSON objects (one per line).
+        list[dict[str, Any]]: List of parsed JSON objects.
         
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -65,7 +65,7 @@ def build_vocab_from_jsonl(path: str | Path) -> dict[str, int]:
     Scans all spacer, repeat, and flank sequences in the JSONL file,
     and creates a token-to-ID mapping. Starts with the standard DNA_VOCAB
     (PAD, CLS, SEP, A, C, G, T, N) and assigns new IDs to any additional
-    unique bases encountered.
+    unique "word" encountered.
     
     Args:
         path: Path to the JSONL dataset file.
@@ -166,8 +166,7 @@ def encode_example(
     """Encode a DirectionExample to token sequences and metadata.
     
     Tokenizes all spacers, repeats, and optionally flanks. Returns a
-    dictionary with token lists, lengths, and metadata suitable for
-    batching and model input.
+    dictionary with token lists, lengths, and metadata.
     
     Args:
         example: DirectionExample to encode.

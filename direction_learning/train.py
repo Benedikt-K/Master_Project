@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 
 try:
     import matplotlib
-    matplotlib.use('Agg')  # Use non-interactive backend
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 except ModuleNotFoundError:
     plt = None
@@ -199,9 +199,7 @@ def stratified_train_test_and_val_by_cas_subtype(
 
     This creates a two-way split where approximately `train_test_fraction` of
     each subtype is assigned to the combined train+test set, and the remainder
-    (1 - train_test_fraction) is used for validation. This matches the
-    requested 80/20 allocation where 80% is reserved for training+testing and
-    20% for validation, while preserving subtype proportions.
+    (1 - train_test_fraction) is used for validation.
 
     Args:
         examples: List of DirectionExample objects with `cas_subtype` set.
@@ -576,24 +574,125 @@ def evaluate(model: SpacerDirectionTransformer, loader: Any, loss_fn: Any, devic
     }
 
 
+def evaluate_per_subtype(
+    model: SpacerDirectionTransformer,
+    base_dataset: DirectionJsonlDataset,
+    indices: list[int],
+    vocab: dict[str, int],
+    loss_fn: Any,
+    device: Any,
+    batch_size: int,
+) -> dict[str, dict[str, float]]:
+    """Evaluate test performance separately for each cas_subtype.
+
+    Args:
+        model: Trained model to evaluate.
+        base_dataset: Dataset containing original records and subtype metadata.
+        indices: Dataset indices to evaluate (usually test split).
+        vocab: Token vocabulary used during training.
+        loss_fn: Loss function (unused for subtype metrics but kept for API parity).
+        device: torch.device to run on.
+        batch_size: Batch size for forward passes.
+
+    Returns:
+        Mapping cas_subtype -> metrics dict.
+    """
+    _require_torch()
+    del loss_fn
+
+    import numpy as np
+
+    model.eval()
+    probs_by_subtype: dict[str, list[float]] = {}
+    labels_by_subtype: dict[str, list[float]] = {}
+
+    with torch.no_grad():
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start:start + batch_size]
+            encoded_batch = [
+                encode_example(base_dataset[i], vocab=vocab, include_flanks=base_dataset.include_flanks)
+                for i in batch_indices
+            ]
+            collated = collate_encoded_examples(encoded_batch)
+            tensor_batch = batch_to_tensors(collated)
+            tensor_batch = {key: value.to(device) for key, value in tensor_batch.items()}
+
+            logits = model(tensor_batch)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            labels = tensor_batch["label"].cpu().numpy()
+
+            for dataset_idx, prob, label in zip(batch_indices, probs, labels):
+                subtype = (base_dataset[dataset_idx].cas_subtype or "Unknown").strip() or "Unknown"
+                probs_by_subtype.setdefault(subtype, []).append(float(prob))
+                labels_by_subtype.setdefault(subtype, []).append(float(label))
+
+    metrics_by_subtype: dict[str, dict[str, float]] = {}
+    for subtype in sorted(probs_by_subtype.keys()):
+        y_prob = np.array(probs_by_subtype[subtype], dtype=float)
+        y_true = np.array(labels_by_subtype[subtype], dtype=float)
+        y_pred_bin = (y_prob >= 0.5).astype(int)
+
+        accuracy = float((y_pred_bin == y_true.astype(int)).mean()) if y_true.size > 0 else float("nan")
+        positive_rate_true = float(y_true.mean()) if y_true.size > 0 else float("nan")
+        majority_baseline_accuracy = max(positive_rate_true, 1.0 - positive_rate_true)
+
+        try:
+            from sklearn.metrics import (
+                average_precision_score,
+                f1_score,
+                precision_score,
+                recall_score,
+                roc_auc_score,
+            )
+
+            auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+            aupr = float(average_precision_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+            precision = float(precision_score(y_true, y_pred_bin, zero_division=0))
+            recall = float(recall_score(y_true, y_pred_bin, zero_division=0))
+            f1 = float(f1_score(y_true, y_pred_bin, zero_division=0))
+        except Exception:
+            tp = int(((y_pred_bin == 1) & (y_true == 1)).sum())
+            fp = int(((y_pred_bin == 1) & (y_true == 0)).sum())
+            fn = int(((y_pred_bin == 0) & (y_true == 1)).sum())
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            auc = float("nan")
+            aupr = float("nan")
+
+        metrics_by_subtype[subtype] = {
+            "n": float(len(y_true)),
+            "accuracy": accuracy,
+            "auc": auc,
+            "aupr": aupr,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "positive_rate_true": positive_rate_true,
+            "majority_baseline_accuracy": majority_baseline_accuracy,
+        }
+
+    return metrics_by_subtype
+
+
 def main() -> int:
-    """Train a CRISPR direction transformer with stratified 80/10/10 split.
+    """Train the transformer
     
     Loads agreed-only JSONL dataset, performs stratified split by CRISPR
     subtype to balance train/val/test distributions, then trains for specified
-    epochs with validation monitoring. Implements early stopping to prevent
-    overfitting and checkpoints the best model by validation loss.
+    epochs with validation monitoring. Implements early stopping and checkpoints 
+    the best model by validation loss.
     """
     parser = argparse.ArgumentParser(description="Train a CRISPR direction transformer on the agreed-only JSONL dataset.")
     parser.add_argument("--jsonl", default="output_dataset/direction_training_dataset.jsonl")
     parser.add_argument("--include_flanks", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training (default 16).")
+    parser.add_argument("--epochs", type=int, default=5, help="Maximum number of training epochs (default 5).")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for AdamW optimizer (default 3e-4).")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="L2 regularization strength (default 1e-5).")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for regularization (default 0.1); try 0.3-0.5 for heavy overfitting.")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for regularization (default 0.1).")
     parser.add_argument("--early_stopping_patience", type=int, default=3, help="Stop if val_loss doesn't improve for N epochs (default 3).")
-    parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default 42).")
     parser.add_argument(
         "--stratify_by",
         type=str,
@@ -629,8 +728,6 @@ def main() -> int:
             f"Label counts: {dict(dataset_label_counts)}"
         )
     
-    # Use stratified split to allocate 80%% to the combined train+test set and 20%% to validation.
-    # Stratification method ensures balanced class proportions in each split.
     stratify_mode = (
         "cas_subtype_and_label" if args.stratify_by_cas_subtype_and_label else args.stratify_by
     )
@@ -639,44 +736,46 @@ def main() -> int:
         splits = stratified_train_test_and_val_by_label(
             base_dataset.records, seed=args.seed, train_test_fraction=0.8
         )
+        two_way_split = True
     elif stratify_mode == "cas_subtype":
-        splits = stratified_train_test_and_val_by_cas_subtype(
-            base_dataset.records, seed=args.seed, train_test_fraction=0.8
+        splits = stratified_split_by_cas_subtype(
+            base_dataset.records, seed=args.seed, train_fraction=0.8, test_fraction=0.1
         )
+        two_way_split = False
     else:
         splits = stratified_train_test_and_val_by_cas_subtype_and_label(
             base_dataset.records, seed=args.seed, train_test_fraction=0.8
         )
+        two_way_split = True
 
-    # Optionally, split the combined train_test set further into train/test.
     train_indices: list[int]
     test_indices: list[int]
-    if args.test_within_train_fraction and 0.0 < args.test_within_train_fraction < 1.0:
-        # Build examples list for the train_test subset and run an inner stratified split
-        train_test_indices = splits["train_test"]
-        train_test_examples = [base_dataset.records[i] for i in train_test_indices]
-        inner_train_fraction = 1.0 - args.test_within_train_fraction
-        
-        if stratify_mode == "label":
-            inner_splits = stratified_train_test_and_val_by_label(
-                train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
-            )
-        elif stratify_mode == "cas_subtype":
-            inner_splits = stratified_train_test_and_val_by_cas_subtype(
-                train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
-            )
-        else:
-            inner_splits = stratified_train_test_and_val_by_cas_subtype_and_label(
-                train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
-            )
-        # Map inner indices back to original dataset indices
-        train_indices = [train_test_indices[i] for i in inner_splits["train_test"]]
-        test_indices = [train_test_indices[i] for i in inner_splits["val"]]
+    if not two_way_split:
+        # splits contains keys 'train','val','test'
+        train_indices = splits["train"]
+        val_indices = splits["val"]
+        test_indices = splits["test"]
     else:
-        train_indices = splits["train_test"]
-        test_indices = []
+        if args.test_within_train_fraction and 0.0 < args.test_within_train_fraction < 1.0:
+            train_test_indices = splits["train_test"]
+            train_test_examples = [base_dataset.records[i] for i in train_test_indices]
+            inner_train_fraction = 1.0 - args.test_within_train_fraction
 
-    val_indices = splits["val"]
+            if stratify_mode == "label":
+                inner_splits = stratified_train_test_and_val_by_label(
+                    train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
+                )
+            else:
+                inner_splits = stratified_train_test_and_val_by_cas_subtype_and_label(
+                    train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
+                )
+            train_indices = [train_test_indices[i] for i in inner_splits["train_test"]]
+            test_indices = [train_test_indices[i] for i in inner_splits["val"]]
+        else:
+            train_indices = splits["train_test"]
+            test_indices = []
+
+        val_indices = splits["val"]
 
     train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab)
     val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab)
@@ -689,7 +788,7 @@ def main() -> int:
     print(f"Label distribution train={dict(train_label_counts)} val={dict(val_label_counts)}")
     if len(train_label_counts) < 2 or len(val_label_counts) < 2:
         raise ValueError(
-            "Train/validation split contains a single class. Metrics like accuracy can be misleading. "
+            "Train/validation split contains only a single class."
             f"train={dict(train_label_counts)} val={dict(val_label_counts)}"
         )
 
@@ -704,7 +803,7 @@ def main() -> int:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
-    # Training loop with early stopping. We always have a validation split (20%% by default).
+    # Training loop with early stopping.
     best_val_loss = float("inf")
     patience_counter = 0
     best_model_state = None
@@ -718,7 +817,7 @@ def main() -> int:
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         
-        # Early stopping: if validation loss improves, checkpoint the model
+        # if validation loss improves, checkpoint the model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -746,12 +845,11 @@ def main() -> int:
             )
         )
         
-        # Early stopping: exit if no improvement for N epochs
         if patience_counter >= args.early_stopping_patience:
             print(f"Early stopping: validation loss did not improve for {args.early_stopping_patience} epochs.")
             break
 
-    # Restore best model before test/final evaluation
+    # Restore best model before final evaluation
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print("Restored best model (lowest validation loss).")
@@ -768,7 +866,7 @@ def main() -> int:
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         
-        # Add parameters as text box
+        # param text box
         params_text = (
             f"batch_size={args.batch_size}\n"
             f"lr={args.lr}\n"
@@ -795,6 +893,7 @@ def main() -> int:
         print("matplotlib not available; skipping training curves visualization.")
     
     if test_loader is not None:
+        # print test metrics
         test_metrics = evaluate(model, test_loader, loss_fn, device)
         print(
             (
@@ -810,6 +909,38 @@ def main() -> int:
                 f1=test_metrics["f1"],
             )
         )
+
+        # print subtype test metrics
+        per_subtype_metrics = evaluate_per_subtype(
+            model=model,
+            base_dataset=base_dataset,
+            indices=test_indices,
+            vocab=vocab,
+            loss_fn=loss_fn,
+            device=device,
+            batch_size=args.batch_size,
+        )
+        print("Per-cas_subtype test metrics:")
+        print(
+            "{:<16} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}".format(
+                "cas_subtype", "n", "accuracy", "auc", "aupr", "precision", "recall", "f1"
+            )
+        )
+        for subtype, metrics in per_subtype_metrics.items():
+            auc_text = f"{metrics['auc']:.4f}" if not (metrics["auc"] != metrics["auc"]) else "nan"
+            aupr_text = f"{metrics['aupr']:.4f}" if not (metrics["aupr"] != metrics["aupr"]) else "nan"
+            print(
+                "{:<16} {:>7} {:>9.4f} {:>9} {:>9} {:>9.4f} {:>9.4f} {:>9.4f}".format(
+                    subtype,
+                    int(metrics["n"]),
+                    metrics["accuracy"],
+                    auc_text,
+                    aupr_text,
+                    metrics["precision"],
+                    metrics["recall"],
+                    metrics["f1"],
+                )
+            )
     return 0
 
 

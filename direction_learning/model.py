@@ -86,9 +86,9 @@ class MeanPoolSequenceEncoder(nn.Module if nn is not None else object):
 class SpacerDirectionTransformer(nn.Module if nn is not None else object):
     """Hierarchical transformer model for CRISPR array direction prediction.
     
-    Encodes individual spacers/repeats, applies positional embeddings to preserve
+    Encodes individual spacers, applies positional embeddings to preserve
     array order, processes through a multi-head transformer encoder, and outputs
-    a binary direction logit (Forward/Reverse) per array.
+    a binary direction classification (logits) (Forward/Reverse) per array.
     """
     def __init__(self, config: DirectionTransformerConfig):
         """Initialize the transformer model.
