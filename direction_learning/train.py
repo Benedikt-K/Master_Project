@@ -203,6 +203,7 @@ def _materialize_subarray_augmentations(
     min_spacers: int,
     max_per_array: int,
     split_name: str,
+    use_diversity: bool = True,
 ) -> tuple[list[int], dict[str, int]]:
     """Materialize subarray deletion augmentation for a split.
 
@@ -235,8 +236,6 @@ def _materialize_subarray_augmentations(
             keep_sets = [tuple(sorted(local_rng.sample(range(n), k)))]
         else:
             candidate_goal = max_per_array if max_per_array > 0 else 0
-            # Generate a larger candidate pool than the final cap so we can
-            # choose a more diverse subset of subarrays.
             if use_diversity:
                 # Generate a larger candidate pool than the final cap so we can
                 # choose a more diverse subset of subarrays.
@@ -261,7 +260,11 @@ def _materialize_subarray_augmentations(
                     seen_local.add(keep)
                     candidates.append(keep)
 
-                    keep_sets = _select_diverse_keep_sets(candidates, candidate_goal, local_rng) if use_diversity else candidates[:candidate_goal]
+            keep_sets = (
+                _select_diverse_keep_sets(candidates, candidate_goal, local_rng)
+                if use_diversity
+                else candidates[:candidate_goal]
+            )
             if candidate_goal > 0 and len(keep_sets) >= candidate_goal:
                 stats["capped_arrays"] += 1
 
@@ -310,6 +313,146 @@ def summarize_cas_subtypes(
     """Return unique subtype count and per-subtype counts for a split."""
     counts = Counter((records[i].cas_subtype or "Unknown") for i in indices)
     return len(counts), dict(sorted(counts.items(), key=lambda kv: kv[0]))
+
+
+def build_cv_folds_by_signature(
+    examples: list[DirectionExample],
+    pool_indices: list[int],
+    n_folds: int,
+    seed: int,
+    stratify_mode: str,
+) -> list[list[int]]:
+    """Build CV folds from pool indices, keeping exact signatures together.
+
+    Args:
+        examples: Full list of examples.
+        pool_indices: Indices allowed for CV (development pool).
+        n_folds: Number of CV folds.
+        seed: RNG seed.
+        stratify_mode: One of "label", "cas_subtype", "cas_subtype_and_label".
+
+    Returns:
+        List of folds where each entry is a list of validation indices for that fold.
+    """
+    if n_folds < 2:
+        raise ValueError("n_folds must be at least 2")
+
+    rng = random.Random(seed)
+    pool_set = set(pool_indices)
+
+    signature_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    for idx in pool_indices:
+        ex = examples[idx]
+        sig = (tuple(ex.spacers), tuple(ex.repeats))
+        signature_groups.setdefault(sig, []).append(idx)
+
+    strata_groups: dict[Any, list[list[int]]] = {}
+    for group in signature_groups.values():
+        rep = examples[group[0]]
+        subtype = (rep.cas_subtype or "Unknown").strip() or "Unknown"
+        label = int(rep.label)
+
+        if stratify_mode == "label":
+            key: Any = label
+        elif stratify_mode == "cas_subtype":
+            key = subtype
+        else:
+            key = (subtype, label)
+
+        strata_groups.setdefault(key, []).append(group)
+
+    folds: list[list[int]] = [[] for _ in range(n_folds)]
+    for key in sorted(strata_groups.keys(), key=str):
+        groups = list(strata_groups[key])
+        rng.shuffle(groups)
+        for j, group in enumerate(groups):
+            fold_idx = j % n_folds
+            folds[fold_idx].extend(group)
+
+    # Keep only indices from the pool and stabilize ordering for reproducibility
+    for i in range(n_folds):
+        folds[i] = sorted(idx for idx in folds[i] if idx in pool_set)
+
+    return folds
+
+
+def stratified_holdout_by_mode(
+    examples: list[DirectionExample],
+    seed: int,
+    holdout_fraction: float,
+    stratify_mode: str,
+) -> tuple[list[int], list[int]]:
+    """Split indices into development/train and held-out test sets.
+
+    Exact spacer/repeat signatures stay together, and the stratification key
+    follows the selected mode.
+    """
+    if not (0.0 <= holdout_fraction < 1.0):
+        raise ValueError("holdout_fraction must be in [0.0, 1.0)")
+    if holdout_fraction == 0.0:
+        return list(range(len(examples))), []
+
+    rng = random.Random(seed)
+
+    signature_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    for idx, example in enumerate(examples):
+        signature = (tuple(example.spacers), tuple(example.repeats))
+        signature_groups.setdefault(signature, []).append(idx)
+
+    strata_groups: dict[Any, list[list[int]]] = {}
+    for group in signature_groups.values():
+        rep = examples[group[0]]
+        subtype = (rep.cas_subtype or "Unknown").strip() or "Unknown"
+        label = int(rep.label)
+
+        if stratify_mode == "label":
+            key: Any = label
+        elif stratify_mode == "cas_subtype":
+            key = subtype
+        else:
+            key = (subtype, label)
+
+        strata_groups.setdefault(key, []).append(group)
+
+    dev_indices: list[int] = []
+    test_indices: list[int] = []
+    for key in sorted(strata_groups.keys(), key=str):
+        groups = list(strata_groups[key])
+        rng.shuffle(groups)
+        n_groups = len(groups)
+        n_test = 0 if n_groups == 1 else min(n_groups - 1, max(1, round(n_groups * holdout_fraction)))
+        for group in groups[:n_test]:
+            test_indices.extend(group)
+        for group in groups[n_test:]:
+            dev_indices.extend(group)
+
+    return sorted(dev_indices), sorted(test_indices)
+
+
+def split_dev_pool_by_mode(
+    examples: list[DirectionExample],
+    pool_indices: list[int],
+    seed: int,
+    stratify_mode: str,
+) -> tuple[list[int], list[int]]:
+    """Split a development pool into train and validation indices."""
+    pool_examples = [examples[i] for i in pool_indices]
+    if stratify_mode == "label":
+        splits = stratified_train_test_and_val_by_label(pool_examples, seed=seed, train_test_fraction=0.8)
+        train_indices = [pool_indices[i] for i in splits["train_test"]]
+        val_indices = [pool_indices[i] for i in splits["val"]]
+    elif stratify_mode == "cas_subtype":
+        splits = stratified_split_by_cas_subtype(pool_examples, seed=seed, train_fraction=0.8, test_fraction=0.0)
+        train_indices = [pool_indices[i] for i in splits["train"]]
+        val_indices = [pool_indices[i] for i in splits["val"]]
+    else:
+        splits = stratified_train_test_and_val_by_cas_subtype_and_label(
+            pool_examples, seed=seed, train_test_fraction=0.8
+        )
+        train_indices = [pool_indices[i] for i in splits["train_test"]]
+        val_indices = [pool_indices[i] for i in splits["val"]]
+
+    return sorted(train_indices), sorted(val_indices)
 
 
 def _build_signature_components(examples: list[DirectionExample]) -> dict[int, list[int]]:
@@ -987,10 +1130,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--test_size",
         "--test_within_train_fraction",
+        dest="test_size",
         type=float,
         default=0.0,
-        help="Optional fraction of the combined train+test split to hold out as a test set (e.g. 0.1 for 10%%).",
+        help="Fraction of the full dataset to hold out as the final test set (e.g. 0.1 for 10%%).",
+    )
+    parser.add_argument(
+        "--cv_folds",
+        type=int,
+        default=0,
+        help="If >1, run a single CV fold split on the development pool (train+val), keeping test untouched.",
+    )
+    parser.add_argument(
+        "--cv_fold_index",
+        type=int,
+        default=0,
+        help="Validation fold index to use when --cv_folds > 1 (0-based).",
     )
     parser.add_argument(
         "--augment_subarrays",
@@ -1027,6 +1184,11 @@ def main() -> int:
         action="store_true",
         help="Skip diversity computation in enumerate mode; randomly sample max_per_array subarrays instead (faster, less diverse).",
     )
+    parser.add_argument(
+        "--plot_test_curve",
+        action="store_true",
+        help="If set and a test set is present, evaluate the model on the test set once per epoch and include test loss as a third line in the training curves plot.",
+    )
     args = parser.parse_args()
 
     _require_torch()
@@ -1046,50 +1208,97 @@ def main() -> int:
         "cas_subtype_and_label" if args.stratify_by_cas_subtype_and_label else args.stratify_by
     )
 
-    if stratify_mode == "label":
-        splits = stratified_train_test_and_val_by_label(
-            base_dataset.records, seed=args.seed, train_test_fraction=0.8
+    use_explicit_test_holdout = args.test_size and 0.0 < args.test_size < 1.0
+    if args.test_size and not (0.0 < args.test_size < 1.0):
+        raise ValueError("test_size must be in (0.0, 1.0)")
+
+    if use_explicit_test_holdout:
+        dev_indices, test_indices = stratified_holdout_by_mode(
+            base_dataset.records,
+            seed=args.seed,
+            holdout_fraction=args.test_size,
+            stratify_mode=stratify_mode,
         )
-        two_way_split = True
-    elif stratify_mode == "cas_subtype":
-        splits = stratified_split_by_cas_subtype(
-            base_dataset.records, seed=args.seed, train_fraction=0.8, test_fraction=0.1
-        )
-        two_way_split = False
     else:
-        splits = stratified_train_test_and_val_by_cas_subtype_and_label(
-            base_dataset.records, seed=args.seed, train_test_fraction=0.8
-        )
-        two_way_split = True
+        # Legacy behavior when no explicit final test holdout is requested.
+        if stratify_mode == "label":
+            splits = stratified_train_test_and_val_by_label(
+                base_dataset.records, seed=args.seed, train_test_fraction=0.8
+            )
+            train_indices = splits["train_test"]
+            val_indices = splits["val"]
+            test_indices = []
+            dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+        elif stratify_mode == "cas_subtype":
+            splits = stratified_split_by_cas_subtype(
+                base_dataset.records, seed=args.seed, train_fraction=0.8, test_fraction=0.1
+            )
+            train_indices = splits["train"]
+            val_indices = splits["val"]
+            test_indices = splits["test"]
+            dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+        else:
+            splits = stratified_train_test_and_val_by_cas_subtype_and_label(
+                base_dataset.records, seed=args.seed, train_test_fraction=0.8
+            )
+            train_indices = splits["train_test"]
+            val_indices = splits["val"]
+            test_indices = []
+            dev_indices = sorted(set(list(train_indices) + list(val_indices)))
 
     train_indices: list[int]
-    test_indices: list[int]
-    if not two_way_split:
-        # splits contains keys 'train','val','test'
-        train_indices = splits["train"]
-        val_indices = splits["val"]
-        test_indices = splits["test"]
-    else:
-        if args.test_within_train_fraction and 0.0 < args.test_within_train_fraction < 1.0:
-            train_test_indices = splits["train_test"]
-            train_test_examples = [base_dataset.records[i] for i in train_test_indices]
-            inner_train_fraction = 1.0 - args.test_within_train_fraction
+    test_indices = list(test_indices)
+    if use_explicit_test_holdout:
+        if args.cv_folds > 1:
+            if not (0 <= args.cv_fold_index < args.cv_folds):
+                raise ValueError(
+                    f"cv_fold_index must be in [0, {args.cv_folds - 1}] when cv_folds={args.cv_folds}"
+                )
 
-            if stratify_mode == "label":
-                inner_splits = stratified_train_test_and_val_by_label(
-                    train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
-                )
-            else:
-                inner_splits = stratified_train_test_and_val_by_cas_subtype_and_label(
-                    train_test_examples, seed=args.seed, train_test_fraction=inner_train_fraction
-                )
-            train_indices = [train_test_indices[i] for i in inner_splits["train_test"]]
-            test_indices = [train_test_indices[i] for i in inner_splits["val"]]
+            cv_folds = build_cv_folds_by_signature(
+                examples=base_dataset.records,
+                pool_indices=dev_indices,
+                n_folds=args.cv_folds,
+                seed=args.seed,
+                stratify_mode=stratify_mode,
+            )
+            val_indices = cv_folds[args.cv_fold_index]
+            train_indices = [idx for j, fold in enumerate(cv_folds) if j != args.cv_fold_index for idx in fold]
+
+            print(
+                f"CV mode: folds={args.cv_folds}, using fold {args.cv_fold_index} as validation "
+                f"(dev pool={len(dev_indices)}; train={len(train_indices)}, val={len(val_indices)}, "
+                f"test={len(test_indices)})"
+            )
         else:
-            train_indices = splits["train_test"]
-            test_indices = []
+            train_indices, val_indices = split_dev_pool_by_mode(
+                examples=base_dataset.records,
+                pool_indices=dev_indices,
+                seed=args.seed,
+                stratify_mode=stratify_mode,
+            )
+    elif args.cv_folds > 1:
+        if not (0 <= args.cv_fold_index < args.cv_folds):
+            raise ValueError(
+                f"cv_fold_index must be in [0, {args.cv_folds - 1}] when cv_folds={args.cv_folds}"
+            )
 
-        val_indices = splits["val"]
+        dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+        cv_folds = build_cv_folds_by_signature(
+            examples=base_dataset.records,
+            pool_indices=dev_indices,
+            n_folds=args.cv_folds,
+            seed=args.seed,
+            stratify_mode=stratify_mode,
+        )
+        val_indices = cv_folds[args.cv_fold_index]
+        train_indices = [idx for j, fold in enumerate(cv_folds) if j != args.cv_fold_index for idx in fold]
+
+        print(
+            f"CV mode: folds={args.cv_folds}, using fold {args.cv_fold_index} as validation "
+            f"(dev pool={len(dev_indices)}; train={len(train_indices)}, val={len(val_indices)}, "
+            f"test={(len(test_indices) if test_indices else 0)})"
+        )
 
     augment_fn = None
     if getattr(args, "augment_subarrays", False):
@@ -1186,6 +1395,7 @@ def main() -> int:
     best_model_state = None
     train_losses = []
     val_losses = []
+    test_losses = []
     
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
@@ -1193,6 +1403,13 @@ def main() -> int:
         val_loss = val_metrics["loss"]
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+
+        # Optionally evaluate on the held-out test set once per epoch for plotting
+        test_loss = float("nan")
+        if getattr(args, "plot_test_curve", False) and test_loader is not None:
+            test_metrics_epoch = evaluate(model, test_loader, loss_fn, device)
+            test_loss = test_metrics_epoch.get("loss", float("nan"))
+            test_losses.append(test_loss)
         
         # if validation loss improves, checkpoint the model
         if val_loss < best_val_loss:
@@ -1206,7 +1423,7 @@ def main() -> int:
         timestamp = datetime.now().strftime('%H:%M:%S')
         print(
             (
-                "[{timestamp}] epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f}{es_marker} "
+                "[{timestamp}] epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} test_loss={test_loss:.4f}{es_marker} "
                 "val_accuracy={val_accuracy:.4f} val_f1={val_f1:.4f} "
                 "val_pos_rate={val_pos_rate:.4f} val_pred_pos_rate={val_pred_pos_rate:.4f} "
                 "val_majority_baseline_acc={val_baseline:.4f}"
@@ -1215,6 +1432,7 @@ def main() -> int:
                 epoch=epoch,
                 train_loss=train_loss,
                 val_loss=val_loss,
+                test_loss=test_loss,
                 es_marker=es_marker,
                 val_accuracy=val_metrics["accuracy"],
                 val_f1=val_metrics["f1"],
@@ -1239,6 +1457,10 @@ def main() -> int:
         epochs_range = range(1, len(train_losses) + 1)
         ax.plot(epochs_range, train_losses, marker='o', label='Train Loss', linewidth=2)
         ax.plot(epochs_range, val_losses, marker='s', label='Val Loss', linewidth=2)
+        if getattr(args, "plot_test_curve", False) and test_loader is not None and len(test_losses) > 0:
+            # Ensure we only plot as many epochs as we recorded test losses for
+            test_range = range(1, len(test_losses) + 1)
+            ax.plot(test_range, test_losses, marker='^', label='Test Loss', linewidth=2)
         ax.set_xlabel('Epoch', fontsize=12)
         ax.set_ylabel('Loss', fontsize=12)
         ax.set_title('Training vs Validation Loss', fontsize=14, fontweight='bold')
