@@ -134,8 +134,173 @@ def make_subarray_augment_fn(prob: float = 1.0, seed: int = 42):
     return augment_fn
 
 
+def make_subarray_augment_fn_with_similarity_filter(
+    prob: float = 1.0,
+    seed: int = 42,
+    max_attempts: int = 5,
+    test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_token_sets: dict[int, set[str]] | None = None,
+    inverted_index: dict[str, set[int]] | None = None,
+    similarity_metric: str = "jaccard",
+    min_distance: float = 0.0,
+):
+    """Return an augment_fn that also filters candidates against the test set.
+
+    This is only used when the optional similarity safeguard is enabled.
+    """
+    rng = random.Random(seed)
+
+    stats = {
+        "accepted": 0,
+        "blocked_exact": 0,
+        "blocked_distance": 0,
+        "attempts": 0,
+    }
+
+    def augment_fn(example: DirectionExample) -> DirectionExample:
+        try:
+            if rng.random() >= float(prob):
+                return example
+
+            n = len(example.spacers)
+            if n <= 1:
+                return example
+
+            for _ in range(max(1, max_attempts)):
+                stats["attempts"] += 1
+                k = rng.randint(1, n - 1)
+                keep_indices = sorted(rng.sample(range(n), k))
+                new_spacers = [example.spacers[i] for i in keep_indices]
+                new_repeats = [example.repeats[i] for i in keep_indices]
+                candidate = DirectionExample(
+                    array_name=example.array_name,
+                    group_name=example.group_name,
+                    agreement=example.agreement,
+                    evor_direction=example.evor_direction,
+                    label=example.label,
+                    orientation_variant=example.orientation_variant,
+                    source_variant=example.source_variant,
+                    spacers=new_spacers,
+                    repeats=new_repeats,
+                    cas_subtype=example.cas_subtype,
+                    left_flank=example.left_flank,
+                    right_flank=example.right_flank,
+                    source_json=example.source_json,
+                )
+
+                candidate_sig = _example_signature(candidate)
+                if test_signatures is not None and candidate_sig in test_signatures:
+                    stats["blocked_exact"] += 1
+                    continue
+                if not _candidate_passes_similarity_filter(
+                    candidate,
+                    test_token_sets=test_token_sets,
+                    inverted_index=inverted_index,
+                    metric=similarity_metric,
+                    min_distance=min_distance,
+                ):
+                    stats["blocked_distance"] += 1
+                    continue
+
+                stats["accepted"] += 1
+                return candidate
+
+            return example
+        except Exception:
+            return example
+
+    augment_fn.similarity_stats = stats  # type: ignore[attr-defined]
+    return augment_fn
+
+
 def _example_signature(example: DirectionExample) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return (tuple(example.spacers), tuple(example.repeats))
+
+
+def _token_signature(example: DirectionExample) -> set[str]:
+    """Return a lightweight token set for similarity checks.
+
+    Prefixes keep spacer and repeat tokens distinct while still making set-based
+    overlap computations cheap.
+    """
+    return {f"S:{spacer}" for spacer in example.spacers} | {f"R:{repeat}" for repeat in example.repeats}
+
+
+def _build_test_similarity_index(
+    records: list[DirectionExample],
+    test_indices: list[int],
+) -> tuple[dict[int, set[str]], dict[str, set[int]]]:
+    """Build a compact inverted index over held-out test examples.
+
+    The returned structures let us compute candidate-to-test similarity without
+    comparing against every test record.
+    """
+    test_token_sets: dict[int, set[str]] = {}
+    inverted_index: dict[str, set[int]] = {}
+    for idx in test_indices:
+        token_set = _token_signature(records[idx])
+        test_token_sets[idx] = token_set
+        for token in token_set:
+            inverted_index.setdefault(token, set()).add(idx)
+    return test_token_sets, inverted_index
+
+
+def _min_distance_to_test_set(
+    candidate_tokens: set[str],
+    test_token_sets: dict[int, set[str]],
+    inverted_index: dict[str, set[int]],
+    metric: str,
+) -> float:
+    """Compute the minimum distance from a candidate to any test example.
+
+    Only test examples sharing at least one token with the candidate are checked,
+    which keeps the runtime low while still being exact for the chosen metric.
+    """
+    if not candidate_tokens or not test_token_sets:
+        return 1.0
+
+    candidate_test_indices: set[int] = set()
+    for token in candidate_tokens:
+        candidate_test_indices.update(inverted_index.get(token, set()))
+
+    if not candidate_test_indices:
+        return 1.0
+
+    best_distance = 1.0
+    candidate_size = len(candidate_tokens)
+    for test_idx in candidate_test_indices:
+        test_tokens = test_token_sets[test_idx]
+        intersection = len(candidate_tokens & test_tokens)
+        if metric == "overlap":
+            denom = min(candidate_size, len(test_tokens))
+            similarity = intersection / denom if denom > 0 else 0.0
+        else:
+            union = len(candidate_tokens | test_tokens)
+            similarity = intersection / union if union > 0 else 0.0
+
+        distance = 1.0 - similarity
+        if distance < best_distance:
+            best_distance = distance
+            if best_distance <= 0.0:
+                break
+
+    return best_distance
+
+
+def _candidate_passes_similarity_filter(
+    candidate_example: DirectionExample,
+    test_token_sets: dict[int, set[str]] | None,
+    inverted_index: dict[str, set[int]] | None,
+    metric: str,
+    min_distance: float,
+) -> bool:
+    """Return True if a candidate is far enough from the test set."""
+    if test_token_sets is None or inverted_index is None:
+        return True
+
+    candidate_tokens = _token_signature(candidate_example)
+    distance = _min_distance_to_test_set(candidate_tokens, test_token_sets, inverted_index, metric)
+    return distance >= min_distance
 
 
 def _keep_overlap_ratio(a: tuple[int, ...], b: tuple[int, ...]) -> float:
@@ -197,6 +362,9 @@ def _materialize_subarray_augmentations(
     base_dataset: DirectionJsonlDataset,
     source_indices: list[int],
     seen_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]],
+    test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None,
+    test_token_sets: dict[int, set[str]] | None,
+    inverted_index: dict[str, set[int]] | None,
     seed: int,
     mode: str,
     prob: float,
@@ -204,6 +372,8 @@ def _materialize_subarray_augmentations(
     max_per_array: int,
     split_name: str,
     use_diversity: bool = True,
+    similarity_metric: str = "jaccard",
+    min_distance: float = 0.0,
 ) -> tuple[list[int], dict[str, int]]:
     """Materialize subarray deletion augmentation for a split.
 
@@ -215,6 +385,7 @@ def _materialize_subarray_augmentations(
     stats = {
         "added": 0,
         "blocked_overlap": 0,
+        "blocked_similarity": 0,
         "capped_arrays": 0,
         "skipped_short": 0,
         "source_examples": len(source_indices),
@@ -276,7 +447,11 @@ def _materialize_subarray_augmentations(
                 stats["blocked_overlap"] += 1
                 continue
 
-            new_ex = DirectionExample(
+            if test_signatures is not None and aug_sig in test_signatures:
+                stats["blocked_similarity"] += 1
+                continue
+
+            candidate_example = DirectionExample(
                 array_name=ex.array_name,
                 group_name=ex.group_name,
                 agreement=ex.agreement,
@@ -291,14 +466,25 @@ def _materialize_subarray_augmentations(
                 right_flank=ex.right_flank,
                 source_json=ex.source_json,
             )
-            base_dataset.records.append(new_ex)
+            if not _candidate_passes_similarity_filter(
+                candidate_example,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                metric=similarity_metric,
+                min_distance=min_distance,
+            ):
+                stats["blocked_similarity"] += 1
+                continue
+
+            base_dataset.records.append(candidate_example)
             new_indices.append(len(base_dataset.records) - 1)
             seen_signatures.add(aug_sig)
             stats["added"] += 1
 
     print(
         f"Augmentation: {split_name} added {stats['added']} examples "
-        f"(blocked_overlap={stats['blocked_overlap']}, skipped_short={stats['skipped_short']})"
+        f"(blocked_overlap={stats['blocked_overlap']}, blocked_similarity={stats['blocked_similarity']}, "
+        f"skipped_short={stats['skipped_short']})"
     )
     if mode == "enumerate" and max_per_array > 0:
         print(f"Augmentation: {split_name} cap_hit_on={stats['capped_arrays']} arrays")
@@ -1185,6 +1371,19 @@ def main() -> int:
         help="Skip diversity computation in enumerate mode; randomly sample max_per_array subarrays instead (faster, less diverse).",
     )
     parser.add_argument(
+        "--aug_similarity",
+        type=str,
+        default="",
+        choices=["", "jaccard", "overlap"],
+        help="Optional test-set similarity safeguard for augmented subarrays. Choose 'jaccard' or 'overlap' to reject candidates that are too close to any held-out test example. Leave empty to keep current behavior.",
+    )
+    parser.add_argument(
+        "--aug_similarity_min_distance",
+        type=float,
+        default=0.30,
+        help="Minimum allowed distance to the nearest test example when --aug_similarity is set (higher is stricter).",
+    )
+    parser.add_argument(
         "--plot_test_curve",
         action="store_true",
         help="If set and a test set is present, evaluate the model on the test set once per epoch and include test loss as a third line in the training curves plot.",
@@ -1248,6 +1447,22 @@ def main() -> int:
 
     train_indices: list[int]
     test_indices = list(test_indices)
+
+    similarity_metric = (args.aug_similarity or "").strip().lower()
+    use_similarity_filter = bool(similarity_metric)
+    if use_similarity_filter and not test_indices:
+        print("Augmentation similarity safeguard requested, but no test split is present; similarity filtering will be skipped.")
+
+    test_signatures = None
+    test_token_sets = None
+    inverted_index = None
+    if use_similarity_filter and test_indices:
+        test_signatures = {
+            _example_signature(base_dataset.records[idx])
+            for idx in test_indices
+        }
+        test_token_sets, inverted_index = _build_test_similarity_index(base_dataset.records, test_indices)
+
     if use_explicit_test_holdout:
         if args.cv_folds > 1:
             if not (0 <= args.cv_fold_index < args.cv_folds):
@@ -1311,10 +1526,26 @@ def main() -> int:
             f"(test untouched; mode={mode}, min_spacers={min_spacers}, "
             f"max_per_array={max_per_array if max_per_array > 0 else 'unlimited'})"
         )
+        if use_similarity_filter:
+            print(
+                f"Augmentation: similarity safeguard enabled using {similarity_metric} with min_distance={args.aug_similarity_min_distance:.2f}"
+            )
 
         if mode == "random":
             # Random mode: on-the-fly augmentation during training, not materialized
-            augment_fn = make_subarray_augment_fn(prob=args.augment_subarrays_prob, seed=args.seed)
+            if use_similarity_filter:
+                augment_fn = make_subarray_augment_fn_with_similarity_filter(
+                    prob=args.augment_subarrays_prob,
+                    seed=args.seed,
+                    max_attempts=5,
+                    test_signatures=test_signatures,
+                    test_token_sets=test_token_sets,
+                    inverted_index=inverted_index,
+                    similarity_metric=similarity_metric,
+                    min_distance=args.aug_similarity_min_distance,
+                )
+            else:
+                augment_fn = make_subarray_augment_fn(prob=args.augment_subarrays_prob, seed=args.seed)
             print(f"Augmentation: random subarray deletion (on-the-fly) enabled for train and validation")
         else:
             # Enumerate mode: materialize diverse subarrays upfront for train and val
@@ -1323,10 +1554,13 @@ def main() -> int:
                 for example in base_dataset.records
             }
 
-            train_new_indices, _ = _materialize_subarray_augmentations(
+            train_new_indices, train_aug_stats = _materialize_subarray_augmentations(
                 base_dataset=base_dataset,
                 source_indices=list(train_indices),
                 seen_signatures=seen_signatures,
+                test_signatures=test_signatures,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
                 seed=args.seed,
                 mode=mode,
                 prob=args.augment_subarrays_prob,
@@ -1334,13 +1568,18 @@ def main() -> int:
                 max_per_array=max_per_array,
                 split_name="train",
                 use_diversity=not args.augment_subarrays_enumerate_fast,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
             )
             train_indices = list(train_indices) + train_new_indices
 
-            val_new_indices, _ = _materialize_subarray_augmentations(
+            val_new_indices, val_aug_stats = _materialize_subarray_augmentations(
                 base_dataset=base_dataset,
                 source_indices=list(val_indices),
                 seen_signatures=seen_signatures,
+                test_signatures=test_signatures,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
                 seed=args.seed + 1,
                 mode=mode,
                 prob=args.augment_subarrays_prob,
@@ -1348,8 +1587,19 @@ def main() -> int:
                 max_per_array=max_per_array,
                 split_name="val",
                 use_diversity=not args.augment_subarrays_enumerate_fast,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
             )
             val_indices = list(val_indices) + val_new_indices
+
+            if use_similarity_filter:
+                print(
+                    "Augmentation similarity summary: "
+                    f"train_blocked={train_aug_stats.get('blocked_similarity', 0)} "
+                    f"val_blocked={val_aug_stats.get('blocked_similarity', 0)} "
+                    f"train_added={train_aug_stats.get('added', 0)} "
+                    f"val_added={val_aug_stats.get('added', 0)}"
+                )
 
     train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn)
     val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab, augment_fn=augment_fn)
@@ -1450,6 +1700,16 @@ def main() -> int:
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print("Restored best model (lowest validation loss).")
+
+    if use_similarity_filter and augment_fn is not None and hasattr(augment_fn, "similarity_stats"):
+        sim_stats = getattr(augment_fn, "similarity_stats")
+        print(
+            "Augmentation similarity summary: "
+            f"accepted={sim_stats.get('accepted', 0)} "
+            f"blocked_exact={sim_stats.get('blocked_exact', 0)} "
+            f"blocked_distance={sim_stats.get('blocked_distance', 0)} "
+            f"attempts={sim_stats.get('attempts', 0)}"
+        )
     
     # Plot training curves with parameters
     if plt is not None:
