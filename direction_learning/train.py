@@ -1458,9 +1458,11 @@ def main() -> int:
         ax.plot(epochs_range, train_losses, marker='o', label='Train Loss', linewidth=2)
         ax.plot(epochs_range, val_losses, marker='s', label='Val Loss', linewidth=2)
         if getattr(args, "plot_test_curve", False) and test_loader is not None and len(test_losses) > 0:
-            # Ensure we only plot as many epochs as we recorded test losses for
-            test_range = range(1, len(test_losses) + 1)
-            ax.plot(test_range, test_losses, marker='^', label='Test Loss', linewidth=2)
+            # Align test losses to the same epoch x-axis. If for any reason test_losses
+            # is shorter than train_losses (shouldn't be), pad with NaN so plotting
+            # uses the same epoch indices for all curves.
+            test_plot = [test_losses[i] if i < len(test_losses) else float('nan') for i in range(len(train_losses))]
+            ax.plot(epochs_range, test_plot, marker='^', label='Test Loss', linewidth=2)
         ax.set_xlabel('Epoch', fontsize=12)
         ax.set_ylabel('Loss', fontsize=12)
         ax.set_title('Training vs Validation Loss', fontsize=14, fontweight='bold')
