@@ -192,6 +192,44 @@ def build_example(row: dict[str, str], include_flanks: bool) -> dict[str, Any]:
     return record
 
 
+def summarize_collapse(records: list[dict[str, Any]]) -> tuple[
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+    list[dict[str, Any]],
+]:
+    """Summarize duplicate collapse impact by cas_subtype."""
+    signature_to_records: dict[tuple[tuple[str, ...], tuple[str, ...]], list[dict[str, Any]]] = {}
+    for record in records:
+        signature = (tuple(record["spacers"]), tuple(record["repeats"]))
+        signature_to_records.setdefault(signature, []).append(record)
+
+    pre_counts = Counter(str(record.get("cas_subtype", "") or "Unknown") for record in records)
+    post_counts = Counter()
+    removed_counts = Counter()
+    cross_subtype_groups: list[dict[str, Any]] = []
+
+    for group_records in signature_to_records.values():
+        canonical = group_records[0]
+        canonical_subtype = str(canonical.get("cas_subtype", "") or "Unknown")
+        post_counts[canonical_subtype] += 1
+        for removed_record in group_records[1:]:
+            removed_subtype = str(removed_record.get("cas_subtype", "") or "Unknown")
+            removed_counts[removed_subtype] += 1
+
+        subtype_counts = Counter(str(record.get("cas_subtype", "") or "Unknown") for record in group_records)
+        if len(subtype_counts) > 1:
+            cross_subtype_groups.append(
+                {
+                    "collapsed_total": len(group_records) - 1,
+                    "canonical_subtype": canonical_subtype,
+                    "subtype_counts": dict(sorted(subtype_counts.items(), key=lambda kv: kv[0])),
+                }
+            )
+
+    return dict(sorted(pre_counts.items(), key=lambda kv: kv[0])), dict(sorted(post_counts.items(), key=lambda kv: kv[0])), dict(sorted(removed_counts.items(), key=lambda kv: kv[0])), cross_subtype_groups
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -230,6 +268,11 @@ def main() -> int:
         action="store_true",
         help="Also keep rows whose agreement is not comparable",
     )
+    parser.add_argument(
+        "--collapse_duplicates",
+        action="store_true",
+        help="Collapse exact spacer/repeat duplicates into single canonical records",
+    )
     args = parser.parse_args()
 
     curated_tsv = Path(args.curated_tsv)
@@ -257,33 +300,67 @@ def main() -> int:
                 continue
         filtered_rows.append(row)
 
-    label_counts = Counter(row["evor_direction"] for row in filtered_rows)
+    pre_collapse_label_counts = Counter(row["evor_direction"] for row in filtered_rows)
     written = 0
     skipped = 0
 
+    # Build all records first
+    all_records: list[dict[str, Any]] = []
+    for row in filtered_rows:
+        try:
+            base_record = build_example(row, include_flanks=args.include_flanks)
+            all_records.append(base_record)
+
+            if not args.no_augmentation:
+                rc_record = reverse_complement_array(base_record)
+                all_records.append(rc_record)
+        except Exception as exc:
+            skipped += 1
+            print(f"WARNING: skipping {row.get('array_name', '<unknown>')}: {exc}", file=sys.stderr)
+
+    # Optionally collapse duplicates by (spacers, repeats) signature
+    if args.collapse_duplicates:
+        pre_counts, post_counts, removed_counts, cross_subtype_groups = summarize_collapse(all_records)
+
+        signature_to_record: dict[tuple, dict[str, Any]] = {}
+        for record in all_records:
+            sig = (tuple(record["spacers"]), tuple(record["repeats"]))
+            if sig not in signature_to_record:
+                signature_to_record[sig] = record
+        all_records = list(signature_to_record.values())
+
+        total_collapsed = sum(removed_counts.values())
+        print(f"Collapsed {total_collapsed} duplicate records (by spacer/repeat signature)")
+        print(f"Subtype counts before collapse: {pre_counts}")
+        print(f"Subtype counts after collapse:  {post_counts}")
+        print(f"Subtype counts removed by collapse: {removed_counts}")
+        print(f"Collapsed signatures spanning multiple CRISPR types: {len(cross_subtype_groups)}")
+        if cross_subtype_groups:
+            print("Examples of cross-subtype collapsed signatures:")
+            for entry in cross_subtype_groups[:10]:
+                print(
+                    f"  canonical={entry['canonical_subtype']} collapsed_total={entry['collapsed_total']} "
+                    f"subtypes={entry['subtype_counts']}"
+                )
+
+    final_label_counts = Counter(record["evor_direction"] for record in all_records)
+
+    # Write records to JSONL
     with open(out_jsonl, "w") as out_fh:
-        for row in filtered_rows:
-            try:
-                base_record = build_example(row, include_flanks=args.include_flanks)
-                json.dump(base_record, out_fh)
-                out_fh.write("\n")
-                written += 1
+        for record in all_records:
+            json.dump(record, out_fh)
+            out_fh.write("\n")
+            written += 1
 
-                if not args.no_augmentation:
-                    rc_record = reverse_complement_array(base_record)
-                    json.dump(rc_record, out_fh)
-                    out_fh.write("\n")
-                    written += 1
-            except Exception as exc:
-                skipped += 1
-                print(f"WARNING: skipping {row.get('array_name', '<unknown>')}: {exc}", file=sys.stderr)
-
-    print(f"Filtered rows: {len(filtered_rows)}")
-    print(f"Label counts: {dict(label_counts)}")
+    print(f"Filtered rows (pre-collapse): {len(filtered_rows)}")
+    print(f"Label counts (pre-collapse): {dict(pre_collapse_label_counts)}")
+    print(f"Prepared records (post-collapse): {len(all_records)}")
+    print(f"Label counts (post-collapse): {dict(final_label_counts)}")
     print(f"Wrote {written} JSONL records to {out_jsonl}")
     print(f"Skipped arrays: {skipped}")
     print(f"Include flanks: {parse_bool(args.include_flanks)}")
     print(f"Augmentation enabled: {not args.no_augmentation}")
+    print(f"Collapse duplicates: {args.collapse_duplicates}")
 
     return 0
 

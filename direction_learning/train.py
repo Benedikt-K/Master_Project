@@ -134,6 +134,215 @@ def make_subarray_augment_fn(prob: float = 1.0, seed: int = 42):
     return augment_fn
 
 
+def _example_signature(example: DirectionExample) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (tuple(example.spacers), tuple(example.repeats))
+
+
+def _keep_overlap_ratio(a: tuple[int, ...], b: tuple[int, ...]) -> float:
+    set_a = set(a)
+    set_b = set(b)
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
+def _select_diverse_keep_sets(
+    candidates: list[tuple[int, ...]],
+    target: int,
+    rng: random.Random,
+) -> list[tuple[int, ...]]:
+    """Choose a diverse subset of keep-indices by maximizing pairwise distance (with precomputed overlaps)."""
+    unique_candidates = list(dict.fromkeys(candidates))
+    if target <= 0 or len(unique_candidates) <= target:
+        rng.shuffle(unique_candidates)
+        return unique_candidates
+
+    # Limit pool to avoid excessive computation
+    if len(unique_candidates) > 500:
+        rng.shuffle(unique_candidates)
+        unique_candidates = unique_candidates[:500]
+
+    n = len(unique_candidates)
+    # Pre-compute all pairwise overlaps once (O(n²) one-time cost)
+    overlaps: dict[tuple[int, int], float] = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            overlap = _keep_overlap_ratio(unique_candidates[i], unique_candidates[j])
+            overlaps[(i, j)] = overlap
+            overlaps[(j, i)] = overlap
+
+    selected_indices = [rng.randint(0, n - 1)]
+    remaining = set(range(n)) - {selected_indices[0]}
+
+    while remaining and len(selected_indices) < target:
+        best_score = -1.0
+        best_candidate = None
+
+        for idx in remaining:
+            # Fast O(selected) lookup: check precomputed overlaps
+            min_distance = min(1.0 - overlaps.get((idx, selected), 0.0) for selected in selected_indices)
+            if min_distance > best_score:
+                best_score = min_distance
+                best_candidate = idx
+
+        if best_candidate is not None:
+            selected_indices.append(best_candidate)
+            remaining.remove(best_candidate)
+
+    return [unique_candidates[i] for i in selected_indices]
+
+
+def _materialize_subarray_augmentations(
+    base_dataset: DirectionJsonlDataset,
+    source_indices: list[int],
+    seen_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]],
+    seed: int,
+    mode: str,
+    prob: float,
+    min_spacers: int,
+    max_per_array: int,
+    split_name: str,
+) -> tuple[list[int], dict[str, int]]:
+    """Materialize subarray deletion augmentation for a split.
+
+    Augmented signatures are globally deduplicated against `seen_signatures`
+    so train/val/test do not gain overlapping spacer/repeat pairs.
+    """
+    base_rng = random.Random(seed)
+    new_indices: list[int] = []
+    stats = {
+        "added": 0,
+        "blocked_overlap": 0,
+        "capped_arrays": 0,
+        "skipped_short": 0,
+        "source_examples": len(source_indices),
+    }
+
+    for orig_idx in list(source_indices):
+        ex = base_dataset.records[orig_idx]
+        n = len(ex.spacers)
+        if n <= min_spacers:
+            stats["skipped_short"] += 1
+            continue
+
+        local_rng = random.Random(base_rng.randint(0, 2**31 - 1))
+
+        if mode == "random":
+            if local_rng.random() >= float(prob):
+                continue
+            k = local_rng.randint(min_spacers, n - 1)
+            keep_sets = [tuple(sorted(local_rng.sample(range(n), k)))]
+        else:
+            candidate_goal = max_per_array if max_per_array > 0 else 0
+            # Generate a larger candidate pool than the final cap so we can
+            # choose a more diverse subset of subarrays.
+            if use_diversity:
+                # Generate a larger candidate pool than the final cap so we can
+                # choose a more diverse subset of subarrays.
+                if candidate_goal > 0:
+                    pool_goal = max(candidate_goal * 4, candidate_goal + 32, 64)
+                else:
+                    pool_goal = max(64, n * 16)
+                max_attempts = max(100, pool_goal * 50)
+            else:
+                # Fast mode: just generate candidate_goal samples without diversity
+                pool_goal = candidate_goal if candidate_goal > 0 else min(64, n * 4)
+                max_attempts = max(50, pool_goal * 10)
+            candidates: list[tuple[int, ...]] = []
+            seen_local: set[tuple[int, ...]] = set()
+            attempts = 0
+
+            while len(candidates) < pool_goal and attempts < max_attempts:
+                attempts += 1
+                k = local_rng.randint(min_spacers, n - 1)
+                keep = tuple(sorted(local_rng.sample(range(n), k)))
+                if keep not in seen_local:
+                    seen_local.add(keep)
+                    candidates.append(keep)
+
+                    keep_sets = _select_diverse_keep_sets(candidates, candidate_goal, local_rng) if use_diversity else candidates[:candidate_goal]
+            if candidate_goal > 0 and len(keep_sets) >= candidate_goal:
+                stats["capped_arrays"] += 1
+
+        for keep in keep_sets:
+            new_spacers = [ex.spacers[i] for i in keep]
+            new_repeats = [ex.repeats[i] for i in keep]
+            aug_sig = (tuple(new_spacers), tuple(new_repeats))
+            if aug_sig in seen_signatures:
+                stats["blocked_overlap"] += 1
+                continue
+
+            new_ex = DirectionExample(
+                array_name=ex.array_name,
+                group_name=ex.group_name,
+                agreement=ex.agreement,
+                evor_direction=ex.evor_direction,
+                label=ex.label,
+                orientation_variant=ex.orientation_variant,
+                source_variant=ex.source_variant,
+                spacers=new_spacers,
+                repeats=new_repeats,
+                cas_subtype=ex.cas_subtype,
+                left_flank=ex.left_flank,
+                right_flank=ex.right_flank,
+                source_json=ex.source_json,
+            )
+            base_dataset.records.append(new_ex)
+            new_indices.append(len(base_dataset.records) - 1)
+            seen_signatures.add(aug_sig)
+            stats["added"] += 1
+
+    print(
+        f"Augmentation: {split_name} added {stats['added']} examples "
+        f"(blocked_overlap={stats['blocked_overlap']}, skipped_short={stats['skipped_short']})"
+    )
+    if mode == "enumerate" and max_per_array > 0:
+        print(f"Augmentation: {split_name} cap_hit_on={stats['capped_arrays']} arrays")
+
+    return new_indices, stats
+
+
+def summarize_cas_subtypes(
+    records: list[DirectionExample],
+    indices: list[int],
+) -> tuple[int, dict[str, int]]:
+    """Return unique subtype count and per-subtype counts for a split."""
+    counts = Counter((records[i].cas_subtype or "Unknown") for i in indices)
+    return len(counts), dict(sorted(counts.items(), key=lambda kv: kv[0]))
+
+
+def _build_signature_components(examples: list[DirectionExample]) -> dict[int, list[int]]:
+    """Group indices into connected components by exact spacer/repeat signature."""
+    n = len(examples)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+    for idx, example in enumerate(examples):
+        signature = (tuple(example.spacers), tuple(example.repeats))
+        if signature in first_by_signature:
+            union(idx, first_by_signature[signature])
+        else:
+            first_by_signature[signature] = idx
+
+    components: dict[int, list[int]] = {}
+    for idx in range(n):
+        components.setdefault(find(idx), []).append(idx)
+    return components
+
+
 def stratified_split_by_cas_subtype(
     examples: list[DirectionExample],
     seed: int = 13,
@@ -166,30 +375,34 @@ def stratified_split_by_cas_subtype(
         raise ValueError("train_fraction + test_fraction must be <= 1.0")
     
     rng = random.Random(seed)
-    
-    # Group indices by cas_subtype
-    subtype_indices: dict[str, list[int]] = {}
-    for index, example in enumerate(examples):
-        subtype = example.cas_subtype or "Unknown"
-        subtype_indices.setdefault(subtype, []).append(index)
-    
-    # For each subtype, stratified split into train/val/test
+    components = _build_signature_components(examples)
+
+    # Stratify by cas_subtype at component level so exact duplicate signatures stay together.
+    subtype_components: dict[str, list[list[int]]] = {}
+    for comp in components.values():
+        subtype_counts = Counter((examples[i].cas_subtype or "Unknown") for i in comp)
+        subtype = max(subtype_counts, key=subtype_counts.get)
+        subtype_components.setdefault(subtype, []).append(comp)
+
     train_indices: list[int] = []
     val_indices: list[int] = []
     test_indices: list[int] = []
-    
-    for subtype, indices in subtype_indices.items():
-        shuffled = list(indices)
+
+    for subtype, comp_list in subtype_components.items():
+        shuffled = list(comp_list)
         rng.shuffle(shuffled)
-        
+
         n_total = len(shuffled)
         n_train = max(1, round(n_total * train_fraction))
         n_test = max(0, round(n_total * test_fraction))
         n_val = n_total - n_train - n_test
-        
-        train_indices.extend(shuffled[:n_train])
-        test_indices.extend(shuffled[n_train:n_train + n_test])
-        val_indices.extend(shuffled[n_train + n_test:])
+
+        for comp in shuffled[:n_train]:
+            train_indices.extend(comp)
+        for comp in shuffled[n_train:n_train + n_test]:
+            test_indices.extend(comp)
+        for comp in shuffled[n_train + n_test:]:
+            val_indices.extend(comp)
     
     return {
         "train": train_indices,
@@ -220,20 +433,25 @@ def stratified_train_test_by_cas_subtype(
         raise ValueError("train_fraction must be between 0 and 1")
 
     rng = random.Random(seed)
-    subtype_indices: dict[str, list[int]] = {}
-    for index, example in enumerate(examples):
-        subtype = example.cas_subtype or "Unknown"
-        subtype_indices.setdefault(subtype, []).append(index)
+    components = _build_signature_components(examples)
+
+    subtype_components: dict[str, list[list[int]]] = {}
+    for comp in components.values():
+        subtype_counts = Counter((examples[i].cas_subtype or "Unknown") for i in comp)
+        subtype = max(subtype_counts, key=subtype_counts.get)
+        subtype_components.setdefault(subtype, []).append(comp)
 
     train_indices: list[int] = []
     test_indices: list[int] = []
-    for subtype, indices in subtype_indices.items():
-        shuffled = list(indices)
+    for subtype, comp_list in subtype_components.items():
+        shuffled = list(comp_list)
         rng.shuffle(shuffled)
         n_total = len(shuffled)
         n_train = max(1, round(n_total * train_fraction)) if n_total > 1 else n_total
-        train_indices.extend(shuffled[:n_train])
-        test_indices.extend(shuffled[n_train:])
+        for comp in shuffled[:n_train]:
+            train_indices.extend(comp)
+        for comp in shuffled[n_train:]:
+            test_indices.extend(comp)
 
     return {"train": train_indices, "test": test_indices}
 
@@ -345,30 +563,27 @@ def stratified_train_test_and_val_by_label(
         raise ValueError("train_test_fraction must be between 0 and 1")
     
     rng = random.Random(seed)
-    
-    # Group indices by label
-    label_indices: dict[int, list[int]] = {}
-    for idx, example in enumerate(examples):
-        label = example.label
-        if label not in label_indices:
-            label_indices[label] = []
-        label_indices[label].append(idx)
-    
-    # Shuffle each label group independently
-    for label in label_indices:
-        rng.shuffle(label_indices[label])
-    
-    # Split each label group
+    components = _build_signature_components(examples)
+
+    label_components: dict[int, list[list[int]]] = {}
+    for comp in components.values():
+        label_counts = Counter(examples[i].label for i in comp)
+        label = max(label_counts, key=label_counts.get)
+        label_components.setdefault(label, []).append(comp)
+
     train_test_indices: list[int] = []
     val_indices: list[int] = []
-    
-    for label in sorted(label_indices.keys()):
-        indices = label_indices[label]
-        n = len(indices)
+
+    for label in sorted(label_components.keys()):
+        comp_list = list(label_components[label])
+        rng.shuffle(comp_list)
+        n = len(comp_list)
         n_train_test = max(1, round(n * train_test_fraction))
-        
-        train_test_indices.extend(indices[:n_train_test])
-        val_indices.extend(indices[n_train_test:])
+
+        for comp in comp_list[:n_train_test]:
+            train_test_indices.extend(comp)
+        for comp in comp_list[n_train_test:]:
+            val_indices.extend(comp)
     
     return {"train_test": train_test_indices, "val": val_indices}
 
@@ -780,7 +995,7 @@ def main() -> int:
     parser.add_argument(
         "--augment_subarrays",
         action="store_true",
-        help="If set, perform on-the-fly spacer-subset augmentation (train only).",
+        help="If set, perform spacer-subset augmentation for train and validation splits (test untouched).",
     )
     parser.add_argument(
         "--augment_subarrays_prob",
@@ -806,6 +1021,11 @@ def main() -> int:
         type=int,
         default=256,
         help="Maximum number of augmented subarrays to add per original array in enumerate mode (default 256; <=0 means unlimited).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_enumerate_fast",
+        action="store_true",
+        help="Skip diversity computation in enumerate mode; randomly sample max_per_array subarrays instead (faster, less diverse).",
     )
     args = parser.parse_args()
 
@@ -871,88 +1091,59 @@ def main() -> int:
 
         val_indices = splits["val"]
 
-    # Build augmentation function (applied only to training dataset)
     augment_fn = None
     if getattr(args, "augment_subarrays", False):
-        if args.augment_subarrays_mode == "random":
+        mode = args.augment_subarrays_mode
+        min_spacers = max(1, args.augment_subarrays_min_spacers)
+        max_per_array = args.augment_subarrays_max_per_array
+
+        print(
+            "Augmentation: spacer deletion enabled for train and validation "
+            f"(test untouched; mode={mode}, min_spacers={min_spacers}, "
+            f"max_per_array={max_per_array if max_per_array > 0 else 'unlimited'})"
+        )
+
+        if mode == "random":
+            # Random mode: on-the-fly augmentation during training, not materialized
             augment_fn = make_subarray_augment_fn(prob=args.augment_subarrays_prob, seed=args.seed)
-            print(f"Augmentation: random subarray sampling enabled (prob={args.augment_subarrays_prob})")
+            print(f"Augmentation: random subarray deletion (on-the-fly) enabled for train and validation")
         else:
-            # enumerate mode: add a random mix of distinct subarrays per array, up to the cap
-            max_per_array = args.augment_subarrays_max_per_array
-            min_spacers = max(1, args.augment_subarrays_min_spacers)
-            base_rng = random.Random(args.seed)
-            new_indices: list[int] = []
-            orig_train_len = len(train_indices)
-            print(
-                "Augmentation: enumerate mode (randomized order) for "
-                f"{orig_train_len} train examples (min_spacers={min_spacers}, "
-                f"max_per_array={max_per_array if max_per_array > 0 else 'unlimited'})"
+            # Enumerate mode: materialize diverse subarrays upfront for train and val
+            seen_signatures = {
+                _example_signature(example)
+                for example in base_dataset.records
+            }
+
+            train_new_indices, _ = _materialize_subarray_augmentations(
+                base_dataset=base_dataset,
+                source_indices=list(train_indices),
+                seen_signatures=seen_signatures,
+                seed=args.seed,
+                mode=mode,
+                prob=args.augment_subarrays_prob,
+                min_spacers=min_spacers,
+                max_per_array=max_per_array,
+                split_name="train",
+                use_diversity=not args.augment_subarrays_enumerate_fast,
             )
+            train_indices = list(train_indices) + train_new_indices
 
-            capped_arrays = 0
-            total_added = 0
-
-            for orig_idx in list(train_indices):
-                ex = base_dataset.records[orig_idx]
-                n = len(ex.spacers)
-                if n <= min_spacers:
-                    continue
-
-                # Randomly sample distinct subarrays until the cap is reached.
-                # This gives a random ordering of subarrays instead of lexicographic enumeration.
-                local_rng = random.Random(base_rng.randint(0, 2**31 - 1))
-                seen: set[tuple[int, ...]] = set()
-                sampled: list[tuple[int, ...]] = []
-                target = max_per_array if max_per_array > 0 else 0
-                max_attempts = max(100, (target if target > 0 else 1) * 50)
-                attempts = 0
-
-                while (target <= 0 or len(sampled) < target) and attempts < max_attempts:
-                    attempts += 1
-                    k = local_rng.randint(min_spacers, n - 1)
-                    keep = tuple(sorted(local_rng.sample(range(n), k)))
-                    if keep not in seen:
-                        seen.add(keep)
-                        sampled.append(keep)
-
-                if target > 0 and len(sampled) >= target:
-                    capped_arrays += 1
-
-                for keep in sampled:
-                    new_spacers = [ex.spacers[i] for i in keep]
-                    new_repeats = [ex.repeats[i] for i in keep]
-                    new_ex = DirectionExample(
-                        array_name=ex.array_name,
-                        group_name=ex.group_name,
-                        agreement=ex.agreement,
-                        evor_direction=ex.evor_direction,
-                        label=ex.label,
-                        orientation_variant=ex.orientation_variant,
-                        source_variant=ex.source_variant,
-                        spacers=new_spacers,
-                        repeats=new_repeats,
-                        cas_subtype=ex.cas_subtype,
-                        left_flank=ex.left_flank,
-                        right_flank=ex.right_flank,
-                        source_json=ex.source_json,
-                    )
-                    base_dataset.records.append(new_ex)
-                    new_indices.append(len(base_dataset.records) - 1)
-                    total_added += 1
-
-            # extend train_indices with new augmented example indices
-            train_indices = list(train_indices) + new_indices
-            cap_note = f"; cap_hit_on={capped_arrays} arrays" if capped_arrays > 0 else ""
-            print(
-                f"Augmentation: enumerate added {total_added} examples to dataset (size {len(base_dataset.records)}; "
-                f"train size {len(train_indices)}{cap_note})"
+            val_new_indices, _ = _materialize_subarray_augmentations(
+                base_dataset=base_dataset,
+                source_indices=list(val_indices),
+                seen_signatures=seen_signatures,
+                seed=args.seed + 1,
+                mode=mode,
+                prob=args.augment_subarrays_prob,
+                min_spacers=min_spacers,
+                max_per_array=max_per_array,
+                split_name="val",
+                use_diversity=not args.augment_subarrays_enumerate_fast,
             )
-            # No on-the-fly augment_fn used in enumerate mode
-            augment_fn = None
+            val_indices = list(val_indices) + val_new_indices
 
     train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn)
-    val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab)
+    val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab, augment_fn=augment_fn)
     test_dataset = DirectionTorchDataset(base_dataset, test_indices, vocab) if test_indices else None
 
     print(f"Split sizes: train={len(train_dataset)}, val={len(val_dataset)}, test={(len(test_dataset) if test_dataset else 0)}")
@@ -963,6 +1154,15 @@ def main() -> int:
     if test_indices:
         test_label_counts = Counter(base_dataset.records[i].label for i in test_indices)
         print(f"Label distribution test={dict(test_label_counts)}")
+
+    train_type_n, train_type_counts = summarize_cas_subtypes(base_dataset.records, train_indices)
+    val_type_n, val_type_counts = summarize_cas_subtypes(base_dataset.records, val_indices)
+    print(f"CRISPR types train (unique={train_type_n}): {train_type_counts}")
+    print(f"CRISPR types val (unique={val_type_n}): {val_type_counts}")
+    if test_indices:
+        test_type_n, test_type_counts = summarize_cas_subtypes(base_dataset.records, test_indices)
+        print(f"CRISPR types test (unique={test_type_n}): {test_type_counts}")
+
     if len(train_label_counts) < 2 or len(val_label_counts) < 2:
         raise ValueError(
             "Train/validation split contains only a single class."
