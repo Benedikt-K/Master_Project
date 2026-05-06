@@ -1071,7 +1071,7 @@ def collate_for_training(batch: list[dict]) -> dict[str, Any]:
     return batch_to_tensors(collate_encoded_examples(batch))
 
 
-def build_dataloader(dataset: DirectionTorchDataset, batch_size: int, shuffle: bool) -> Any:
+def build_dataloader(dataset: DirectionTorchDataset, batch_size: int, shuffle: bool, weights: list[float] | None = None) -> Any:
     """Create a PyTorch DataLoader for a split of data.
     
     Args:
@@ -1083,6 +1083,19 @@ def build_dataloader(dataset: DirectionTorchDataset, batch_size: int, shuffle: b
         torch.utils.data.DataLoader: Ready for training/evaluation loops.
     """
     _require_torch()
+    if weights is not None:
+        # Use WeightedRandomSampler when per-sample weights are provided. When a sampler
+        # is used, DataLoader must not be shuffled (sampler defines sampling order).
+        try:
+            from torch.utils.data import WeightedRandomSampler
+
+            tensor_weights = torch.tensor(weights, dtype=torch.double)
+            sampler = WeightedRandomSampler(tensor_weights, num_samples=len(tensor_weights), replacement=True)
+            return DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=collate_for_training)
+        except Exception:
+            # Fall back to standard loader if sampler unavailable
+            return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_for_training)
+
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_for_training)
 
 
@@ -1402,6 +1415,30 @@ def main() -> int:
         "--augment_subarrays_enumerate_fast",
         action="store_true",
         help="Skip diversity computation in enumerate mode; randomly sample max_per_array subarrays instead (faster, less diverse).",
+    )
+    parser.add_argument(
+        "--weighted_sampling",
+        action="store_true",
+        help="Enable weighted sampling to upweight under-represented strata instead of augmenting as much.",
+    )
+    parser.add_argument(
+        "--weighted_sampling_by",
+        type=str,
+        default="cas_subtype",
+        choices=["cas_subtype", "label"],
+        help="Which key to base sampling weights on (default: cas_subtype).",
+    )
+    parser.add_argument(
+        "--weighted_sampling_alpha",
+        type=float,
+        default=1.0,
+        help="Aggressiveness exponent for inverse-frequency weighting (default 1.0).",
+    )
+    parser.add_argument(
+        "--weighted_sampling_max_weight",
+        type=float,
+        default=10.0,
+        help="Maximum allowed sample weight to avoid extreme oversampling (default 10.0).",
     )
     parser.add_argument(
         "--augment_subtypes_balance",
@@ -1804,8 +1841,64 @@ def main() -> int:
             f"train={dict(train_label_counts)} val={dict(val_label_counts)}"
         )
 
-    train_loader = build_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    # Optionally compute weighted sampling weights and pass to dataloaders
+    train_weights = None
+    val_weights = None
+    if getattr(args, "weighted_sampling", False):
+        print("Weighted sampling enabled; computing per-sample weights...")
+        # choose key function
+        if args.weighted_sampling_by == "cas_subtype":
+            def _key_fn(i: int) -> str:
+                return (base_dataset.records[i].cas_subtype or "Unknown").strip() or "Unknown"
+        else:
+            def _key_fn(i: int) -> str:
+                return str(int(base_dataset.records[i].label))
+
+        # compute counts based on original (pre-augmentation) records when possible
+        def _counts_for(indices: list[int]) -> Counter:
+            c = Counter()
+            for i in indices:
+                if i < base_len:
+                    c[_key_fn(i)] += 1
+            # fallback to counting all if no originals present
+            if not c:
+                for i in indices:
+                    c[_key_fn(i)] += 1
+            return c
+
+        train_counts = _counts_for(train_indices)
+        val_counts = _counts_for(val_indices)
+
+        def _make_weights(indices: list[int], counts: Counter) -> list[float]:
+            majority = max(counts.values()) if counts else 1
+            alpha = float(getattr(args, "weighted_sampling_alpha", 1.0))
+            max_w = float(getattr(args, "weighted_sampling_max_weight", 10.0))
+            weight_map: dict[str, float] = {}
+            for k, v in counts.items():
+                ratio = majority / max(1, v)
+                weight = min(max_w, ratio ** alpha)
+                weight_map[k] = float(weight)
+
+            weights: list[float] = []
+            for i in indices:
+                key = _key_fn(i)
+                weights.append(weight_map.get(key, 1.0))
+            # normalize weights to have mean 1.0 to keep effective epoch size similar
+            if weights:
+                mean_w = float(sum(weights)) / len(weights)
+                if mean_w > 0:
+                    weights = [w / mean_w for w in weights]
+            return weights
+
+        train_weights = _make_weights(train_indices, train_counts)
+        val_weights = _make_weights(val_indices, val_counts)
+        print(
+            f"Weighted sampling: train weights mean={sum(train_weights)/len(train_weights):.3f} max={max(train_weights):.3f} | "
+            f"val weights mean={sum(val_weights)/len(val_weights):.3f} max={max(val_weights):.3f}"
+        )
+
+    train_loader = build_dataloader(train_dataset, batch_size=args.batch_size, shuffle=not bool(train_weights), weights=train_weights)
+    val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=not bool(val_weights), weights=val_weights)
     test_loader = build_dataloader(test_dataset, batch_size=args.batch_size, shuffle=False) if test_dataset else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1974,11 +2067,23 @@ def main() -> int:
                 cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
                 
                 # Plot confusion matrix
+                from matplotlib.colors import LinearSegmentedColormap
+
+                blue_purple = LinearSegmentedColormap.from_list(
+                    "blue_purple",
+                    ["#dbeafe", "#a78bfa", "#7c3aed"],
+                    N=256,
+                )
                 fig, ax = plt.subplots(figsize=(8, 6))
-                im = ax.imshow(cm, interpolate='nearest', cmap=plt.cm.Blues)
+                im = ax.imshow(cm, interpolation='nearest', cmap=blue_purple)
                 
                 # Labels and formatting
-                class_names = ['Backward (0)', 'Forward (1)']
+                total_examples = int(cm.sum()) if int(cm.sum()) > 0 else 1
+                row_sums = cm.sum(axis=1)
+                class_names = [
+                    f"Backward (n={int(row_sums[0])}, {row_sums[0] / total_examples:.1%})",
+                    f"Forward (n={int(row_sums[1])}, {row_sums[1] / total_examples:.1%})",
+                ]
                 tick_marks = np.arange(len(class_names))
                 ax.set_xticks(tick_marks)
                 ax.set_yticks(tick_marks)
@@ -1986,13 +2091,16 @@ def main() -> int:
                 ax.set_yticklabels(class_names)
                 
                 # Annotations
-                thresh = cm.max() / 2.
+                thresh = cm.max() * 0.65
                 for i in range(cm.shape[0]):
                     for j in range(cm.shape[1]):
-                        ax.text(j, i, f'{cm[i, j]}',
+                        count = cm[i, j]
+                        pct_all = (count / total_examples) * 100.0
+                        pct_row = (count / row_sums[i]) * 100.0 if row_sums[i] > 0 else 0.0
+                        ax.text(j, i, f'{count}\n{pct_all:.1f}% total\n{pct_row:.1f}% row',
                                 ha="center", va="center",
                                 color="white" if cm[i, j] > thresh else "black",
-                                fontsize=12, fontweight='bold')
+                                fontsize=10, fontweight='bold')
                 
                 ax.set_ylabel('True Label', fontsize=12)
                 ax.set_xlabel('Predicted Label', fontsize=12)
