@@ -24,7 +24,7 @@ import re, json, math, os, sys
 from pathlib import Path
 
 # ── colours (one per run) ────────────────────────────────────────────────────
-PALETTE = ["#185FA5", "#C27C0E", "#0F6E56", "#888780", "#7B2D8B", "#A32D2D"]
+PALETTE = ["#0D4DBB", "#E07A00", "#0FA077", "#5A5A5A", "#8C2DAA", "#D53333"]
 
 # ── subtypes that are "reliable" enough to show in subtype charts ─────────────
 MIN_N = 5
@@ -244,24 +244,25 @@ def build_html(runs: list[dict]) -> str:
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
   *, *::before, *::after {{ box-sizing: border-box; }}
-  body {{ font-family: system-ui, sans-serif; background: #f8f8f7; color: #1a1a18;
+  body {{ font-family: system-ui, sans-serif; background: #f4f5f6; color: #1a1a18;
          margin: 0; padding: 2rem 1.5rem; }}
   h1 {{ font-size: 1.4rem; font-weight: 600; margin-bottom: 0.25rem; }}
-  h2 {{ font-size: 1rem; font-weight: 500; color: #555; margin: 2rem 0 0.6rem; border-bottom: 1px solid #e0dfd8; padding-bottom: 4px; }}
+  h2 {{ font-size: 1rem; font-weight: 500; color: #444; margin: 2rem 0 0.6rem; border-bottom: 1px solid #ddd; padding-bottom: 4px; }}
   .legend {{ display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 1.25rem; font-size: 13px; color: #666; }}
   .legend span {{ display: flex; align-items: center; gap: 6px; }}
-  .dot {{ width: 10px; height: 10px; border-radius: 2px; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 1rem; }}
-  th {{ text-align: left; padding: 5px 8px; color: #888; font-weight: 400;
-        border-bottom: 1px solid #e0dfd8; background: #f2f1eb; }}
-  td {{ padding: 5px 8px; border-bottom: 1px solid #eeede6; }}
+  .dot {{ width: 10px; height: 10px; border-radius: 2px; border: 1px solid #cfcfcf; }}
+  table {{ width: auto; max-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; margin-bottom: 0.5rem; border: 1px solid #ddd; table-layout: auto; }}
+  thead th {{ text-align: left; padding: 6px 6px; color: #444; font-weight: 600; border-bottom: 2px solid #cfcfcf; background: #f6f6f6; font-size:13px; white-space:nowrap; }}
+  th {{ text-align: left; padding: 6px 6px; color: #444; font-weight: 600; font-size:13px; white-space:nowrap; }}
+  td {{ padding: 4px 6px; border-top: 1px solid #e6e6e6; background: #fff; font-size:14px; white-space:nowrap; }}
+  tbody tr:nth-child(even) td {{ background: #fbfbfa; }}
   tr:last-child td {{ border-bottom: none; }}
-  .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-  .grid3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
-  .card {{ background: #fff; border-radius: 8px; padding: 1rem; box-shadow: 0 1px 3px #0001; }}
-  .card-title {{ font-size: 12px; font-weight: 500; color: #888; margin-bottom: 8px; text-align: center; }}
-  .chart-wrap {{ position: relative; width: 100%; height: 260px; }}
-  .chart-wrap-lg {{ position: relative; width: 100%; height: 320px; }}
+  .grid2 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }}
+  .grid3 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }}
+  .card {{ background: #fff; border-radius: 8px; padding: 0.85rem; box-shadow: 0 1px 3px #0001; border: 1px solid #e9e9e9; }}
+  .card-title {{ font-size: 12px; font-weight: 500; color: #666; margin-bottom: 6px; text-align: center; }}
+  .chart-wrap {{ position: relative; width: 100%; height: 200px; max-width:100%; }}
+  .chart-wrap-lg {{ position: relative; width: 100%; height: 260px; max-width:100%; }}
   @media (max-width: 680px) {{
     .grid2, .grid3 {{ grid-template-columns: 1fr; }}
   }}
