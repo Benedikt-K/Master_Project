@@ -140,6 +140,7 @@ def make_subarray_augment_fn_with_similarity_filter(
     seed: int = 42,
     max_attempts: int = 5,
     test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
     test_token_sets: dict[int, set[str]] | None = None,
     inverted_index: dict[str, set[int]] | None = None,
     similarity_metric: str = "jaccard",
@@ -199,6 +200,7 @@ def make_subarray_augment_fn_with_similarity_filter(
                     inverted_index=inverted_index,
                     metric=similarity_metric,
                     min_distance=min_distance,
+                    test_signatures_by_idx=test_signatures_by_idx,
                 ):
                     stats["blocked_distance"] += 1
                     continue
@@ -294,12 +296,43 @@ def _candidate_passes_similarity_filter(
     inverted_index: dict[str, set[int]] | None,
     metric: str,
     min_distance: float,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
 ) -> bool:
     """Return True if a candidate is far enough from the test set."""
     if test_token_sets is None or inverted_index is None:
         return True
 
     candidate_tokens = _token_signature(candidate_example)
+
+    # First, check contiguous subarray / superset relationships against nearby test examples
+    if test_signatures_by_idx is not None and candidate_tokens:
+        # compute candidate_test_indices (only those sharing any token)
+        candidate_test_indices: set[int] = set()
+        for token in candidate_tokens:
+            candidate_test_indices.update(inverted_index.get(token, set()))
+
+        if candidate_test_indices:
+            cand_sp = tuple(candidate_example.spacers)
+            cand_re = tuple(candidate_example.repeats)
+            cand_len = len(cand_sp)
+
+            for tidx in candidate_test_indices:
+                tsig = test_signatures_by_idx.get(tidx)
+                if not tsig:
+                    continue
+                test_sp, test_re = tsig
+                # check if candidate is a contiguous subarray of test
+                if cand_len <= len(test_sp):
+                    for i in range(len(test_sp) - cand_len + 1):
+                        if test_sp[i : i + cand_len] == cand_sp and test_re[i : i + cand_len] == cand_re:
+                            return False
+                # check if candidate is a contiguous superset (contains test)
+                tst_len = len(test_sp)
+                if tst_len <= cand_len:
+                    for i in range(cand_len - tst_len + 1):
+                        if cand_sp[i : i + tst_len] == test_sp and cand_re[i : i + tst_len] == test_re:
+                            return False
+
     distance = _min_distance_to_test_set(candidate_tokens, test_token_sets, inverted_index, metric)
     return distance >= min_distance
 
@@ -364,6 +397,7 @@ def _materialize_subarray_augmentations(
     source_indices: list[int],
     seen_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]],
     test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None,
     test_token_sets: dict[int, set[str]] | None,
     inverted_index: dict[str, set[int]] | None,
     seed: int,
@@ -497,6 +531,7 @@ def _materialize_subarray_augmentations(
                 inverted_index=inverted_index,
                 metric=similarity_metric,
                 min_distance=min_distance,
+                test_signatures_by_idx=test_signatures_by_idx,
             ):
                 stats["blocked_similarity"] += 1
                 continue
@@ -1542,13 +1577,16 @@ def main() -> int:
         print("Augmentation similarity safeguard requested, but no test split is present; similarity filtering will be skipped.")
 
     test_signatures = None
+    test_signatures_by_idx = None
     test_token_sets = None
     inverted_index = None
     if use_similarity_filter and test_indices:
+        # keep both a set for quick equality checks and a mapping for positional checks
         test_signatures = {
             _example_signature(base_dataset.records[idx])
             for idx in test_indices
         }
+        test_signatures_by_idx = {idx: _example_signature(base_dataset.records[idx]) for idx in test_indices}
         test_token_sets, inverted_index = _build_test_similarity_index(base_dataset.records, test_indices)
 
     if use_explicit_test_holdout:
@@ -1634,6 +1672,7 @@ def main() -> int:
                     seed=args.seed,
                     max_attempts=5,
                     test_signatures=test_signatures,
+                    test_signatures_by_idx=test_signatures_by_idx,
                     test_token_sets=test_token_sets,
                     inverted_index=inverted_index,
                     similarity_metric=similarity_metric,
@@ -1654,6 +1693,7 @@ def main() -> int:
                 source_indices=list(train_indices),
                 seen_signatures=seen_signatures,
                 test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
                 test_token_sets=test_token_sets,
                 inverted_index=inverted_index,
                 seed=args.seed,
@@ -1673,6 +1713,7 @@ def main() -> int:
                 source_indices=list(val_indices),
                 seen_signatures=seen_signatures,
                 test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
                 test_token_sets=test_token_sets,
                 inverted_index=inverted_index,
                 seed=args.seed + 1,
@@ -1785,6 +1826,7 @@ def main() -> int:
                             source_indices=list(source_pool),
                             seen_signatures=seen_signatures,
                             test_signatures=test_signatures,
+                            test_signatures_by_idx=test_signatures_by_idx,
                             test_token_sets=test_token_sets,
                             inverted_index=inverted_index,
                             seed=round_seed,

@@ -398,8 +398,12 @@ new Chart(document.getElementById('accBar'), {{
 # ═════════════════════════════════════════════════════════════════════════════
 
 INPUT_FILES = [
-    "seed-42.txt",   # ← replace with your actual filenames
-    "seed-63.txt",
+    "sample-0.txt",   # ← replace with your actual filenames
+    "sample-10.txt",
+    "sample-20.txt", 
+    "sample-50.txt", 
+    "sample-100.txt", 
+    "sample-150.txt", 
     # "run3.txt",  # add / remove as needed (up to 6)
 ]
 
