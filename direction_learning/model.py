@@ -26,6 +26,7 @@ class DirectionTransformerConfig:
     num_layers: int = 2
     feedforward_dim: int | None = None
     dropout: float = 0.1
+    activation: str = "gelu"
     max_spacers: int = 64
     include_flanks: bool = False
 
@@ -128,15 +129,16 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
             dim_feedforward=feedforward_dim,
             dropout=config.dropout,
             batch_first=True,
-            activation="gelu",
+            activation=config.activation,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         self.flank_projection = nn.Linear(config.spacer_dim * 2, config.transformer_dim) if config.include_flanks else None
         self.layer_norm = nn.LayerNorm(config.transformer_dim)
         self.dropout = nn.Dropout(config.dropout)
+        act_layer = nn.GELU() if config.activation == "gelu" else nn.ReLU()
         self.classifier = nn.Sequential(
             nn.Linear(config.transformer_dim, config.transformer_dim),
-            nn.GELU(),
+            act_layer,
             nn.Dropout(config.dropout),
             nn.Linear(config.transformer_dim, 1),
         )

@@ -66,6 +66,7 @@ def _sample_config(trial: Any, vocab_size: int, max_spacers: int, include_flanks
     dropout = trial.suggest_float("dropout", 0.0, 0.4)
     feedforward_multiplier = trial.suggest_categorical("feedforward_multiplier", [2, 4, 6])
     feedforward_dim = transformer_dim * feedforward_multiplier
+    activation = trial.suggest_categorical("activation", ["gelu", "relu"])
 
     return DirectionTransformerConfig(
         vocab_size=vocab_size,
@@ -76,6 +77,7 @@ def _sample_config(trial: Any, vocab_size: int, max_spacers: int, include_flanks
         num_layers=num_layers,
         feedforward_dim=feedforward_dim,
         dropout=dropout,
+        activation=activation,
         max_spacers=max_spacers,
         include_flanks=include_flanks,
     )
@@ -165,20 +167,25 @@ def run_study(args: argparse.Namespace) -> int:
             num_heads=config.num_heads,
             num_layers=config.num_layers,
             feedforward_dim=config.feedforward_dim,
+            activation=config.activation,
         ).to(device)
 
-        optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam"])
+        optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam", "sgd"])
         lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+        if optimizer_name == "sgd":
+            momentum = trial.suggest_float("momentum", 0.0, 0.99)
 
         train_loader_trial = build_dataloader(DirectionTorchDataset(dataset, train_indices, vocab), batch_size=batch_size, shuffle=True)
         val_loader_trial = build_dataloader(DirectionTorchDataset(dataset, val_indices, vocab), batch_size=batch_size, shuffle=False)
 
         if optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        else:
+        elif optimizer_name == "adam":
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
 
         best_val_loss = float("inf")
         best_val_metrics = None
