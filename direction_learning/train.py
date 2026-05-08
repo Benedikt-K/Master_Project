@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +41,16 @@ def _require_torch() -> None:
         raise ModuleNotFoundError(
             "PyTorch is required to run the direction training entrypoint. Install torch first."
         )
+
+
+def _timestamp() -> str:
+    """Return a human-readable wall-clock timestamp for log lines."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _print_ts(message: str) -> None:
+    """Print a log line with a wall-clock timestamp prefix."""
+    print(f"[{_timestamp()}] {message}")
 
 
 def split_groups(examples: list[DirectionExample], seed: int = 13, train_fraction: float = 0.7, val_fraction: float = 0.15) -> dict[str, list[int]]:
@@ -437,7 +448,7 @@ def _materialize_subarray_augmentations(
         "source_examples": len(source_indices),
     }
 
-    print(f"Augmentation: {split_name} starting materialization of {len(source_indices)} source examples...")
+    _print_ts(f"Augmentation: {split_name} starting materialization of {len(source_indices)} source examples...")
     source_list = list(source_indices)
     
     # When balancing, distribute augmentations evenly across all source arrays
@@ -446,11 +457,11 @@ def _materialize_subarray_augmentations(
         # Calculate fair per-array cap: distribute target evenly across all sources
         per_array_target = math.ceil(target_additions / len(source_list))
         effective_max_per_array = min(max_per_array, per_array_target) if max_per_array > 0 else per_array_target
-        print(f"Augmentation: {split_name} balancing per-array distribution: need {target_additions} total across {len(source_list)} arrays, cap per-array to {effective_max_per_array}")
+        _print_ts(f"Augmentation: {split_name} balancing per-array distribution: need {target_additions} total across {len(source_list)} arrays, cap per-array to {effective_max_per_array}")
     
     for i_example, orig_idx in enumerate(source_list, 1):
         if i_example % 50 == 1 or i_example == 1:
-            print(f"  Augmentation: {split_name} processing example {i_example}/{len(source_list)} (added so far: {stats['added']})")
+            _print_ts(f"  Augmentation: {split_name} processing example {i_example}/{len(source_list)} (added so far: {stats['added']})")
         ex = base_dataset.records[orig_idx]
         n = len(ex.spacers)
         if n <= min_spacers:
@@ -549,13 +560,13 @@ def _materialize_subarray_augmentations(
         if target_additions > 0 and stats["added"] >= target_additions:
             break
 
-    print(
+    _print_ts(
         f"Augmentation: {split_name} added {stats['added']} examples "
         f"(blocked_overlap={stats['blocked_overlap']}, blocked_similarity={stats['blocked_similarity']}, "
         f"skipped_short={stats['skipped_short']})"
     )
     if mode == "enumerate" and max_per_array > 0:
-        print(f"Augmentation: {split_name} cap_hit_on={stats['capped_arrays']} arrays")
+        _print_ts(f"Augmentation: {split_name} cap_hit_on={stats['capped_arrays']} arrays")
 
     return new_indices, stats
 
@@ -1515,6 +1526,9 @@ def main() -> int:
 
     _require_torch()
 
+    augmentation_elapsed = 0.0
+    training_elapsed = 0.0
+
     base_dataset = DirectionJsonlDataset(args.jsonl, include_flanks=args.include_flanks)
     base_len = len(base_dataset.records)
     vocab = build_vocab_from_jsonl(args.jsonl)
@@ -1649,18 +1663,21 @@ def main() -> int:
         and args.augment_subarrays_mode == "enumerate"
     )
 
+    augmentation_started_at = None
+
     if getattr(args, "augment_subarrays", False):
+        augmentation_started_at = time.perf_counter()
         mode = args.augment_subarrays_mode
         min_spacers = max(1, args.augment_subarrays_min_spacers)
         max_per_array = args.augment_subarrays_max_per_array
 
-        print(
+        _print_ts(
             "Augmentation: spacer deletion enabled for train and validation "
             f"(test untouched; mode={mode}, min_spacers={min_spacers}, "
             f"max_per_array={max_per_array if max_per_array > 0 else 'unlimited'})"
         )
         if use_similarity_filter:
-            print(
+            _print_ts(
                 f"Augmentation: similarity safeguard enabled using {similarity_metric} with min_distance={args.aug_similarity_min_distance:.2f}"
             )
 
@@ -1680,7 +1697,7 @@ def main() -> int:
                 )
             else:
                 augment_fn = make_subarray_augment_fn(prob=args.augment_subarrays_prob, seed=args.seed)
-            print(f"Augmentation: random subarray deletion (on-the-fly) enabled for train and validation")
+            _print_ts("Augmentation: random subarray deletion (on-the-fly) enabled for train and validation")
         elif not skip_standard_augment_for_balancing:
             # Enumerate mode without balancing: materialize diverse subarrays upfront for train and val
             seen_signatures = {
@@ -1729,7 +1746,7 @@ def main() -> int:
             val_indices = list(val_indices) + val_new_indices
 
             if use_similarity_filter:
-                print(
+                _print_ts(
                     "Augmentation similarity summary: "
                     f"train_blocked={train_aug_stats.get('blocked_similarity', 0)} "
                     f"val_blocked={val_aug_stats.get('blocked_similarity', 0)} "
@@ -1738,7 +1755,7 @@ def main() -> int:
                 )
         else:
             # Enumerate mode with balancing: skip standard pass, will be handled by balancing logic below
-            print("Augmentation: skipping standard enumerate pass; will use subtype-aware balancing instead")
+            _print_ts("Augmentation: skipping standard enumerate pass; will use subtype-aware balancing instead")
             seen_signatures = {
                 _example_signature(example)
                 for example in base_dataset.records
@@ -1749,15 +1766,15 @@ def main() -> int:
     # targets upfront and only materializes what's needed for each subtype.
     if getattr(args, "augment_subtypes_balance", False):
         if not getattr(args, "augment_subarrays", False):
-            print("augment_subtypes_balance requested but --augment_subarrays not set; skipping balancing.")
+            _print_ts("augment_subtypes_balance requested but --augment_subarrays not set; skipping balancing.")
         elif args.augment_subarrays_mode != "enumerate":
-            print("augment_subtypes_balance requires --augment_subarrays_mode enumerate; skipping balancing.")
+            _print_ts("augment_subtypes_balance requires --augment_subarrays_mode enumerate; skipping balancing.")
         else:
             # Ensure seen_signatures is initialized
             if 'seen_signatures' not in locals():
                 seen_signatures = {_example_signature(example) for example in base_dataset.records}
 
-            print("Augmentation: subtype-aware balancing—computing per-subtype targets and materializing only what's needed")
+            _print_ts("Augmentation: subtype-aware balancing—computing per-subtype targets and materializing only what's needed")
 
             min_spacers = max(1, args.augment_subarrays_min_spacers)
             max_per_array = args.augment_subarrays_max_per_array
@@ -1770,7 +1787,7 @@ def main() -> int:
             train_size = len(train_indices)
             val_size = len(val_indices)
             val_to_train_ratio = val_size / train_size if train_size > 0 else 0.2
-            print(f"Augmentation: val/train ratio = {val_to_train_ratio:.3f} (will scale val targets proportionally)")
+            _print_ts(f"Augmentation: val/train ratio = {val_to_train_ratio:.3f} (will scale val targets proportionally)")
 
             for split_name in ["train", "val"]:
                 split_indices = train_indices if split_name == "train" else val_indices
@@ -1797,19 +1814,19 @@ def main() -> int:
                         subtype_needs[subtype] = target - cnt
 
                 if not subtype_needs:
-                    print(f"Balancing {split_name}: all subtypes already at or above target {target}")
+                    _print_ts(f"Balancing {split_name}: all subtypes already at or above target {target}")
                     continue
 
-                print(f"Balancing {split_name}: target={target}, subtype needs: {subtype_needs}")
+                _print_ts(f"Balancing {split_name}: target={target}, subtype needs: {subtype_needs}")
 
                 # Now materialize only what's needed for each under-represented subtype
                 for subtype, needed in sorted(subtype_needs.items()):
-                    print(f"Balancing {split_name}: augmenting subtype={subtype} (current={counts[subtype]}, need={needed} more)")
+                    _print_ts(f"Balancing {split_name}: augmenting subtype={subtype} (current={counts[subtype]}, need={needed} more)")
 
                     # Get source examples for this subtype from the current split
                     source_pool = [i for i in list(split_indices) if _subtype_of(i) == subtype]
                     if not source_pool:
-                        print(f"  No source examples for subtype {subtype}; skipping")
+                        _print_ts(f"  No source examples for subtype {subtype}; skipping")
                         continue
 
                     added_total = 0
@@ -1819,7 +1836,7 @@ def main() -> int:
                     # Loop until we've added enough or augmentation stops producing new examples
                     while added_total < needed:
                         attempt += 1
-                        print(f"  Round {attempt}: generating augmentations for subtype={subtype} (need {needed - added_total} more)")
+                        _print_ts(f"  Round {attempt}: generating augmentations for subtype={subtype} (need {needed - added_total} more)")
 
                         new_indices, aug_stats = _materialize_subarray_augmentations(
                             base_dataset=base_dataset,
@@ -1843,7 +1860,7 @@ def main() -> int:
                         )
 
                         if not new_indices:
-                            print(f"  Round {attempt}: no augmentations produced; stopped after adding {added_total}/{needed}")
+                            _print_ts(f"  Round {attempt}: no augmentations produced; stopped after adding {added_total}/{needed}")
                             break
 
                         # Function now stops early when target_additions is reached, so we add all returned indices
@@ -1851,9 +1868,12 @@ def main() -> int:
                         added_total += len(new_indices)
                         counts[subtype] = counts.get(subtype, 0) + len(new_indices)
                         round_seed += 2
-                        print(f"  Round {attempt}: added {len(new_indices)} examples (total: {added_total}/{needed})")
+                        _print_ts(f"  Round {attempt}: added {len(new_indices)} examples (total: {added_total}/{needed})")
 
-                    print(f"  Subtype={subtype} balancing complete: added {added_total}/{needed}, final_count={counts.get(subtype, 0)}")
+                    _print_ts(f"  Subtype={subtype} balancing complete: added {added_total}/{needed}, final_count={counts.get(subtype, 0)}")
+
+    if augmentation_started_at is not None:
+        augmentation_elapsed = time.perf_counter() - augmentation_started_at
 
 
     train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn)
@@ -1957,6 +1977,8 @@ def main() -> int:
     train_losses = []
     val_losses = []
     test_losses = []
+
+    training_started_at = time.perf_counter()
     
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
@@ -2006,6 +2028,8 @@ def main() -> int:
         if patience_counter >= args.early_stopping_patience:
             print(f"Early stopping: validation loss did not improve for {args.early_stopping_patience} epochs.")
             break
+
+    training_elapsed = time.perf_counter() - training_started_at
 
     # Restore best model before final evaluation
     if best_model_state is not None:
@@ -2189,6 +2213,14 @@ def main() -> int:
                     metrics["f1"],
                 )
             )
+
+    total_elapsed = augmentation_elapsed + training_elapsed
+    _print_ts(
+        "Timing summary: "
+        f"augmentation_time={augmentation_elapsed:.2f}s "
+        f"training_time={training_elapsed:.2f}s "
+        f"total_time={total_elapsed:.2f}s"
+    )
     return 0
 
 
