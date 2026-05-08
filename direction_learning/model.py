@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 try:
     import torch
@@ -23,6 +24,7 @@ class DirectionTransformerConfig:
     transformer_dim: int = 128
     num_heads: int = 4
     num_layers: int = 2
+    feedforward_dim: int | None = None
     dropout: float = 0.1
     max_spacers: int = 64
     include_flanks: bool = False
@@ -62,7 +64,7 @@ class MeanPoolSequenceEncoder(nn.Module if nn is not None else object):
             nn.Dropout(dropout),
         )
 
-    def forward(self, token_batch: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, token_batch: Any, token_mask: Any = None) -> Any:
         """Encode token sequences to embeddings.
         
         Args:
@@ -72,6 +74,11 @@ class MeanPoolSequenceEncoder(nn.Module if nn is not None else object):
         Returns:
             torch.Tensor: Shape (batch_size, spacer_dim) fixed-size embeddings.
         """
+        if token_batch.shape[1] == 0:
+            batch_size = token_batch.shape[0]
+            output_dim = self.projection[0].out_features
+            return torch.zeros((batch_size, output_dim), device=token_batch.device, dtype=self.embedding.weight.dtype)
+
         embedded = self.embedding(token_batch)
         if token_mask is None:
             pooled = embedded.mean(dim=1)
@@ -99,7 +106,14 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         _require_torch()
         super().__init__()
         self.config = config
+        self.include_flanks = config.include_flanks
         self.sequence_encoder = MeanPoolSequenceEncoder(
+            vocab_size=config.vocab_size,
+            token_dim=config.token_dim,
+            spacer_dim=config.spacer_dim,
+            dropout=config.dropout,
+        )
+        self.flank_encoder = MeanPoolSequenceEncoder(
             vocab_size=config.vocab_size,
             token_dim=config.token_dim,
             spacer_dim=config.spacer_dim,
@@ -107,15 +121,17 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         )
         self.spacer_position_embedding = nn.Embedding(config.max_spacers, config.transformer_dim)
         self.spacer_projection = nn.Linear(config.spacer_dim, config.transformer_dim)
+        feedforward_dim = config.feedforward_dim if config.feedforward_dim is not None else config.transformer_dim * 4
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.transformer_dim,
             nhead=config.num_heads,
-            dim_feedforward=config.transformer_dim * 4,
+            dim_feedforward=feedforward_dim,
             dropout=config.dropout,
             batch_first=True,
             activation="gelu",
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+        self.flank_projection = nn.Linear(config.spacer_dim * 2, config.transformer_dim) if config.include_flanks else None
         self.layer_norm = nn.LayerNorm(config.transformer_dim)
         self.dropout = nn.Dropout(config.dropout)
         self.classifier = nn.Sequential(
@@ -125,7 +141,7 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
             nn.Linear(config.transformer_dim, 1),
         )
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: dict[str, Any]) -> Any:
         """Predict direction logits for a batch of arrays.
         
         Args:
@@ -146,6 +162,22 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         spacer_embeddings = self.spacer_projection(spacer_embeddings)
         spacer_embeddings = spacer_embeddings.view(batch_size, max_spacers, -1)
 
+        if self.include_flanks:
+            left_flank_tokens = batch.get("left_flank_tokens")
+            right_flank_tokens = batch.get("right_flank_tokens")
+            if left_flank_tokens is None:
+                left_flank_tokens = torch.zeros((batch_size, 0), dtype=spacer_tokens.dtype, device=spacer_tokens.device)
+            if right_flank_tokens is None:
+                right_flank_tokens = torch.zeros((batch_size, 0), dtype=spacer_tokens.dtype, device=spacer_tokens.device)
+
+            left_mask = left_flank_tokens.ne(0)
+            right_mask = right_flank_tokens.ne(0)
+            left_embed = self.flank_encoder(left_flank_tokens, left_mask)
+            right_embed = self.flank_encoder(right_flank_tokens, right_mask)
+            flank_context = torch.cat([left_embed, right_embed], dim=-1)
+            flank_context = self.flank_projection(flank_context).unsqueeze(1)
+            spacer_embeddings = spacer_embeddings + flank_context
+
         positions = torch.arange(max_spacers, device=spacer_embeddings.device).unsqueeze(0).expand(batch_size, -1)
         spacer_embeddings = spacer_embeddings + self.spacer_position_embedding(positions)
         spacer_embeddings = self.layer_norm(spacer_embeddings)
@@ -160,7 +192,18 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         return logits
 
 
-def build_model(vocab_size: int, include_flanks: bool = False, max_spacers: int = 64, dropout: float = 0.1) -> SpacerDirectionTransformer:
+def build_model(
+    vocab_size: int,
+    include_flanks: bool = False,
+    max_spacers: int = 64,
+    dropout: float = 0.1,
+    token_dim: int = 64,
+    spacer_dim: int = 128,
+    transformer_dim: int = 128,
+    num_heads: int = 4,
+    num_layers: int = 2,
+    feedforward_dim: int | None = None,
+) -> SpacerDirectionTransformer:
     """Instantiate a SpacerDirectionTransformer with default configuration.
     
     Creates a pre-configured transformer model suitable for binary direction
@@ -171,6 +214,13 @@ def build_model(vocab_size: int, include_flanks: bool = False, max_spacers: int 
         include_flanks: If True, configure model to accept flank sequences.
         max_spacers: Maximum number of spacers to support in embeddings.
         dropout: Dropout rate for regularization (default 0.1).
+        token_dim: DNA token embedding dimension.
+        spacer_dim: Projected spacer embedding dimension.
+        transformer_dim: Transformer hidden dimension.
+        num_heads: Number of attention heads.
+        num_layers: Number of transformer encoder layers.
+        feedforward_dim: Transformer feedforward hidden dimension. If None,
+            defaults to four times transformer_dim.
         
     Returns:
         SpacerDirectionTransformer: Initialized model ready for training.
@@ -179,5 +229,16 @@ def build_model(vocab_size: int, include_flanks: bool = False, max_spacers: int 
         ModuleNotFoundError: If PyTorch is not installed.
     """
     _require_torch()
-    config = DirectionTransformerConfig(vocab_size=vocab_size, include_flanks=include_flanks, max_spacers=max_spacers, dropout=dropout)
+    config = DirectionTransformerConfig(
+        vocab_size=vocab_size,
+        token_dim=token_dim,
+        spacer_dim=spacer_dim,
+        transformer_dim=transformer_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        feedforward_dim=feedforward_dim,
+        dropout=dropout,
+        max_spacers=max_spacers,
+        include_flanks=include_flanks,
+    )
     return SpacerDirectionTransformer(config)
