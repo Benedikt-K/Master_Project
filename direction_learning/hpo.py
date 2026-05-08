@@ -22,7 +22,15 @@ except ModuleNotFoundError:
 
 from .dataset import DirectionJsonlDataset, build_vocab_from_jsonl
 from .model import DirectionTransformerConfig, build_model
-from .train import DirectionTorchDataset, build_dataloader, evaluate, split_groups, train_one_epoch
+from .train import (
+    DirectionTorchDataset,
+    build_dataloader,
+    evaluate,
+    split_groups,
+    split_dev_pool_by_mode,
+    stratified_holdout_by_mode,
+    train_one_epoch,
+)
 
 
 def _require_dependencies() -> None:
@@ -99,13 +107,32 @@ def run_study(args: argparse.Namespace) -> int:
     if base_len == 0:
         raise ValueError("Dataset is empty")
 
-    splits = split_groups(dataset.records, seed=args.seed, train_fraction=args.train_fraction, val_fraction=args.val_fraction)
-    train_indices = splits["train"]
-    val_indices = splits["val"]
-    test_indices = splits["test"]
+    stratify_mode = args.stratify_by
+    use_explicit_test_holdout = args.test_size and 0.0 < args.test_size < 1.0
+    if args.test_size and not (0.0 < args.test_size < 1.0):
+        raise ValueError("test_size must be in (0.0, 1.0)")
+
+    if use_explicit_test_holdout:
+        dev_indices, test_indices = stratified_holdout_by_mode(
+            dataset.records,
+            seed=args.seed,
+            holdout_fraction=args.test_size,
+            stratify_mode=stratify_mode,
+        )
+        train_indices, val_indices = split_dev_pool_by_mode(
+            dataset.records,
+            pool_indices=dev_indices,
+            seed=args.seed,
+            stratify_mode=stratify_mode,
+        )
+    else:
+        splits = split_groups(dataset.records, seed=args.seed, train_fraction=args.train_fraction, val_fraction=args.val_fraction)
+        train_indices = splits["train"]
+        val_indices = splits["val"]
+        test_indices = splits["test"]
 
     _print(
-        f"Loaded dataset={jsonl_path} records={base_len} train={len(train_indices)} val={len(val_indices)} test={len(test_indices)} include_flanks={args.include_flanks}"
+        f"Loaded dataset={jsonl_path} records={base_len} train={len(train_indices)} val={len(val_indices)} test={len(test_indices)} stratify_by={stratify_mode}"
     )
 
     train_dataset = DirectionTorchDataset(dataset, train_indices, vocab)
@@ -154,6 +181,8 @@ def run_study(args: argparse.Namespace) -> int:
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         best_val_loss = float("inf")
+        best_val_metrics = None
+        best_model_state = None
         patience_counter = 0
         for epoch in range(1, args.max_epochs + 1):
             train_one_epoch(model, train_loader_trial, optimizer, loss_fn, device)
@@ -164,11 +193,32 @@ def run_study(args: argparse.Namespace) -> int:
                 raise TrialPruned()
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_val_metrics = metrics
+                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
                 patience_counter += 1
             if patience_counter >= args.early_stopping_patience:
                 break
+
+        # Restore best model and evaluate on test set
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        
+        best_test_metrics = None
+        if test_loader is not None:
+            best_test_metrics = evaluate(model, test_loader, loss_fn, device)
+        
+        # Store metrics in trial for later retrieval
+        trial.set_user_attr("best_val_loss", best_val_loss)
+        if best_val_metrics:
+            for key, value in best_val_metrics.items():
+                if isinstance(value, (int, float)):
+                    trial.set_user_attr(f"val_{key}", float(value))
+        if best_test_metrics:
+            for key, value in best_test_metrics.items():
+                if isinstance(value, (int, float)):
+                    trial.set_user_attr(f"test_{key}", float(value))
 
         return best_val_loss
 
@@ -221,26 +271,35 @@ def run_study(args: argparse.Namespace) -> int:
     )
     with trials_path.open("w") as handle:
         for trial in study.trials:
-            handle.write(
-                json.dumps(
-                    {
-                        "number": trial.number,
-                        "state": str(trial.state),
-                        "value": trial.value,
-                        "params": trial.params,
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
+            trial_data = {
+                "number": trial.number,
+                "state": str(trial.state),
+                "value": trial.value,
+                "params": trial.params,
+            }
+            # Include all user attributes (metrics) in the trial data
+            if trial.user_attrs:
+                trial_data["metrics"] = trial.user_attrs
+            handle.write(json.dumps(trial_data, sort_keys=True) + "\n")
 
     _print(f"Best trial={best_trial.number} val_loss={best_trial.value:.6f}")
     _print(f"Best config saved to {best_config_path}")
     _print(f"Trials saved to {trials_path}")
+    # Save best trial metrics
+    best_metrics_path = results_dir / "best_metrics.json"
+    best_metrics = {
+        "trial": best_trial.number,
+        "val_loss": float(best_trial.value),
+    }
+    if best_trial.user_attrs:
+        best_metrics.update(best_trial.user_attrs)
+    best_metrics_path.write_text(json.dumps(best_metrics, indent=2, sort_keys=True) + "\n")
+    _print(f"Best metrics saved to {best_metrics_path}")
+
 
     if args.final_retrain:
         best_params = best_trial.params
-        config = DirectionTransformerConfig(
+        best_config_obj = DirectionTransformerConfig(
             vocab_size=len(vocab),
             token_dim=int(best_params["token_dim"]),
             spacer_dim=int(best_params["spacer_dim"]),
@@ -253,16 +312,16 @@ def run_study(args: argparse.Namespace) -> int:
             include_flanks=args.include_flanks,
         )
         model = build_model(
-            vocab_size=config.vocab_size,
-            include_flanks=config.include_flanks,
-            max_spacers=config.max_spacers,
-            dropout=config.dropout,
-            token_dim=config.token_dim,
-            spacer_dim=config.spacer_dim,
-            transformer_dim=config.transformer_dim,
-            num_heads=config.num_heads,
-            num_layers=config.num_layers,
-            feedforward_dim=config.feedforward_dim,
+            vocab_size=best_config_obj.vocab_size,
+            include_flanks=best_config_obj.include_flanks,
+            max_spacers=best_config_obj.max_spacers,
+            dropout=best_config_obj.dropout,
+            token_dim=best_config_obj.token_dim,
+            spacer_dim=best_config_obj.spacer_dim,
+            transformer_dim=best_config_obj.transformer_dim,
+            num_heads=best_config_obj.num_heads,
+            num_layers=best_config_obj.num_layers,
+            feedforward_dim=best_config_obj.feedforward_dim,
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=best_params["lr"], weight_decay=best_params["weight_decay"])
         retrain_train_indices = train_indices + val_indices
@@ -288,8 +347,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", default="", help="Torch device override")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for the initial split metadata")
-    parser.add_argument("--train_fraction", type=float, default=0.7, help="Training fraction for the fixed split")
-    parser.add_argument("--val_fraction", type=float, default=0.15, help="Validation fraction for the fixed split")
+    parser.add_argument(
+        "--stratify_by",
+        type=str,
+        default="cas_subtype",
+        choices=["label", "cas_subtype"],
+        help="Stratification method: 'label' (balanced classes) or 'cas_subtype' (CRISPR type). Default: cas_subtype.",
+    )
+    parser.add_argument(
+        "--test_size",
+        "--test_within_train_fraction",
+        dest="test_size",
+        type=float,
+        default=0.2,
+        help="Fraction of the full dataset to hold out as the final test set (default 0.2 for 20%%).",
+    )
+    parser.add_argument("--train_fraction", type=float, default=0.64, help="Training fraction (only used if test_size=0; legacy behavior)")
+    parser.add_argument("--val_fraction", type=float, default=0.16, help="Validation fraction (only used if test_size=0; legacy behavior)")
     parser.add_argument("--include_flanks", action="store_true", help="Include flank tokens in the model/search")
     parser.add_argument("--max_epochs", type=int, default=30, help="Maximum epochs per trial")
     parser.add_argument("--early_stopping_patience", type=int, default=5, help="Early stopping patience per trial")
