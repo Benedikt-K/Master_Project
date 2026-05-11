@@ -1,0 +1,2421 @@
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import time
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import torch
+    from torch.utils.data import DataLoader, Dataset
+except ModuleNotFoundError:
+    torch = None
+    DataLoader = object
+    Dataset = object
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
+
+from .dataset import (
+    DirectionExample,
+    DirectionJsonlDataset,
+    build_vocab_from_jsonl,
+    collate_encoded_examples,
+    encode_example,
+)
+from .tokenization import reverse_complement
+from direction_learning.model import SpacerDirectionTransformer, build_model
+
+
+def _require_torch() -> None:
+    """Raise error if PyTorch is not installed."""
+    if torch is None:
+        raise ModuleNotFoundError(
+            "PyTorch is required to run the direction training entrypoint. Install torch first."
+        )
+
+
+def _timestamp() -> str:
+    """Return a human-readable wall-clock timestamp for log lines."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _print_ts(message: str) -> None:
+    """Print a log line with a wall-clock timestamp prefix."""
+    print(f"[{_timestamp()}] {message}")
+
+
+def _reverse_complement_example(example: DirectionExample) -> DirectionExample:
+    """Return the reverse-complemented counterpart of a CRISPR array example."""
+    flipped_label = 1 - int(example.label)
+    flipped_direction = "Forward" if flipped_label == 1 else "Reverse"
+    return DirectionExample(
+        array_name=example.array_name,
+        group_name=example.group_name,
+        agreement=example.agreement,
+        evor_direction=flipped_direction,
+        label=flipped_label,
+        orientation_variant="reverse_complement",
+        source_variant=example.orientation_variant,
+        spacers=[reverse_complement(seq) for seq in reversed(example.spacers)],
+        repeats=[reverse_complement(seq) for seq in reversed(example.repeats)],
+        cas_subtype=example.cas_subtype,
+        left_flank=reverse_complement(example.right_flank),
+        right_flank=reverse_complement(example.left_flank),
+        source_json=example.source_json,
+    )
+
+
+def _materialize_reverse_complement_augmentation(
+    base_dataset: DirectionJsonlDataset,
+    source_indices: list[int],
+    test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_token_sets: dict[int, set[str]] | None = None,
+    inverted_index: dict[str, set[int]] | None = None,
+    similarity_metric: str = "jaccard",
+    min_distance: float = 0.0,
+) -> tuple[list[int], dict[str, int]]:
+    """Duplicate a split with reverse-complemented examples before other augmentation."""
+    new_indices: list[int] = []
+    stats = {"added": 0, "blocked_similarity": 0}
+
+    for idx in source_indices:
+        candidate_example = _reverse_complement_example(base_dataset.records[idx])
+        if not _candidate_passes_similarity_filter(
+            candidate_example,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            metric=similarity_metric,
+            min_distance=min_distance,
+            test_signatures_by_idx=test_signatures_by_idx,
+        ):
+            stats["blocked_similarity"] += 1
+            continue
+
+        if test_signatures is not None:
+            candidate_sig = _example_signature(candidate_example)
+            if candidate_sig in test_signatures:
+                stats["blocked_similarity"] += 1
+                continue
+
+        base_dataset.records.append(candidate_example)
+        new_indices.append(len(base_dataset.records) - 1)
+        stats["added"] += 1
+
+    return new_indices, stats
+
+
+def split_groups(examples: list[DirectionExample], seed: int = 13, train_fraction: float = 0.7, val_fraction: float = 0.15) -> dict[str, list[int]]:
+    """Split examples by group for train/val/test (preserves group cohesion).
+    
+    Groups examples by group_name (e.g., genome cluster), randomly shuffles
+    groups, then assigns groups to splits to preserve biological coherence.
+    
+    Args:
+        examples: List of DirectionExample objects to split.
+        seed: Random seed for reproducibility.
+        train_fraction: Fraction of groups to assign to training (default 0.7).
+        val_fraction: Fraction of groups to assign to validation (default 0.15).
+            Remaining fraction goes to test.
+            
+    Returns:
+        dict[str, list[int]]: Mapping of split names ("train", "val", "test")
+            to lists of indices into the examples list.
+            
+    Raises:
+        ValueError: If train_fraction + val_fraction >= 1.0.
+    """
+    if train_fraction + val_fraction >= 1.0:
+        raise ValueError("train_fraction + val_fraction must be smaller than 1.0")
+
+    grouped_indices: dict[str, list[int]] = {}
+    for index, example in enumerate(examples):
+        grouped_indices.setdefault(example.group_name, []).append(index)
+
+    groups = list(grouped_indices)
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+
+    n_groups = len(groups)
+    n_train = max(1, round(n_groups * train_fraction))
+    n_val = max(1, round(n_groups * val_fraction))
+    if n_train + n_val >= n_groups:
+        n_val = max(1, min(n_val, n_groups - n_train - 1))
+
+    train_groups = groups[:n_train]
+    val_groups = groups[n_train:n_train + n_val]
+    test_groups = groups[n_train + n_val:]
+
+    return {
+        "train": [index for group in train_groups for index in grouped_indices[group]],
+        "val": [index for group in val_groups for index in grouped_indices[group]],
+        "test": [index for group in test_groups for index in grouped_indices[group]],
+    }
+
+
+def make_subarray_augment_fn(prob: float = 1.0, seed: int = 42):
+    """Return an augment_fn that deletes a random subset of spacers (preserving order).
+
+    The augment_fn returns either the original example or a new DirectionExample
+    with a subset of spacers/repeats chosen uniformly by size and indices.
+    """
+    rng = random.Random(seed)
+
+    def augment_fn(example: DirectionExample) -> DirectionExample:
+        try:
+            if rng.random() >= float(prob):
+                return example
+
+            n = len(example.spacers)
+            # Nothing to drop if <=1 spacer
+            if n <= 1:
+                return example
+
+            # choose subset size between 1 and n-1 (so we produce a proper subarray)
+            k = rng.randint(1, n - 1)
+            keep_indices = sorted(rng.sample(range(n), k))
+            new_spacers = [example.spacers[i] for i in keep_indices]
+            new_repeats = [example.repeats[i] for i in keep_indices]
+
+            return DirectionExample(
+                array_name=example.array_name,
+                group_name=example.group_name,
+                agreement=example.agreement,
+                evor_direction=example.evor_direction,
+                label=example.label,
+                orientation_variant=example.orientation_variant,
+                source_variant=example.source_variant,
+                spacers=new_spacers,
+                repeats=new_repeats,
+                cas_subtype=example.cas_subtype,
+                left_flank=example.left_flank,
+                right_flank=example.right_flank,
+                source_json=example.source_json,
+            )
+        except Exception:
+            return example
+
+    return augment_fn
+
+
+def make_subarray_augment_fn_with_similarity_filter(
+    prob: float = 1.0,
+    seed: int = 42,
+    max_attempts: int = 5,
+    test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_token_sets: dict[int, set[str]] | None = None,
+    inverted_index: dict[str, set[int]] | None = None,
+    similarity_metric: str = "jaccard",
+    min_distance: float = 0.0,
+):
+    """Return an augment_fn that also filters candidates against the test set.
+
+    This is only used when the optional similarity safeguard is enabled.
+    """
+    rng = random.Random(seed)
+
+    stats = {
+        "accepted": 0,
+        "blocked_exact": 0,
+        "blocked_distance": 0,
+        "attempts": 0,
+    }
+
+    def augment_fn(example: DirectionExample) -> DirectionExample:
+        try:
+            if rng.random() >= float(prob):
+                return example
+
+            n = len(example.spacers)
+            if n <= 1:
+                return example
+
+            for _ in range(max(1, max_attempts)):
+                stats["attempts"] += 1
+                k = rng.randint(1, n - 1)
+                keep_indices = sorted(rng.sample(range(n), k))
+                new_spacers = [example.spacers[i] for i in keep_indices]
+                new_repeats = [example.repeats[i] for i in keep_indices]
+                candidate = DirectionExample(
+                    array_name=example.array_name,
+                    group_name=example.group_name,
+                    agreement=example.agreement,
+                    evor_direction=example.evor_direction,
+                    label=example.label,
+                    orientation_variant=example.orientation_variant,
+                    source_variant=example.source_variant,
+                    spacers=new_spacers,
+                    repeats=new_repeats,
+                    cas_subtype=example.cas_subtype,
+                    left_flank=example.left_flank,
+                    right_flank=example.right_flank,
+                    source_json=example.source_json,
+                )
+
+                candidate_sig = _example_signature(candidate)
+                if test_signatures is not None and candidate_sig in test_signatures:
+                    stats["blocked_exact"] += 1
+                    continue
+                if not _candidate_passes_similarity_filter(
+                    candidate,
+                    test_token_sets=test_token_sets,
+                    inverted_index=inverted_index,
+                    metric=similarity_metric,
+                    min_distance=min_distance,
+                    test_signatures_by_idx=test_signatures_by_idx,
+                ):
+                    stats["blocked_distance"] += 1
+                    continue
+
+                stats["accepted"] += 1
+                return candidate
+
+            return example
+        except Exception:
+            return example
+
+    augment_fn.similarity_stats = stats  # type: ignore[attr-defined]
+    return augment_fn
+
+
+def _example_signature(example: DirectionExample) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (tuple(example.spacers), tuple(example.repeats))
+
+
+def _token_signature(example: DirectionExample) -> set[str]:
+    """Return a lightweight token set for similarity checks.
+
+    Prefixes keep spacer and repeat tokens distinct while still making set-based
+    overlap computations cheap.
+    """
+    return {f"S:{spacer}" for spacer in example.spacers} | {f"R:{repeat}" for repeat in example.repeats}
+
+
+def _build_test_similarity_index(
+    records: list[DirectionExample],
+    test_indices: list[int],
+) -> tuple[dict[int, set[str]], dict[str, set[int]]]:
+    """Build a compact inverted index over held-out test examples.
+
+    The returned structures let us compute candidate-to-test similarity without
+    comparing against every test record.
+    """
+    test_token_sets: dict[int, set[str]] = {}
+    inverted_index: dict[str, set[int]] = {}
+    for idx in test_indices:
+        token_set = _token_signature(records[idx])
+        test_token_sets[idx] = token_set
+        for token in token_set:
+            inverted_index.setdefault(token, set()).add(idx)
+    return test_token_sets, inverted_index
+
+
+def _min_distance_to_test_set(
+    candidate_tokens: set[str],
+    test_token_sets: dict[int, set[str]],
+    inverted_index: dict[str, set[int]],
+    metric: str,
+) -> float:
+    """Compute the minimum distance from a candidate to any test example.
+
+    Only test examples sharing at least one token with the candidate are checked,
+    which keeps the runtime low while still being exact for the chosen metric.
+    """
+    if not candidate_tokens or not test_token_sets:
+        return 1.0
+
+    candidate_test_indices: set[int] = set()
+    for token in candidate_tokens:
+        candidate_test_indices.update(inverted_index.get(token, set()))
+
+    if not candidate_test_indices:
+        return 1.0
+
+    best_distance = 1.0
+    candidate_size = len(candidate_tokens)
+    for test_idx in candidate_test_indices:
+        test_tokens = test_token_sets[test_idx]
+        intersection = len(candidate_tokens & test_tokens)
+        if metric == "overlap":
+            denom = min(candidate_size, len(test_tokens))
+            similarity = intersection / denom if denom > 0 else 0.0
+        else:
+            union = len(candidate_tokens | test_tokens)
+            similarity = intersection / union if union > 0 else 0.0
+
+        distance = 1.0 - similarity
+        if distance < best_distance:
+            best_distance = distance
+            if best_distance <= 0.0:
+                break
+
+    return best_distance
+
+
+def _candidate_passes_similarity_filter(
+    candidate_example: DirectionExample,
+    test_token_sets: dict[int, set[str]] | None,
+    inverted_index: dict[str, set[int]] | None,
+    metric: str,
+    min_distance: float,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+) -> bool:
+    """Return True if a candidate is far enough from the test set."""
+    if test_token_sets is None or inverted_index is None:
+        return True
+
+    candidate_tokens = _token_signature(candidate_example)
+
+    # First, check contiguous subarray / superset relationships against nearby test examples
+    if test_signatures_by_idx is not None and candidate_tokens:
+        # compute candidate_test_indices (only those sharing any token)
+        candidate_test_indices: set[int] = set()
+        for token in candidate_tokens:
+            candidate_test_indices.update(inverted_index.get(token, set()))
+
+        if candidate_test_indices:
+            cand_sp = tuple(candidate_example.spacers)
+            cand_re = tuple(candidate_example.repeats)
+            cand_len = len(cand_sp)
+
+            for tidx in candidate_test_indices:
+                tsig = test_signatures_by_idx.get(tidx)
+                if not tsig:
+                    continue
+                test_sp, test_re = tsig
+                # check if candidate is a contiguous subarray of test
+                if cand_len <= len(test_sp):
+                    for i in range(len(test_sp) - cand_len + 1):
+                        if test_sp[i : i + cand_len] == cand_sp and test_re[i : i + cand_len] == cand_re:
+                            return False
+                # check if candidate is a contiguous superset (contains test)
+                tst_len = len(test_sp)
+                if tst_len <= cand_len:
+                    for i in range(cand_len - tst_len + 1):
+                        if cand_sp[i : i + tst_len] == test_sp and cand_re[i : i + tst_len] == test_re:
+                            return False
+
+    distance = _min_distance_to_test_set(candidate_tokens, test_token_sets, inverted_index, metric)
+    return distance >= min_distance
+
+
+def _keep_overlap_ratio(a: tuple[int, ...], b: tuple[int, ...]) -> float:
+    set_a = set(a)
+    set_b = set(b)
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
+def _select_diverse_keep_sets(
+    candidates: list[tuple[int, ...]],
+    target: int,
+    rng: random.Random,
+) -> list[tuple[int, ...]]:
+    """Choose a diverse subset of keep-indices by maximizing pairwise distance (with precomputed overlaps)."""
+    unique_candidates = list(dict.fromkeys(candidates))
+    if target <= 0 or len(unique_candidates) <= target:
+        rng.shuffle(unique_candidates)
+        return unique_candidates
+
+    # Limit pool to avoid excessive computation
+    if len(unique_candidates) > 500:
+        rng.shuffle(unique_candidates)
+        unique_candidates = unique_candidates[:500]
+
+    n = len(unique_candidates)
+    # Pre-compute all pairwise overlaps once (O(n²) one-time cost)
+    overlaps: dict[tuple[int, int], float] = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            overlap = _keep_overlap_ratio(unique_candidates[i], unique_candidates[j])
+            overlaps[(i, j)] = overlap
+            overlaps[(j, i)] = overlap
+
+    selected_indices = [rng.randint(0, n - 1)]
+    remaining = set(range(n)) - {selected_indices[0]}
+
+    while remaining and len(selected_indices) < target:
+        best_score = -1.0
+        best_candidate = None
+
+        for idx in remaining:
+            # Fast O(selected) lookup: check precomputed overlaps
+            min_distance = min(1.0 - overlaps.get((idx, selected), 0.0) for selected in selected_indices)
+            if min_distance > best_score:
+                best_score = min_distance
+                best_candidate = idx
+
+        if best_candidate is not None:
+            selected_indices.append(best_candidate)
+            remaining.remove(best_candidate)
+
+    return [unique_candidates[i] for i in selected_indices]
+
+
+def _materialize_subarray_augmentations(
+    base_dataset: DirectionJsonlDataset,
+    source_indices: list[int],
+    seen_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]],
+    test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None,
+    test_token_sets: dict[int, set[str]] | None,
+    inverted_index: dict[str, set[int]] | None,
+    seed: int,
+    mode: str,
+    prob: float,
+    min_spacers: int,
+    max_per_array: int,
+    split_name: str,
+    use_diversity: bool = True,
+    similarity_metric: str = "jaccard",
+    min_distance: float = 0.0,
+    target_additions: int = 0,
+    balance_per_array: bool = False,
+) -> tuple[list[int], dict[str, int]]:
+    """Materialize subarray deletion augmentation for a split.
+
+    Augmented signatures are globally deduplicated against `seen_signatures`
+    so train/val/test do not gain overlapping spacer/repeat pairs.
+    
+    Args:
+        target_additions: If > 0, stop materializing once this many examples have been added
+            (useful for balanced augmentation to avoid generating more than needed).
+            Default 0 means no early stopping.
+        balance_per_array: If True and target_additions > 0, distribute augmentations evenly
+            across all source arrays instead of generating max_per_array from the first arrays.
+    
+    so train/val/test do not gain overlapping spacer/repeat pairs.
+    """
+    base_rng = random.Random(seed)
+    new_indices: list[int] = []
+    stats = {
+        "added": 0,
+        "blocked_overlap": 0,
+        "blocked_similarity": 0,
+        "capped_arrays": 0,
+        "skipped_short": 0,
+        "source_examples": len(source_indices),
+    }
+
+    _print_ts(f"Augmentation: {split_name} starting materialization of {len(source_indices)} source examples...")
+    source_list = list(source_indices)
+    
+    # When balancing, distribute augmentations evenly across all source arrays
+    effective_max_per_array = max_per_array
+    if balance_per_array and target_additions > 0 and len(source_list) > 0:
+        # Calculate fair per-array cap: distribute target evenly across all sources
+        per_array_target = math.ceil(target_additions / len(source_list))
+        effective_max_per_array = min(max_per_array, per_array_target) if max_per_array > 0 else per_array_target
+        _print_ts(f"Augmentation: {split_name} balancing per-array distribution: need {target_additions} total across {len(source_list)} arrays, cap per-array to {effective_max_per_array}")
+    
+    for i_example, orig_idx in enumerate(source_list, 1):
+        if i_example % 50 == 1 or i_example == 1:
+            _print_ts(f"  Augmentation: {split_name} processing example {i_example}/{len(source_list)} (added so far: {stats['added']})")
+        ex = base_dataset.records[orig_idx]
+        n = len(ex.spacers)
+        if n <= min_spacers:
+            stats["skipped_short"] += 1
+            continue
+
+        local_rng = random.Random(base_rng.randint(0, 2**31 - 1))
+
+        if mode == "random":
+            if local_rng.random() >= float(prob):
+                continue
+            k = local_rng.randint(min_spacers, n - 1)
+            keep_sets = [tuple(sorted(local_rng.sample(range(n), k)))]
+        else:
+            candidate_goal = effective_max_per_array if effective_max_per_array > 0 else 0
+            if use_diversity:
+                # Generate a larger candidate pool than the final cap so we can
+                # choose a more diverse subset of subarrays.
+                if candidate_goal > 0:
+                    pool_goal = max(candidate_goal * 4, candidate_goal + 32, 64)
+                else:
+                    pool_goal = max(64, n * 16)
+                max_attempts = max(100, pool_goal * 50)
+            else:
+                # Fast mode: just generate candidate_goal samples without diversity
+                pool_goal = candidate_goal if candidate_goal > 0 else min(64, n * 4)
+                max_attempts = max(50, pool_goal * 10)
+            candidates: list[tuple[int, ...]] = []
+            seen_local: set[tuple[int, ...]] = set()
+            attempts = 0
+
+            while len(candidates) < pool_goal and attempts < max_attempts:
+                attempts += 1
+                k = local_rng.randint(min_spacers, n - 1)
+                keep = tuple(sorted(local_rng.sample(range(n), k)))
+                if keep not in seen_local:
+                    seen_local.add(keep)
+                    candidates.append(keep)
+
+            keep_sets = (
+                _select_diverse_keep_sets(candidates, candidate_goal, local_rng)
+                if use_diversity
+                else candidates[:candidate_goal]
+            )
+            if candidate_goal > 0 and len(keep_sets) >= candidate_goal:
+                stats["capped_arrays"] += 1
+
+        for keep in keep_sets:
+            new_spacers = [ex.spacers[i] for i in keep]
+            new_repeats = [ex.repeats[i] for i in keep]
+            aug_sig = (tuple(new_spacers), tuple(new_repeats))
+            if aug_sig in seen_signatures:
+                stats["blocked_overlap"] += 1
+                continue
+
+            if test_signatures is not None and aug_sig in test_signatures:
+                stats["blocked_similarity"] += 1
+                continue
+
+            candidate_example = DirectionExample(
+                array_name=ex.array_name,
+                group_name=ex.group_name,
+                agreement=ex.agreement,
+                evor_direction=ex.evor_direction,
+                label=ex.label,
+                orientation_variant=ex.orientation_variant,
+                source_variant=ex.source_variant,
+                spacers=new_spacers,
+                repeats=new_repeats,
+                cas_subtype=ex.cas_subtype,
+                left_flank=ex.left_flank,
+                right_flank=ex.right_flank,
+                source_json=ex.source_json,
+            )
+            if not _candidate_passes_similarity_filter(
+                candidate_example,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                metric=similarity_metric,
+                min_distance=min_distance,
+                test_signatures_by_idx=test_signatures_by_idx,
+            ):
+                stats["blocked_similarity"] += 1
+                continue
+
+            base_dataset.records.append(candidate_example)
+            new_indices.append(len(base_dataset.records) - 1)
+            seen_signatures.add(aug_sig)
+            stats["added"] += 1
+            
+            # Early exit if we've reached the target number of additions
+            if target_additions > 0 and stats["added"] >= target_additions:
+                break
+        
+        # Early exit outer loop if we've reached the target
+        if target_additions > 0 and stats["added"] >= target_additions:
+            break
+
+    _print_ts(
+        f"Augmentation: {split_name} added {stats['added']} examples "
+        f"(blocked_overlap={stats['blocked_overlap']}, blocked_similarity={stats['blocked_similarity']}, "
+        f"skipped_short={stats['skipped_short']})"
+    )
+    if mode == "enumerate" and max_per_array > 0:
+        _print_ts(f"Augmentation: {split_name} cap_hit_on={stats['capped_arrays']} arrays")
+
+    return new_indices, stats
+
+
+def summarize_cas_subtypes(
+    records: list[DirectionExample],
+    indices: list[int],
+) -> tuple[int, dict[str, int]]:
+    """Return unique subtype count and per-subtype counts for a split."""
+    counts = Counter((records[i].cas_subtype or "Unknown") for i in indices)
+    return len(counts), dict(sorted(counts.items(), key=lambda kv: kv[0]))
+
+
+def build_cv_folds_by_signature(
+    examples: list[DirectionExample],
+    pool_indices: list[int],
+    n_folds: int,
+    seed: int,
+    stratify_mode: str,
+) -> list[list[int]]:
+    """Build CV folds from pool indices, keeping exact signatures together.
+
+    Args:
+        examples: Full list of examples.
+        pool_indices: Indices allowed for CV (development pool).
+        n_folds: Number of CV folds.
+        seed: RNG seed.
+        stratify_mode: One of "label", "cas_subtype", "cas_subtype_and_label".
+
+    Returns:
+        List of folds where each entry is a list of validation indices for that fold.
+    """
+    if n_folds < 2:
+        raise ValueError("n_folds must be at least 2")
+
+    rng = random.Random(seed)
+    pool_set = set(pool_indices)
+
+    signature_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    for idx in pool_indices:
+        ex = examples[idx]
+        sig = (tuple(ex.spacers), tuple(ex.repeats))
+        signature_groups.setdefault(sig, []).append(idx)
+
+    strata_groups: dict[Any, list[list[int]]] = {}
+    for group in signature_groups.values():
+        rep = examples[group[0]]
+        subtype = (rep.cas_subtype or "Unknown").strip() or "Unknown"
+        label = int(rep.label)
+
+        if stratify_mode == "label":
+            key: Any = label
+        elif stratify_mode == "cas_subtype":
+            key = subtype
+        else:
+            key = (subtype, label)
+
+        strata_groups.setdefault(key, []).append(group)
+
+    folds: list[list[int]] = [[] for _ in range(n_folds)]
+    for key in sorted(strata_groups.keys(), key=str):
+        groups = list(strata_groups[key])
+        rng.shuffle(groups)
+        for j, group in enumerate(groups):
+            fold_idx = j % n_folds
+            folds[fold_idx].extend(group)
+
+    # Keep only indices from the pool and stabilize ordering for reproducibility
+    for i in range(n_folds):
+        folds[i] = sorted(idx for idx in folds[i] if idx in pool_set)
+
+    return folds
+
+
+def stratified_holdout_by_mode(
+    examples: list[DirectionExample],
+    seed: int,
+    holdout_fraction: float,
+    stratify_mode: str,
+) -> tuple[list[int], list[int]]:
+    """Split indices into development/train and held-out test sets.
+
+    Exact spacer/repeat signatures stay together, and the stratification key
+    follows the selected mode.
+    """
+    if not (0.0 <= holdout_fraction < 1.0):
+        raise ValueError("holdout_fraction must be in [0.0, 1.0)")
+    if holdout_fraction == 0.0:
+        return list(range(len(examples))), []
+
+    rng = random.Random(seed)
+
+    signature_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    for idx, example in enumerate(examples):
+        signature = (tuple(example.spacers), tuple(example.repeats))
+        signature_groups.setdefault(signature, []).append(idx)
+
+    strata_groups: dict[Any, list[list[int]]] = {}
+    for group in signature_groups.values():
+        rep = examples[group[0]]
+        subtype = (rep.cas_subtype or "Unknown").strip() or "Unknown"
+        label = int(rep.label)
+
+        if stratify_mode == "label":
+            key: Any = label
+        elif stratify_mode == "cas_subtype":
+            key = subtype
+        else:
+            key = (subtype, label)
+
+        strata_groups.setdefault(key, []).append(group)
+
+    dev_indices: list[int] = []
+    test_indices: list[int] = []
+    for key in sorted(strata_groups.keys(), key=str):
+        groups = list(strata_groups[key])
+        rng.shuffle(groups)
+        n_groups = len(groups)
+        n_test = 0 if n_groups == 1 else min(n_groups - 1, max(1, round(n_groups * holdout_fraction)))
+        for group in groups[:n_test]:
+            test_indices.extend(group)
+        for group in groups[n_test:]:
+            dev_indices.extend(group)
+
+    return sorted(dev_indices), sorted(test_indices)
+
+
+def split_dev_pool_by_mode(
+    examples: list[DirectionExample],
+    pool_indices: list[int],
+    seed: int,
+    stratify_mode: str,
+) -> tuple[list[int], list[int]]:
+    """Split a development pool into train and validation indices."""
+    pool_examples = [examples[i] for i in pool_indices]
+    if stratify_mode == "label":
+        splits = stratified_train_test_and_val_by_label(pool_examples, seed=seed, train_test_fraction=0.8)
+        train_indices = [pool_indices[i] for i in splits["train_test"]]
+        val_indices = [pool_indices[i] for i in splits["val"]]
+    elif stratify_mode == "cas_subtype":
+        splits = stratified_split_by_cas_subtype(pool_examples, seed=seed, train_fraction=0.8, test_fraction=0.0)
+        train_indices = [pool_indices[i] for i in splits["train"]]
+        val_indices = [pool_indices[i] for i in splits["val"]]
+    else:
+        splits = stratified_train_test_and_val_by_cas_subtype_and_label(
+            pool_examples, seed=seed, train_test_fraction=0.8
+        )
+        train_indices = [pool_indices[i] for i in splits["train_test"]]
+        val_indices = [pool_indices[i] for i in splits["val"]]
+
+    return sorted(train_indices), sorted(val_indices)
+
+
+def _build_signature_components(examples: list[DirectionExample]) -> dict[int, list[int]]:
+    """Group indices into connected components by exact spacer/repeat signature."""
+    n = len(examples)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+    for idx, example in enumerate(examples):
+        signature = (tuple(example.spacers), tuple(example.repeats))
+        if signature in first_by_signature:
+            union(idx, first_by_signature[signature])
+        else:
+            first_by_signature[signature] = idx
+
+    components: dict[int, list[int]] = {}
+    for idx in range(n):
+        components.setdefault(find(idx), []).append(idx)
+    return components
+
+
+def stratified_split_by_cas_subtype(
+    examples: list[DirectionExample],
+    seed: int = 13,
+    train_fraction: float = 0.8,
+    test_fraction: float = 0.1,
+) -> dict[str, list[int]]:
+    """Stratified 80/10/10 split by CRISPR cas_subtype for balanced cross-validation.
+    
+    Ensures each CRISPR subtype (e.g., I-F, I-E, I-C) is represented proportionally
+    in train, validation, and test splits. Uses random stratified sampling to
+    maintain label balance and CRISPR diversity across splits.
+    
+    Args:
+        examples: List of DirectionExample objects with cas_subtype metadata.
+        seed: Random seed for reproducibility (default 13).
+        train_fraction: Fraction for training set (default 0.8, leaving 0.2 for val+test).
+        test_fraction: Fraction for test set from remainder (default 0.1 of all).
+            Validation gets 1 - train_fraction - test_fraction.
+            
+    Returns:
+        dict[str, list[int]]: Split indices with keys "train", "val", "test".
+        
+    Example:
+        >>> splits = stratified_split_by_cas_subtype(examples, seed=42)
+        >>> train_indices = splits["train"]
+        >>> val_indices = splits["val"]
+        >>> test_indices = splits["test"]
+    """
+    if train_fraction + test_fraction > 1.0:
+        raise ValueError("train_fraction + test_fraction must be <= 1.0")
+    
+    rng = random.Random(seed)
+    components = _build_signature_components(examples)
+
+    # Stratify by cas_subtype at component level so exact duplicate signatures stay together.
+    subtype_components: dict[str, list[list[int]]] = {}
+    for comp in components.values():
+        subtype_counts = Counter((examples[i].cas_subtype or "Unknown") for i in comp)
+        subtype = max(subtype_counts, key=subtype_counts.get)
+        subtype_components.setdefault(subtype, []).append(comp)
+
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    test_indices: list[int] = []
+
+    for subtype, comp_list in subtype_components.items():
+        shuffled = list(comp_list)
+        rng.shuffle(shuffled)
+
+        n_total = len(shuffled)
+        n_train = max(1, round(n_total * train_fraction))
+        n_test = max(0, round(n_total * test_fraction))
+        n_val = n_total - n_train - n_test
+
+        for comp in shuffled[:n_train]:
+            train_indices.extend(comp)
+        for comp in shuffled[n_train:n_train + n_test]:
+            test_indices.extend(comp)
+        for comp in shuffled[n_train + n_test:]:
+            val_indices.extend(comp)
+    
+    return {
+        "train": train_indices,
+        "val": val_indices,
+        "test": test_indices,
+    }
+
+
+def stratified_train_test_by_cas_subtype(
+    examples: list[DirectionExample],
+    seed: int = 13,
+    train_fraction: float = 0.8,
+) -> dict[str, list[int]]:
+    """Stratified train/test split by cas_subtype (default 80/20).
+
+    Ensures each CRISPR subtype is split so that approximately `train_fraction`
+    of examples from each subtype go to train and the remainder to test.
+
+    Args:
+        examples: List of DirectionExample objects with `cas_subtype` set.
+        seed: Random seed for reproducibility.
+        train_fraction: Fraction of examples per subtype to assign to train.
+
+    Returns:
+        dict[str, list[int]]: Mapping with keys "train" and "test".
+    """
+    if not (0.0 < train_fraction < 1.0):
+        raise ValueError("train_fraction must be between 0 and 1")
+
+    rng = random.Random(seed)
+    components = _build_signature_components(examples)
+
+    subtype_components: dict[str, list[list[int]]] = {}
+    for comp in components.values():
+        subtype_counts = Counter((examples[i].cas_subtype or "Unknown") for i in comp)
+        subtype = max(subtype_counts, key=subtype_counts.get)
+        subtype_components.setdefault(subtype, []).append(comp)
+
+    train_indices: list[int] = []
+    test_indices: list[int] = []
+    for subtype, comp_list in subtype_components.items():
+        shuffled = list(comp_list)
+        rng.shuffle(shuffled)
+        n_total = len(shuffled)
+        n_train = max(1, round(n_total * train_fraction)) if n_total > 1 else n_total
+        for comp in shuffled[:n_train]:
+            train_indices.extend(comp)
+        for comp in shuffled[n_train:]:
+            test_indices.extend(comp)
+
+    return {"train": train_indices, "test": test_indices}
+
+
+def stratified_train_test_and_val_by_cas_subtype(
+    examples: list[DirectionExample], seed: int = 13, train_test_fraction: float = 0.8
+) -> dict[str, list[int]]:
+    """Split examples into a stratified (by cas_subtype) train+test group and validation.
+
+    This creates a two-way split where approximately `train_test_fraction` of
+    each subtype is assigned to the combined train+test set, and the remainder
+    (1 - train_test_fraction) is used for validation.
+
+    Args:
+        examples: List of DirectionExample objects with `cas_subtype` set.
+        seed: Random seed for reproducibility.
+        train_test_fraction: Fraction of each subtype to keep for train+test.
+
+    Returns:
+        dict with keys `train_test` and `val` mapping to lists of indices.
+    """
+    if not (0.0 < train_test_fraction < 1.0):
+        raise ValueError("train_test_fraction must be between 0 and 1")
+
+    rng = random.Random(seed)
+
+    # Build connected components so examples sharing a group_name OR identical
+    # spacer/repeat signature stay in the same split, reducing leakage.
+    n = len(examples)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    first_by_group: dict[str, int] = {}
+    first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+    for idx, example in enumerate(examples):
+        group = example.group_name.strip()
+        if group:
+            if group in first_by_group:
+                union(idx, first_by_group[group])
+            else:
+                first_by_group[group] = idx
+
+        signature = (tuple(example.spacers), tuple(example.repeats))
+        if signature in first_by_signature:
+            union(idx, first_by_signature[signature])
+        else:
+            first_by_signature[signature] = idx
+
+    components: dict[int, list[int]] = {}
+    for idx in range(n):
+        components.setdefault(find(idx), []).append(idx)
+
+    # Stratify by subtype at component level (majority subtype in each component).
+    subtype_components: dict[str, list[list[int]]] = {}
+    for comp in components.values():
+        subtype_counts = Counter((examples[i].cas_subtype or "Unknown") for i in comp)
+        subtype = max(subtype_counts, key=subtype_counts.get)
+        subtype_components.setdefault(subtype, []).append(comp)
+
+    train_test_indices: list[int] = []
+    val_indices: list[int] = []
+    for subtype, comp_list in subtype_components.items():
+        shuffled_components = list(comp_list)
+        rng.shuffle(shuffled_components)
+        n_components = len(shuffled_components)
+        if n_components > 1:
+            n_train_test_components = min(n_components - 1, max(1, round(n_components * train_test_fraction)))
+        else:
+            n_train_test_components = n_components
+
+        train_components = shuffled_components[:n_train_test_components]
+        val_components = shuffled_components[n_train_test_components:]
+        for comp in train_components:
+            train_test_indices.extend(comp)
+        for comp in val_components:
+            val_indices.extend(comp)
+
+    return {"train_test": train_test_indices, "val": val_indices}
+
+
+def stratified_train_test_and_val_by_label(
+    examples: list[DirectionExample], seed: int = 13, train_test_fraction: float = 0.8
+) -> dict[str, list[int]]:
+    """Split examples stratified by label (Forward/Reverse) into train+test and validation.
+    
+    When cas_subtype is empty/unavailable, stratifies by binary label instead.
+    Ensures both train and validation sets have balanced Forward/Reverse proportions.
+    
+    Args:
+        examples: List of DirectionExample objects.
+        seed: Random seed for reproducibility.
+        train_test_fraction: Fraction of each label class to keep for train+test.
+        
+    Returns:
+        dict with keys `train_test` and `val` mapping to lists of indices.
+    """
+    if not (0.0 < train_test_fraction < 1.0):
+        raise ValueError("train_test_fraction must be between 0 and 1")
+    
+    rng = random.Random(seed)
+    components = _build_signature_components(examples)
+
+    label_components: dict[int, list[list[int]]] = {}
+    for comp in components.values():
+        label_counts = Counter(examples[i].label for i in comp)
+        label = max(label_counts, key=label_counts.get)
+        label_components.setdefault(label, []).append(comp)
+
+    train_test_indices: list[int] = []
+    val_indices: list[int] = []
+
+    for label in sorted(label_components.keys()):
+        comp_list = list(label_components[label])
+        rng.shuffle(comp_list)
+        n = len(comp_list)
+        n_train_test = max(1, round(n * train_test_fraction))
+
+        for comp in comp_list[:n_train_test]:
+            train_test_indices.extend(comp)
+        for comp in comp_list[n_train_test:]:
+            val_indices.extend(comp)
+    
+    return {"train_test": train_test_indices, "val": val_indices}
+
+
+def stratified_train_test_and_val_by_cas_subtype_and_label(
+    examples: list[DirectionExample], seed: int = 13, train_test_fraction: float = 0.8
+) -> dict[str, list[int]]:
+    """Split examples stratified by joint key (cas_subtype, label).
+
+    This keeps both CRISPR subtype proportions and Forward/Reverse label
+    proportions balanced across train+test vs validation.
+
+    Args:
+        examples: List of DirectionExample objects.
+        seed: Random seed for reproducibility.
+        train_test_fraction: Fraction of each stratum to keep for train+test.
+
+    Returns:
+        dict with keys `train_test` and `val` mapping to lists of indices.
+    """
+    if not (0.0 < train_test_fraction < 1.0):
+        raise ValueError("train_test_fraction must be between 0 and 1")
+
+    rng = random.Random(seed)
+
+    strata_indices: dict[tuple[str, int], list[int]] = {}
+    for idx, example in enumerate(examples):
+        subtype = (example.cas_subtype or "Unknown").strip() or "Unknown"
+        label = int(example.label)
+        key = (subtype, label)
+        strata_indices.setdefault(key, []).append(idx)
+
+    train_test_indices: list[int] = []
+    val_indices: list[int] = []
+    for key in sorted(strata_indices.keys()):
+        indices = list(strata_indices[key])
+        rng.shuffle(indices)
+        n = len(indices)
+        if n == 1:
+            n_train_test = 1
+        else:
+            n_train_test = min(n - 1, max(1, round(n * train_test_fraction)))
+        train_test_indices.extend(indices[:n_train_test])
+        val_indices.extend(indices[n_train_test:])
+
+    return {"train_test": train_test_indices, "val": val_indices}
+
+
+class DirectionTorchDataset(Dataset if Dataset is not object else object):
+    """PyTorch Dataset wrapper for indexed access to encoded CRISPR examples.
+    
+    Wraps a DirectionJsonlDataset and provides lazy encoding on-demand during
+    iteration, allowing efficient memory usage with large datasets.
+    """
+    def __init__(self, base_dataset: DirectionJsonlDataset, indices: list[int], vocab: dict[str, int], augment_fn: Callable | None = None):
+        """Initialize the PyTorch dataset.
+        
+        Args:
+            base_dataset: Source DirectionJsonlDataset to wrap.
+            indices: List of indices to use from base_dataset.
+            vocab: Token vocabulary for encoding sequences.
+        """
+        _require_torch()
+        self.base_dataset = base_dataset
+        self.indices = indices
+        self.vocab = vocab
+        # augment_fn: Callable that accepts a DirectionExample and returns
+        # either the original or an augmented DirectionExample. Only used
+        # for on-the-fly training augmentation (e.g., spacer-subset deletion).
+        self.augment_fn = augment_fn
+
+    def __len__(self) -> int:
+        """Return number of examples in this split."""
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> dict:
+        """Get and encode a single example by index.
+
+        Applies `augment_fn` (if present) before encoding so augmentation
+        is applied only at data-loading time.
+        """
+        example = self.base_dataset[self.indices[index]]
+        if self.augment_fn is not None:
+            try:
+                aug = self.augment_fn(example)
+                # If augment_fn returns None or something falsy, fall back to original
+                if aug:
+                    example = aug
+            except Exception:
+                # Any augmentation error should not crash data loading; fall back.
+                pass
+        return encode_example(example, vocab=self.vocab, include_flanks=self.base_dataset.include_flanks)
+
+
+def batch_to_tensors(batch: dict[str, list]) -> dict[str, Any]:
+    """Convert collated batch lists to PyTorch tensors.
+    
+    Takes output from collate_encoded_examples (lists of arrays) and
+    converts to GPU-ready torch tensors with appropriate dtypes.
+    
+    Args:
+        batch: Dict with spacer_tokens (3D list), spacer_mask (2D list),
+            repeat_tokens (3D list), label (list).
+            
+    Returns:
+        dict[str, torch.Tensor]: Same keys with tensor values.
+    """
+    _require_torch()
+    return {
+        "spacer_tokens": torch.tensor(batch["spacer_tokens"], dtype=torch.long),
+        "spacer_mask": torch.tensor(batch["spacer_mask"], dtype=torch.bool),
+        "repeat_tokens": torch.tensor(batch["repeat_tokens"], dtype=torch.long),
+        "label": torch.tensor(batch["label"], dtype=torch.float32),
+    }
+
+
+def collate_for_training(batch: list[dict]) -> dict[str, Any]:
+    """Collate and tensorize a batch for training.
+    
+    Composition of collate_encoded_examples and batch_to_tensors,
+    ready to pass to the model forward() method.
+    """
+    return batch_to_tensors(collate_encoded_examples(batch))
+
+
+def build_dataloader(dataset: DirectionTorchDataset, batch_size: int, shuffle: bool, weights: list[float] | None = None) -> Any:
+    """Create a PyTorch DataLoader for a split of data.
+    
+    Args:
+        dataset: DirectionTorchDataset for this split.
+        batch_size: Number of examples per batch.
+        shuffle: If True, shuffle examples during iteration.
+        
+    Returns:
+        torch.utils.data.DataLoader: Ready for training/evaluation loops.
+    """
+    _require_torch()
+    if weights is not None:
+        # Use WeightedRandomSampler when per-sample weights are provided. When a sampler
+        # is used, DataLoader must not be shuffled (sampler defines sampling order).
+        try:
+            from torch.utils.data import WeightedRandomSampler
+
+            tensor_weights = torch.tensor(weights, dtype=torch.double)
+            sampler = WeightedRandomSampler(tensor_weights, num_samples=len(tensor_weights), replacement=True)
+            return DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=collate_for_training)
+        except Exception:
+            # Fall back to standard loader if sampler unavailable
+            return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_for_training)
+
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_for_training)
+
+
+def train_one_epoch(model: SpacerDirectionTransformer, loader: Any, optimizer: Any, loss_fn: Any, device: Any) -> float:
+    """Train model for one epoch on all batches from loader.
+    
+    Args:
+        model: SpacerDirectionTransformer to train (moves to device internally).
+        loader: DataLoader with training batches.
+        optimizer: torch.optim optimizer (e.g., AdamW).
+        loss_fn: Loss function (e.g., BCEWithLogitsLoss).
+        device: torch.device to run on (CPU or CUDA).
+        
+    Returns:
+        float: Average loss across all batches.
+    """
+    _require_torch()
+    model.train()
+    total_loss = 0.0
+    total_items = 0
+    for batch in loader:
+        batch = {key: value.to(device) for key, value in batch.items()}
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(batch)
+        loss = loss_fn(logits, batch["label"])
+        loss.backward()
+        optimizer.step()
+        total_loss += float(loss.item()) * batch["label"].shape[0]
+        total_items += int(batch["label"].shape[0])
+    return total_loss / max(total_items, 1)
+
+
+def evaluate(model: SpacerDirectionTransformer, loader: Any, loss_fn: Any, device: Any) -> dict[str, float]:
+    """Evaluate model on all batches without gradient updates.
+    
+    Args:
+        model: SpacerDirectionTransformer to evaluate.
+        loader: DataLoader with validation/test batches.
+        loss_fn: Loss function matching training.
+        device: torch.device to run on.
+        
+    Returns:
+        dict[str, float]: Metrics with keys "loss" and "accuracy".
+            - loss: Average loss across batches.
+            - accuracy: Fraction of predictions matching true labels
+              (using 0.5 threshold on sigmoid).
+    """
+    _require_torch()
+    model.eval()
+    total_loss = 0.0
+    total_items = 0
+    correct = 0
+    all_probs: list = []
+    all_labels: list = []
+    with torch.no_grad():
+        for batch in loader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            logits = model(batch)
+            loss = loss_fn(logits, batch["label"])
+            probs = torch.sigmoid(logits)
+            predictions = (probs >= 0.5).long()
+            correct += int((predictions == batch["label"].long()).sum().item())
+            total_loss += float(loss.item()) * batch["label"].shape[0]
+            total_items += int(batch["label"].shape[0])
+            all_probs.append(probs.cpu().numpy())
+            all_labels.append(batch["label"].cpu().numpy())
+
+    # Concatenate numpy arrays
+    import numpy as np
+
+    if len(all_labels) == 0:
+        return {
+            "loss": float("nan"),
+            "accuracy": float("nan"),
+            "auc": float("nan"),
+            "aupr": float("nan"),
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+        }
+
+    y_prob = np.concatenate(all_probs)
+    y_true = np.concatenate(all_labels)
+
+    accuracy = correct / max(total_items, 1)
+    loss_val = total_loss / max(total_items, 1)
+    y_pred_bin = (y_prob >= 0.5).astype(int)
+    positive_rate_true = float(y_true.mean()) if y_true.size > 0 else float("nan")
+    positive_rate_pred = float(y_pred_bin.mean()) if y_pred_bin.size > 0 else float("nan")
+    majority_baseline_accuracy = max(positive_rate_true, 1.0 - positive_rate_true)
+
+    # Compute other metrics using sklearn if available, otherwise fallback to simple computations
+    try:
+        from sklearn.metrics import (
+            roc_auc_score,
+            average_precision_score,
+            precision_score,
+            recall_score,
+            f1_score,
+        )
+
+        auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+        aupr = float(average_precision_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+        precision = float(precision_score(y_true, y_pred_bin, zero_division=0))
+        recall = float(recall_score(y_true, y_pred_bin, zero_division=0))
+        f1 = float(f1_score(y_true, y_pred_bin, zero_division=0))
+    except Exception:
+        # Minimal safe fallbacks
+        tp = int(((y_pred_bin == 1) & (y_true == 1)).sum())
+        fp = int(((y_pred_bin == 1) & (y_true == 0)).sum())
+        fn = int(((y_pred_bin == 0) & (y_true == 1)).sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        auc = float("nan")
+        aupr = float("nan")
+
+    return {
+        "loss": loss_val,
+        "accuracy": accuracy,
+        "auc": auc,
+        "aupr": aupr,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "positive_rate_true": positive_rate_true,
+        "positive_rate_pred": positive_rate_pred,
+        "majority_baseline_accuracy": majority_baseline_accuracy,
+    }
+
+
+def evaluate_per_subtype(
+    model: SpacerDirectionTransformer,
+    base_dataset: DirectionJsonlDataset,
+    indices: list[int],
+    vocab: dict[str, int],
+    loss_fn: Any,
+    device: Any,
+    batch_size: int,
+) -> dict[str, dict[str, float]]:
+    """Evaluate test performance separately for each cas_subtype.
+
+    Args:
+        model: Trained model to evaluate.
+        base_dataset: Dataset containing original records and subtype metadata.
+        indices: Dataset indices to evaluate (usually test split).
+        vocab: Token vocabulary used during training.
+        loss_fn: Loss function (unused for subtype metrics but kept for API parity).
+        device: torch.device to run on.
+        batch_size: Batch size for forward passes.
+
+    Returns:
+        Mapping cas_subtype -> metrics dict.
+    """
+    _require_torch()
+    del loss_fn
+
+    import numpy as np
+
+    model.eval()
+    probs_by_subtype: dict[str, list[float]] = {}
+    labels_by_subtype: dict[str, list[float]] = {}
+
+    with torch.no_grad():
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start:start + batch_size]
+            encoded_batch = [
+                encode_example(base_dataset[i], vocab=vocab, include_flanks=base_dataset.include_flanks)
+                for i in batch_indices
+            ]
+            collated = collate_encoded_examples(encoded_batch)
+            tensor_batch = batch_to_tensors(collated)
+            tensor_batch = {key: value.to(device) for key, value in tensor_batch.items()}
+
+            logits = model(tensor_batch)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            labels = tensor_batch["label"].cpu().numpy()
+
+            for dataset_idx, prob, label in zip(batch_indices, probs, labels):
+                subtype = (base_dataset[dataset_idx].cas_subtype or "Unknown").strip() or "Unknown"
+                probs_by_subtype.setdefault(subtype, []).append(float(prob))
+                labels_by_subtype.setdefault(subtype, []).append(float(label))
+
+    metrics_by_subtype: dict[str, dict[str, float]] = {}
+    for subtype in sorted(probs_by_subtype.keys()):
+        y_prob = np.array(probs_by_subtype[subtype], dtype=float)
+        y_true = np.array(labels_by_subtype[subtype], dtype=float)
+        y_pred_bin = (y_prob >= 0.5).astype(int)
+
+        accuracy = float((y_pred_bin == y_true.astype(int)).mean()) if y_true.size > 0 else float("nan")
+        positive_rate_true = float(y_true.mean()) if y_true.size > 0 else float("nan")
+        majority_baseline_accuracy = max(positive_rate_true, 1.0 - positive_rate_true)
+
+        try:
+            from sklearn.metrics import (
+                average_precision_score,
+                f1_score,
+                precision_score,
+                recall_score,
+                roc_auc_score,
+            )
+
+            auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+            aupr = float(average_precision_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+            precision = float(precision_score(y_true, y_pred_bin, zero_division=0))
+            recall = float(recall_score(y_true, y_pred_bin, zero_division=0))
+            f1 = float(f1_score(y_true, y_pred_bin, zero_division=0))
+        except Exception:
+            tp = int(((y_pred_bin == 1) & (y_true == 1)).sum())
+            fp = int(((y_pred_bin == 1) & (y_true == 0)).sum())
+            fn = int(((y_pred_bin == 0) & (y_true == 1)).sum())
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            auc = float("nan")
+            aupr = float("nan")
+
+        metrics_by_subtype[subtype] = {
+            "n": float(len(y_true)),
+            "accuracy": accuracy,
+            "auc": auc,
+            "aupr": aupr,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "positive_rate_true": positive_rate_true,
+            "majority_baseline_accuracy": majority_baseline_accuracy,
+        }
+
+    return metrics_by_subtype
+
+
+def main() -> int:
+    """Train the transformer
+    
+    Loads agreed-only JSONL dataset, performs stratified split by CRISPR
+    subtype to balance train/val/test distributions, then trains for specified
+    epochs with validation monitoring. Implements early stopping and checkpoints 
+    the best model by validation loss.
+    """
+    parser = argparse.ArgumentParser(description="Train a CRISPR direction transformer on the agreed-only JSONL dataset.")
+    parser.add_argument("--jsonl", default="output_dataset/direction_training_dataset.jsonl")
+    parser.add_argument("--include_flanks", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training (default 16).")
+    parser.add_argument("--epochs", type=int, default=5, help="Maximum number of training epochs (default 5).")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for AdamW optimizer (default 3e-4).")
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="L2 regularization strength (default 1e-5).")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for regularization (default 0.1).")
+    parser.add_argument(
+        "--positional_encoding",
+        type=str,
+        default="absolute",
+        choices=["absolute", "alibi", "rope"],
+        help="Positional encoding to use for spacer order (default: absolute).",
+    )
+    parser.add_argument(
+        "--reverse_complement_mode",
+        type=str,
+        default="none",
+        choices=["none", "before", "after", "initial_only"],
+        help=(
+            "When and how to apply reverse-complement augmentation to train/val (test always stays untouched):\n"
+            "  none: Do not apply reverse-complement augmentation (default).\n"
+            "  before: Add reverse complements before subarray augmentation; augment all including RC examples.\n"
+            "  after: Apply subarray augmentation first, then add reverse complements of all resulting arrays.\n"
+            "  initial_only: Apply subarray augmentation, then add reverse complements only of the initial (non-augmented) arrays."
+        ),
+    )
+    parser.add_argument("--early_stopping_patience", type=int, default=3, help="Stop if val_loss doesn't improve for N epochs (default 3).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default 42).")
+    parser.add_argument(
+        "--stratify_by",
+        type=str,
+        default="label",
+        choices=["label", "cas_subtype"],
+        help="Stratification method: 'label' (balanced classes) or 'cas_subtype' (CRISPR type). Default: label (recommended).",
+    )
+    parser.add_argument(
+        "--stratify_by_cas_subtype_and_label",
+        action="store_true",
+        help=(
+            "Use combined stratification on both cas_subtype and label. "
+            "Overrides --stratify_by when provided."
+        ),
+    )
+    parser.add_argument(
+        "--test_size",
+        "--test_within_train_fraction",
+        dest="test_size",
+        type=float,
+        default=0.0,
+        help="Fraction of the full dataset to hold out as the final test set (e.g. 0.1 for 10%%).",
+    )
+    parser.add_argument(
+        "--cv_folds",
+        type=int,
+        default=0,
+        help="If >1, run a single CV fold split on the development pool (train+val), keeping test untouched.",
+    )
+    parser.add_argument(
+        "--cv_fold_index",
+        type=int,
+        default=0,
+        help="Validation fold index to use when --cv_folds > 1 (0-based).",
+    )
+    parser.add_argument(
+        "--augment_subarrays",
+        action="store_true",
+        help="If set, perform spacer-subset augmentation for train and validation splits (test untouched).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_prob",
+        type=float,
+        default=1.0,
+        help="Per-example probability to apply spacer-subset augmentation (0.0-1.0).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_mode",
+        type=str,
+        default="enumerate",
+        choices=["random", "enumerate"],
+        help="Augmentation mode: 'random' (per-sample random subset) or 'enumerate' (add all subarrays to train set).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_min_spacers",
+        type=int,
+        default=2,
+        help="Minimum number of spacers to keep when enumerating subarrays (default 2).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_max_per_array",
+        type=int,
+        default=256,
+        help="Maximum number of augmented subarrays to add per original array in enumerate mode (default 256; <=0 means unlimited).",
+    )
+    parser.add_argument(
+        "--augment_subarrays_enumerate_fast",
+        action="store_true",
+        help="Skip diversity computation in enumerate mode; randomly sample max_per_array subarrays instead (faster, less diverse).",
+    )
+    parser.add_argument(
+        "--weighted_sampling",
+        action="store_true",
+        help="Enable weighted sampling to upweight under-represented strata instead of augmenting as much.",
+    )
+    parser.add_argument(
+        "--weighted_sampling_by",
+        type=str,
+        default="cas_subtype",
+        choices=["cas_subtype", "label"],
+        help="Which key to base sampling weights on (default: cas_subtype).",
+    )
+    parser.add_argument(
+        "--weighted_sampling_alpha",
+        type=float,
+        default=1.0,
+        help="Aggressiveness exponent for inverse-frequency weighting (default 1.0).",
+    )
+    parser.add_argument(
+        "--weighted_sampling_max_weight",
+        type=float,
+        default=10.0,
+        help="Maximum allowed sample weight to avoid extreme oversampling (default 10.0).",
+    )
+    parser.add_argument(
+        "--augment_subtypes_balance",
+        action="store_true",
+        help=(
+            "Materialize enumerate-mode augmentations to balance cas_subtype counts in"
+            " train/val so each subtype has the same number of examples (uses existing"
+            " augmentation flags; requires --augment_subarrays with enumerate mode)."
+        ),
+    )
+    parser.add_argument(
+        "--augment_subtypes_balance_target",
+        type=int,
+        default=0,
+        help=(
+            "Optional target count per subtype when --augment_subtypes_balance is set."
+            " Default 0 means use the current maximum subtype count per split."
+        ),
+    )
+    parser.add_argument(
+        "--aug_similarity",
+        type=str,
+        default="",
+        choices=["", "jaccard", "overlap"],
+        help="Optional test-set similarity safeguard for augmented subarrays. Choose 'jaccard' or 'overlap' to reject candidates that are too close to any held-out test example. Leave empty to keep current behavior.",
+    )
+    parser.add_argument(
+        "--aug_similarity_min_distance",
+        type=float,
+        default=0.30,
+        help="Minimum allowed distance to the nearest test example when --aug_similarity is set (higher is stricter).",
+    )
+    parser.add_argument(
+        "--plot_test_curve",
+        action="store_true",
+        help="If set and a test set is present, evaluate the model on the test set once per epoch and include test loss as a third line in the training curves plot.",
+    )
+    args = parser.parse_args()
+
+    _require_torch()
+
+    augmentation_elapsed = 0.0
+    training_elapsed = 0.0
+
+    base_dataset = DirectionJsonlDataset(args.jsonl, include_flanks=args.include_flanks)
+    base_len = len(base_dataset.records)
+    vocab = build_vocab_from_jsonl(args.jsonl)
+
+    dataset_label_counts = Counter(example.label for example in base_dataset.records)
+    if len(dataset_label_counts) < 2:
+        raise ValueError(
+            "Dataset contains only one class label. Training/validation accuracy is not informative. "
+            f"Label counts: {dict(dataset_label_counts)}"
+        )
+    
+    stratify_mode = (
+        "cas_subtype_and_label" if args.stratify_by_cas_subtype_and_label else args.stratify_by
+    )
+
+    use_explicit_test_holdout = args.test_size and 0.0 < args.test_size < 1.0
+    if args.test_size and not (0.0 < args.test_size < 1.0):
+        raise ValueError("test_size must be in (0.0, 1.0)")
+
+    if use_explicit_test_holdout:
+        dev_indices, test_indices = stratified_holdout_by_mode(
+            base_dataset.records,
+            seed=args.seed,
+            holdout_fraction=args.test_size,
+            stratify_mode=stratify_mode,
+        )
+    else:
+        # Legacy behavior when no explicit final test holdout is requested.
+        if stratify_mode == "label":
+            splits = stratified_train_test_and_val_by_label(
+                base_dataset.records, seed=args.seed, train_test_fraction=0.8
+            )
+            train_indices = splits["train_test"]
+            val_indices = splits["val"]
+            test_indices = []
+            dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+        elif stratify_mode == "cas_subtype":
+            splits = stratified_split_by_cas_subtype(
+                base_dataset.records, seed=args.seed, train_fraction=0.8, test_fraction=0.1
+            )
+            train_indices = splits["train"]
+            val_indices = splits["val"]
+            test_indices = splits["test"]
+            dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+        else:
+            splits = stratified_train_test_and_val_by_cas_subtype_and_label(
+                base_dataset.records, seed=args.seed, train_test_fraction=0.8
+            )
+            train_indices = splits["train_test"]
+            val_indices = splits["val"]
+            test_indices = []
+            dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+
+    train_indices: list[int]
+    test_indices = list(test_indices)
+
+    similarity_metric = (args.aug_similarity or "").strip().lower()
+    use_similarity_filter = bool(similarity_metric)
+    if use_similarity_filter and not test_indices:
+        print("Augmentation similarity safeguard requested, but no test split is present; similarity filtering will be skipped.")
+
+    test_signatures = None
+    test_signatures_by_idx = None
+    test_token_sets = None
+    inverted_index = None
+    if use_similarity_filter and test_indices:
+        # keep both a set for quick equality checks and a mapping for positional checks
+        test_signatures = {
+            _example_signature(base_dataset.records[idx])
+            for idx in test_indices
+        }
+        test_signatures_by_idx = {idx: _example_signature(base_dataset.records[idx]) for idx in test_indices}
+        test_token_sets, inverted_index = _build_test_similarity_index(base_dataset.records, test_indices)
+
+    if use_explicit_test_holdout:
+        if args.cv_folds > 1:
+            if not (0 <= args.cv_fold_index < args.cv_folds):
+                raise ValueError(
+                    f"cv_fold_index must be in [0, {args.cv_folds - 1}] when cv_folds={args.cv_folds}"
+                )
+
+            cv_folds = build_cv_folds_by_signature(
+                examples=base_dataset.records,
+                pool_indices=dev_indices,
+                n_folds=args.cv_folds,
+                seed=args.seed,
+                stratify_mode=stratify_mode,
+            )
+            val_indices = cv_folds[args.cv_fold_index]
+            train_indices = [idx for j, fold in enumerate(cv_folds) if j != args.cv_fold_index for idx in fold]
+
+            print(
+                f"CV mode: folds={args.cv_folds}, using fold {args.cv_fold_index} as validation "
+                f"(dev pool={len(dev_indices)}; train={len(train_indices)}, val={len(val_indices)}, "
+                f"test={len(test_indices)})"
+            )
+        else:
+            train_indices, val_indices = split_dev_pool_by_mode(
+                examples=base_dataset.records,
+                pool_indices=dev_indices,
+                seed=args.seed,
+                stratify_mode=stratify_mode,
+            )
+    elif args.cv_folds > 1:
+        if not (0 <= args.cv_fold_index < args.cv_folds):
+            raise ValueError(
+                f"cv_fold_index must be in [0, {args.cv_folds - 1}] when cv_folds={args.cv_folds}"
+            )
+
+        dev_indices = sorted(set(list(train_indices) + list(val_indices)))
+        cv_folds = build_cv_folds_by_signature(
+            examples=base_dataset.records,
+            pool_indices=dev_indices,
+            n_folds=args.cv_folds,
+            seed=args.seed,
+            stratify_mode=stratify_mode,
+        )
+        val_indices = cv_folds[args.cv_fold_index]
+        train_indices = [idx for j, fold in enumerate(cv_folds) if j != args.cv_fold_index for idx in fold]
+
+        print(
+            f"CV mode: folds={args.cv_folds}, using fold {args.cv_fold_index} as validation "
+            f"(dev pool={len(dev_indices)}; train={len(train_indices)}, val={len(val_indices)}, "
+            f"test={(len(test_indices) if test_indices else 0)})"
+        )
+
+    # Handle reverse-complement augmentation in "before" mode (before subarray augmentation)
+    rc_mode = getattr(args, "reverse_complement_mode", "none")
+    initial_train_indices = None
+    initial_val_indices = None
+    
+    if rc_mode == "before":
+        _print_ts("Augmentation: reverse-complement mode=before (add RC before subarray augmentation; augment all)")
+        train_rc_indices, train_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(train_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        val_rc_indices, val_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(val_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        train_indices = list(train_indices) + train_rc_indices
+        val_indices = list(val_indices) + val_rc_indices
+        _print_ts(
+            "Augmentation: reverse-complement duplication summary "
+            f"train_added={train_rc_stats['added']} train_blocked={train_rc_stats['blocked_similarity']} "
+            f"val_added={val_rc_stats['added']} val_blocked={val_rc_stats['blocked_similarity']}"
+        )
+    elif rc_mode in ("after", "initial_only"):
+        # For "after" and "initial_only" modes, track the original indices before subarray augmentation
+        initial_train_indices = list(train_indices)
+        initial_val_indices = list(val_indices)
+        _print_ts(f"Augmentation: reverse-complement mode={rc_mode} (will apply after subarray augmentation)")
+
+    augment_fn = None
+    # Detect if we're using subtype balancing with enumerate mode; if so, skip standard enumerate.
+    skip_standard_augment_for_balancing = (
+        getattr(args, "augment_subarrays", False)
+        and getattr(args, "augment_subtypes_balance", False)
+        and args.augment_subarrays_mode == "enumerate"
+    )
+
+    augmentation_started_at = None
+
+    if getattr(args, "augment_subarrays", False):
+        augmentation_started_at = time.perf_counter()
+        mode = args.augment_subarrays_mode
+        min_spacers = max(1, args.augment_subarrays_min_spacers)
+        max_per_array = args.augment_subarrays_max_per_array
+
+        _print_ts(
+            "Augmentation: spacer deletion enabled for train and validation "
+            f"(test untouched; mode={mode}, min_spacers={min_spacers}, "
+            f"max_per_array={max_per_array if max_per_array > 0 else 'unlimited'})"
+        )
+        if use_similarity_filter:
+            _print_ts(
+                f"Augmentation: similarity safeguard enabled using {similarity_metric} with min_distance={args.aug_similarity_min_distance:.2f}"
+            )
+
+        if mode == "random":
+            # Random mode: on-the-fly augmentation during training, not materialized
+            if use_similarity_filter:
+                augment_fn = make_subarray_augment_fn_with_similarity_filter(
+                    prob=args.augment_subarrays_prob,
+                    seed=args.seed,
+                    max_attempts=5,
+                    test_signatures=test_signatures,
+                    test_signatures_by_idx=test_signatures_by_idx,
+                    test_token_sets=test_token_sets,
+                    inverted_index=inverted_index,
+                    similarity_metric=similarity_metric,
+                    min_distance=args.aug_similarity_min_distance,
+                )
+            else:
+                augment_fn = make_subarray_augment_fn(prob=args.augment_subarrays_prob, seed=args.seed)
+            _print_ts("Augmentation: random subarray deletion (on-the-fly) enabled for train and validation")
+        elif not skip_standard_augment_for_balancing:
+            # Enumerate mode without balancing: materialize diverse subarrays upfront for train and val
+            seen_signatures = {
+                _example_signature(example)
+                for example in base_dataset.records
+            }
+
+            train_new_indices, train_aug_stats = _materialize_subarray_augmentations(
+                base_dataset=base_dataset,
+                source_indices=list(train_indices),
+                seen_signatures=seen_signatures,
+                test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                seed=args.seed,
+                mode=mode,
+                prob=args.augment_subarrays_prob,
+                min_spacers=min_spacers,
+                max_per_array=max_per_array,
+                split_name="train",
+                use_diversity=not args.augment_subarrays_enumerate_fast,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
+            )
+            train_indices = list(train_indices) + train_new_indices
+
+            val_new_indices, val_aug_stats = _materialize_subarray_augmentations(
+                base_dataset=base_dataset,
+                source_indices=list(val_indices),
+                seen_signatures=seen_signatures,
+                test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                seed=args.seed + 1,
+                mode=mode,
+                prob=args.augment_subarrays_prob,
+                min_spacers=min_spacers,
+                max_per_array=max_per_array,
+                split_name="val",
+                use_diversity=not args.augment_subarrays_enumerate_fast,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
+            )
+            val_indices = list(val_indices) + val_new_indices
+
+            if use_similarity_filter:
+                _print_ts(
+                    "Augmentation similarity summary: "
+                    f"train_blocked={train_aug_stats.get('blocked_similarity', 0)} "
+                    f"val_blocked={val_aug_stats.get('blocked_similarity', 0)} "
+                    f"train_added={train_aug_stats.get('added', 0)} "
+                    f"val_added={val_aug_stats.get('added', 0)}"
+                )
+        else:
+            # Enumerate mode with balancing: skip standard pass, will be handled by balancing logic below
+            _print_ts("Augmentation: skipping standard enumerate pass; will use subtype-aware balancing instead")
+            seen_signatures = {
+                _example_signature(example)
+                for example in base_dataset.records
+            }
+
+    # Optional: materialize enumerate-mode augmentations to balance cas_subtype counts
+    # across train/val splits. When combined with --augment_subarrays, computes per-subtype
+    # targets upfront and only materializes what's needed for each subtype.
+    if getattr(args, "augment_subtypes_balance", False):
+        if not getattr(args, "augment_subarrays", False):
+            _print_ts("augment_subtypes_balance requested but --augment_subarrays not set; skipping balancing.")
+        elif args.augment_subarrays_mode != "enumerate":
+            _print_ts("augment_subtypes_balance requires --augment_subarrays_mode enumerate; skipping balancing.")
+        else:
+            # Ensure seen_signatures is initialized
+            if 'seen_signatures' not in locals():
+                seen_signatures = {_example_signature(example) for example in base_dataset.records}
+
+            _print_ts("Augmentation: subtype-aware balancing—computing per-subtype targets and materializing only what's needed")
+
+            min_spacers = max(1, args.augment_subarrays_min_spacers)
+            max_per_array = args.augment_subarrays_max_per_array
+
+            # Helper to get cas_subtype for an index
+            def _subtype_of(idx: int) -> str:
+                return (base_dataset.records[idx].cas_subtype or "Unknown").strip() or "Unknown"
+
+            # Calculate the ratio of val to train for proportional balancing
+            train_size = len(train_indices)
+            val_size = len(val_indices)
+            val_to_train_ratio = val_size / train_size if train_size > 0 else 0.2
+            _print_ts(f"Augmentation: val/train ratio = {val_to_train_ratio:.3f} (will scale val targets proportionally)")
+
+            for split_name in ["train", "val"]:
+                split_indices = train_indices if split_name == "train" else val_indices
+
+                # Current per-subtype counts
+                counts = Counter(_subtype_of(i) for i in list(split_indices))
+                if not counts:
+                    continue
+
+                # Compute target per-subtype, scaled for val split
+                base_target = args.augment_subtypes_balance_target or max(counts.values())
+                if split_name == "val":
+                    target = int(base_target * val_to_train_ratio)
+                else:
+                    target = base_target
+                    
+                if target <= 0:
+                    continue
+
+                # Pre-compute which subtypes need augmentation and how much
+                subtype_needs = {}
+                for subtype, cnt in sorted(counts.items()):
+                    if cnt < target:
+                        subtype_needs[subtype] = target - cnt
+
+                if not subtype_needs:
+                    _print_ts(f"Balancing {split_name}: all subtypes already at or above target {target}")
+                    continue
+
+                _print_ts(f"Balancing {split_name}: target={target}, subtype needs: {subtype_needs}")
+
+                # Now materialize only what's needed for each under-represented subtype
+                for subtype, needed in sorted(subtype_needs.items()):
+                    _print_ts(f"Balancing {split_name}: augmenting subtype={subtype} (current={counts[subtype]}, need={needed} more)")
+
+                    # Get source examples for this subtype from the current split
+                    source_pool = [i for i in list(split_indices) if _subtype_of(i) == subtype]
+                    if not source_pool:
+                        _print_ts(f"  No source examples for subtype {subtype}; skipping")
+                        continue
+
+                    added_total = 0
+                    round_seed = args.seed + (0 if split_name == "train" else 1)
+                    attempt = 0
+
+                    # Loop until we've added enough or augmentation stops producing new examples
+                    while added_total < needed:
+                        attempt += 1
+                        _print_ts(f"  Round {attempt}: generating augmentations for subtype={subtype} (need {needed - added_total} more)")
+
+                        new_indices, aug_stats = _materialize_subarray_augmentations(
+                            base_dataset=base_dataset,
+                            source_indices=list(source_pool),
+                            seen_signatures=seen_signatures,
+                            test_signatures=test_signatures,
+                            test_signatures_by_idx=test_signatures_by_idx,
+                            test_token_sets=test_token_sets,
+                            inverted_index=inverted_index,
+                            seed=round_seed,
+                            mode="enumerate",
+                            prob=args.augment_subarrays_prob,
+                            min_spacers=min_spacers,
+                            max_per_array=max_per_array,
+                            split_name=f"{split_name}_balance_{subtype}_r{attempt}",
+                            use_diversity=not args.augment_subarrays_enumerate_fast,
+                            similarity_metric=similarity_metric or "jaccard",
+                            min_distance=args.aug_similarity_min_distance,
+                            target_additions=needed - added_total,
+                            balance_per_array=True,
+                        )
+
+                        if not new_indices:
+                            _print_ts(f"  Round {attempt}: no augmentations produced; stopped after adding {added_total}/{needed}")
+                            break
+
+                        # Function now stops early when target_additions is reached, so we add all returned indices
+                        split_indices.extend(new_indices)
+                        added_total += len(new_indices)
+                        counts[subtype] = counts.get(subtype, 0) + len(new_indices)
+                        round_seed += 2
+                        _print_ts(f"  Round {attempt}: added {len(new_indices)} examples (total: {added_total}/{needed})")
+
+                    _print_ts(f"  Subtype={subtype} balancing complete: added {added_total}/{needed}, final_count={counts.get(subtype, 0)}")
+
+    # Handle reverse-complement augmentation in "after" and "initial_only" modes (after subarray augmentation)
+    if rc_mode == "after":
+        _print_ts("Augmentation: reverse-complement mode=after (augment first, then add RC of all augmented arrays)")
+        train_rc_indices, train_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(train_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        val_rc_indices, val_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(val_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        train_indices = list(train_indices) + train_rc_indices
+        val_indices = list(val_indices) + val_rc_indices
+        _print_ts(
+            "Augmentation: reverse-complement duplication summary "
+            f"train_added={train_rc_stats['added']} train_blocked={train_rc_stats['blocked_similarity']} "
+            f"val_added={val_rc_stats['added']} val_blocked={val_rc_stats['blocked_similarity']}"
+        )
+    elif rc_mode == "initial_only":
+        _print_ts("Augmentation: reverse-complement mode=initial_only (augment first, then add RC only of initial arrays)")
+        if initial_train_indices is not None:
+            train_rc_indices, train_rc_stats = _materialize_reverse_complement_augmentation(
+                base_dataset=base_dataset,
+                source_indices=initial_train_indices,
+                test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
+            )
+            train_indices = list(train_indices) + train_rc_indices
+            _print_ts(
+                f"Augmentation: reverse-complement (initial_only, train) added={train_rc_stats['added']} "
+                f"blocked={train_rc_stats['blocked_similarity']}"
+            )
+        if initial_val_indices is not None:
+            val_rc_indices, val_rc_stats = _materialize_reverse_complement_augmentation(
+                base_dataset=base_dataset,
+                source_indices=initial_val_indices,
+                test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
+            )
+            val_indices = list(val_indices) + val_rc_indices
+            _print_ts(
+                f"Augmentation: reverse-complement (initial_only, val) added={val_rc_stats['added']} "
+                f"blocked={val_rc_stats['blocked_similarity']}"
+            )
+
+    if augmentation_started_at is not None:
+        augmentation_elapsed = time.perf_counter() - augmentation_started_at
+
+
+    train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn)
+    val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab, augment_fn=augment_fn)
+    test_dataset = DirectionTorchDataset(base_dataset, test_indices, vocab) if test_indices else None
+
+    print(f"Split sizes: train={len(train_dataset)}, val={len(val_dataset)}, test={(len(test_dataset) if test_dataset else 0)}")
+
+    train_label_counts = Counter(base_dataset.records[i].label for i in train_indices)
+    val_label_counts = Counter(base_dataset.records[i].label for i in val_indices)
+    print(f"Label distribution train={dict(train_label_counts)} val={dict(val_label_counts)}")
+    if test_indices:
+        test_label_counts = Counter(base_dataset.records[i].label for i in test_indices)
+        print(f"Label distribution test={dict(test_label_counts)}")
+
+    train_type_n, train_type_counts = summarize_cas_subtypes(base_dataset.records, train_indices)
+    val_type_n, val_type_counts = summarize_cas_subtypes(base_dataset.records, val_indices)
+    print(f"CRISPR types train (unique={train_type_n}): {train_type_counts}")
+    print(f"CRISPR types val (unique={val_type_n}): {val_type_counts}")
+    if test_indices:
+        test_type_n, test_type_counts = summarize_cas_subtypes(base_dataset.records, test_indices)
+        print(f"CRISPR types test (unique={test_type_n}): {test_type_counts}")
+
+    if len(train_label_counts) < 2 or len(val_label_counts) < 2:
+        raise ValueError(
+            "Train/validation split contains only a single class."
+            f"train={dict(train_label_counts)} val={dict(val_label_counts)}"
+        )
+
+    # Optionally compute weighted sampling weights and pass to dataloaders
+    train_weights = None
+    val_weights = None
+    if getattr(args, "weighted_sampling", False):
+        print("Weighted sampling enabled; computing per-sample weights...")
+        # choose key function
+        if args.weighted_sampling_by == "cas_subtype":
+            def _key_fn(i: int) -> str:
+                return (base_dataset.records[i].cas_subtype or "Unknown").strip() or "Unknown"
+        else:
+            def _key_fn(i: int) -> str:
+                return str(int(base_dataset.records[i].label))
+
+        # compute counts based on original (pre-augmentation) records when possible
+        def _counts_for(indices: list[int]) -> Counter:
+            c = Counter()
+            for i in indices:
+                if i < base_len:
+                    c[_key_fn(i)] += 1
+            # fallback to counting all if no originals present
+            if not c:
+                for i in indices:
+                    c[_key_fn(i)] += 1
+            return c
+
+        train_counts = _counts_for(train_indices)
+        val_counts = _counts_for(val_indices)
+
+        def _make_weights(indices: list[int], counts: Counter) -> list[float]:
+            majority = max(counts.values()) if counts else 1
+            alpha = float(getattr(args, "weighted_sampling_alpha", 1.0))
+            max_w = float(getattr(args, "weighted_sampling_max_weight", 10.0))
+            weight_map: dict[str, float] = {}
+            for k, v in counts.items():
+                ratio = majority / max(1, v)
+                weight = min(max_w, ratio ** alpha)
+                weight_map[k] = float(weight)
+
+            weights: list[float] = []
+            for i in indices:
+                key = _key_fn(i)
+                weights.append(weight_map.get(key, 1.0))
+            # normalize weights to have mean 1.0 to keep effective epoch size similar
+            if weights:
+                mean_w = float(sum(weights)) / len(weights)
+                if mean_w > 0:
+                    weights = [w / mean_w for w in weights]
+            return weights
+
+        train_weights = _make_weights(train_indices, train_counts)
+        val_weights = _make_weights(val_indices, val_counts)
+        print(
+            f"Weighted sampling: train weights mean={sum(train_weights)/len(train_weights):.3f} max={max(train_weights):.3f} | "
+            f"val weights mean={sum(val_weights)/len(val_weights):.3f} max={max(val_weights):.3f}"
+        )
+
+    train_loader = build_dataloader(train_dataset, batch_size=args.batch_size, shuffle=not bool(train_weights), weights=train_weights)
+    val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=not bool(val_weights), weights=val_weights)
+    test_loader = build_dataloader(test_dataset, batch_size=args.batch_size, shuffle=False) if test_dataset else None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Determine maximum number of spacers in the dataset to size positional encodings when needed
+    max_spacers_in_dataset = max((len(ex.spacers) for ex in base_dataset.records), default=64)
+    model = build_model(
+        vocab_size=len(vocab),
+        include_flanks=args.include_flanks,
+        max_spacers=max_spacers_in_dataset,
+        dropout=args.dropout,
+        positional_encoding=args.positional_encoding,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+
+    # Training loop with early stopping.
+    best_val_loss = float("inf")
+    patience_counter = 0
+    best_model_state = None
+    train_losses = []
+    val_losses = []
+    test_losses = []
+
+    training_started_at = time.perf_counter()
+    
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
+        val_metrics = evaluate(model, val_loader, loss_fn, device)
+        val_loss = val_metrics["loss"]
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        # Optionally evaluate on the held-out test set once per epoch for plotting
+        test_loss = float("nan")
+        if getattr(args, "plot_test_curve", False) and test_loader is not None:
+            test_metrics_epoch = evaluate(model, test_loader, loss_fn, device)
+            test_loss = test_metrics_epoch.get("loss", float("nan"))
+            test_losses.append(test_loss)
+        
+        # if validation loss improves, checkpoint the model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+        else:
+            patience_counter += 1
+        
+        es_marker = " (BEST)" if patience_counter == 0 else (" (STOP)" if patience_counter >= args.early_stopping_patience else "")
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        print(
+            (
+                "[{timestamp}] epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} test_loss={test_loss:.4f}{es_marker} "
+                "val_accuracy={val_accuracy:.4f} val_f1={val_f1:.4f} "
+                "val_pos_rate={val_pos_rate:.4f} val_pred_pos_rate={val_pred_pos_rate:.4f} "
+                "val_majority_baseline_acc={val_baseline:.4f}"
+            ).format(
+                timestamp=timestamp,
+                epoch=epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                test_loss=test_loss,
+                es_marker=es_marker,
+                val_accuracy=val_metrics["accuracy"],
+                val_f1=val_metrics["f1"],
+                val_pos_rate=val_metrics["positive_rate_true"],
+                val_pred_pos_rate=val_metrics["positive_rate_pred"],
+                val_baseline=val_metrics["majority_baseline_accuracy"],
+            )
+        )
+        
+        if patience_counter >= args.early_stopping_patience:
+            print(f"Early stopping: validation loss did not improve for {args.early_stopping_patience} epochs.")
+            break
+
+    training_elapsed = time.perf_counter() - training_started_at
+
+    # Restore best model before final evaluation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print("Restored best model (lowest validation loss).")
+
+    if use_similarity_filter and augment_fn is not None and hasattr(augment_fn, "similarity_stats"):
+        sim_stats = getattr(augment_fn, "similarity_stats")
+        print(
+            "Augmentation similarity summary: "
+            f"accepted={sim_stats.get('accepted', 0)} "
+            f"blocked_exact={sim_stats.get('blocked_exact', 0)} "
+            f"blocked_distance={sim_stats.get('blocked_distance', 0)} "
+            f"attempts={sim_stats.get('attempts', 0)}"
+        )
+    
+    # Plot training curves with parameters
+    if plt is not None:
+        fig, ax = plt.subplots(figsize=(12, 7))
+        epochs_range = range(1, len(train_losses) + 1)
+        ax.plot(epochs_range, train_losses, marker='o', label='Train Loss', linewidth=2)
+        ax.plot(epochs_range, val_losses, marker='s', label='Val Loss', linewidth=2)
+        if getattr(args, "plot_test_curve", False) and test_loader is not None and len(test_losses) > 0:
+            # Align test losses to the same epoch x-axis. If for any reason test_losses
+            # is shorter than train_losses (shouldn't be), pad with NaN so plotting
+            # uses the same epoch indices for all curves.
+            test_plot = [test_losses[i] if i < len(test_losses) else float('nan') for i in range(len(train_losses))]
+            ax.plot(epochs_range, test_plot, marker='^', label='Test Loss', linewidth=2)
+        ax.set_xlabel('Epoch', fontsize=12)
+        ax.set_ylabel('Loss', fontsize=12)
+        ax.set_title('Training vs Validation Loss', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        # param text box
+        params_text = (
+            f"batch_size={args.batch_size}\n"
+            f"lr={args.lr}\n"
+            f"weight_decay={args.weight_decay}\n"
+            f"dropout={args.dropout}\n"
+            f"early_stopping_patience={args.early_stopping_patience}\n"
+            f"stratify_by={stratify_mode}\n"
+            f"seed={args.seed}\n"
+            f"train_size={len(train_dataset)}\n"
+            f"val_size={len(val_dataset)}\n"
+            f"epochs_completed={len(train_losses)}\n"
+            f"best_val_loss={min(val_losses):.4f}"
+        )
+        ax.text(0.98, 0.97, params_text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                family='monospace')
+        
+        output_path = Path("/tmp/training_curves.png")
+        fig.savefig(str(output_path), dpi=100, bbox_inches='tight')
+        print(f"Training curves saved to {output_path}")
+        plt.close(fig)
+    else:
+        print("matplotlib not available; skipping training curves visualization.")
+    
+    if test_loader is not None:
+        # print test metrics
+        test_metrics = evaluate(model, test_loader, loss_fn, device)
+        print(
+            (
+                "test_loss={loss:.4f} test_accuracy={accuracy:.4f} auc={auc} aupr={aupr} "
+                "precision={precision:.4f} recall={recall:.4f} f1={f1:.4f}"
+            ).format(
+                loss=test_metrics["loss"],
+                accuracy=test_metrics["accuracy"],
+                auc=(f"{test_metrics['auc']:.4f}" if not (test_metrics['auc'] != test_metrics['auc']) else "nan"),
+                aupr=(f"{test_metrics['aupr']:.4f}" if not (test_metrics['aupr'] != test_metrics['aupr']) else "nan"),
+                precision=test_metrics["precision"],
+                recall=test_metrics["recall"],
+                f1=test_metrics["f1"],
+            )
+        )
+
+        # Generate confusion matrix for test set
+        if plt is not None:
+            import numpy as np
+            try:
+                from sklearn.metrics import confusion_matrix
+                
+                # Collect all predictions and labels from test set
+                all_probs = []
+                all_labels = []
+                model.eval()
+                with torch.no_grad():
+                    for batch in test_loader:
+                        batch = {key: value.to(device) for key, value in batch.items()}
+                        logits = model(batch)
+                        probs = torch.sigmoid(logits).cpu().numpy()
+                        labels = batch["label"].cpu().numpy()
+                        all_probs.extend(probs.flatten())
+                        all_labels.extend(labels.flatten())
+                
+                y_pred = (np.array(all_probs) >= 0.5).astype(int)
+                y_true = np.array(all_labels, dtype=int)
+                
+                cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+                
+                # Plot confusion matrix
+                from matplotlib.colors import LinearSegmentedColormap
+
+                blue_purple = LinearSegmentedColormap.from_list(
+                    "blue_purple",
+                    ["#dbeafe", "#a78bfa", "#7c3aed"],
+                    N=256,
+                )
+                fig, ax = plt.subplots(figsize=(8, 6))
+                im = ax.imshow(cm, interpolation='nearest', cmap=blue_purple)
+                
+                # Labels and formatting
+                total_examples = int(cm.sum()) if int(cm.sum()) > 0 else 1
+                row_sums = cm.sum(axis=1)
+                class_names = [
+                    f"Backward (n={int(row_sums[0])}, {row_sums[0] / total_examples:.1%})",
+                    f"Forward (n={int(row_sums[1])}, {row_sums[1] / total_examples:.1%})",
+                ]
+                tick_marks = np.arange(len(class_names))
+                ax.set_xticks(tick_marks)
+                ax.set_yticks(tick_marks)
+                ax.set_xticklabels(class_names)
+                ax.set_yticklabels(class_names)
+                
+                # Annotations
+                thresh = cm.max() * 0.65
+                for i in range(cm.shape[0]):
+                    for j in range(cm.shape[1]):
+                        count = cm[i, j]
+                        pct_all = (count / total_examples) * 100.0
+                        pct_row = (count / row_sums[i]) * 100.0 if row_sums[i] > 0 else 0.0
+                        ax.text(j, i, f'{count}\n{pct_all:.1f}% total\n{pct_row:.1f}% row',
+                                ha="center", va="center",
+                                color="white" if cm[i, j] > thresh else "black",
+                                fontsize=10, fontweight='bold')
+                
+                ax.set_ylabel('True Label', fontsize=12)
+                ax.set_xlabel('Predicted Label', fontsize=12)
+                ax.set_title('Test Set Confusion Matrix', fontsize=14, fontweight='bold')
+                
+                plt.colorbar(im, ax=ax, label='Count')
+                
+                output_path = Path("/tmp/confusion_matrix.png")
+                fig.savefig(str(output_path), dpi=100, bbox_inches='tight')
+                print(f"Confusion matrix saved to {output_path}")
+                plt.close(fig)
+            except Exception as e:
+                print(f"Could not generate confusion matrix: {e}")
+        
+        # print subtype test metrics
+
+        per_subtype_metrics = evaluate_per_subtype(
+            model=model,
+            base_dataset=base_dataset,
+            indices=test_indices,
+            vocab=vocab,
+            loss_fn=loss_fn,
+            device=device,
+            batch_size=args.batch_size,
+        )
+        print("Per-cas_subtype test metrics:")
+        print(
+            "{:<16} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}".format(
+                "cas_subtype", "n", "accuracy", "auc", "aupr", "precision", "recall", "f1"
+            )
+        )
+        for subtype, metrics in per_subtype_metrics.items():
+            auc_text = f"{metrics['auc']:.4f}" if not (metrics["auc"] != metrics["auc"]) else "nan"
+            aupr_text = f"{metrics['aupr']:.4f}" if not (metrics["aupr"] != metrics["aupr"]) else "nan"
+            print(
+                "{:<16} {:>7} {:>9.4f} {:>9} {:>9} {:>9.4f} {:>9.4f} {:>9.4f}".format(
+                    subtype,
+                    int(metrics["n"]),
+                    metrics["accuracy"],
+                    auc_text,
+                    aupr_text,
+                    metrics["precision"],
+                    metrics["recall"],
+                    metrics["f1"],
+                )
+            )
+
+    total_elapsed = augmentation_elapsed + training_elapsed
+    _print_ts(
+        "Timing summary: "
+        f"augmentation_time={augmentation_elapsed:.2f}s "
+        f"training_time={training_elapsed:.2f}s "
+        f"total_time={total_elapsed:.2f}s"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

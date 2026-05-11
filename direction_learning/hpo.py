@@ -22,13 +22,15 @@ except ModuleNotFoundError:
 
 from .dataset import DirectionJsonlDataset, build_vocab_from_jsonl
 from .model import DirectionTransformerConfig, build_model
-from .train import (
+from .data import (
     DirectionTorchDataset,
     build_dataloader,
-    evaluate,
     split_groups,
     split_dev_pool_by_mode,
     stratified_holdout_by_mode,
+)
+from .training import (
+    evaluate,
     train_one_epoch,
 )
 
