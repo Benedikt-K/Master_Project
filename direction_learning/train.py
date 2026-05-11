@@ -32,6 +32,7 @@ from .dataset import (
     collate_encoded_examples,
     encode_example,
 )
+from .tokenization import reverse_complement
 from direction_learning.model import SpacerDirectionTransformer, build_model
 
 
@@ -51,6 +52,67 @@ def _timestamp() -> str:
 def _print_ts(message: str) -> None:
     """Print a log line with a wall-clock timestamp prefix."""
     print(f"[{_timestamp()}] {message}")
+
+
+def _reverse_complement_example(example: DirectionExample) -> DirectionExample:
+    """Return the reverse-complemented counterpart of a CRISPR array example."""
+    flipped_label = 1 - int(example.label)
+    flipped_direction = "Forward" if flipped_label == 1 else "Reverse"
+    return DirectionExample(
+        array_name=example.array_name,
+        group_name=example.group_name,
+        agreement=example.agreement,
+        evor_direction=flipped_direction,
+        label=flipped_label,
+        orientation_variant="reverse_complement",
+        source_variant=example.orientation_variant,
+        spacers=[reverse_complement(seq) for seq in reversed(example.spacers)],
+        repeats=[reverse_complement(seq) for seq in reversed(example.repeats)],
+        cas_subtype=example.cas_subtype,
+        left_flank=reverse_complement(example.right_flank),
+        right_flank=reverse_complement(example.left_flank),
+        source_json=example.source_json,
+    )
+
+
+def _materialize_reverse_complement_augmentation(
+    base_dataset: DirectionJsonlDataset,
+    source_indices: list[int],
+    test_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_signatures_by_idx: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] | None = None,
+    test_token_sets: dict[int, set[str]] | None = None,
+    inverted_index: dict[str, set[int]] | None = None,
+    similarity_metric: str = "jaccard",
+    min_distance: float = 0.0,
+) -> tuple[list[int], dict[str, int]]:
+    """Duplicate a split with reverse-complemented examples before other augmentation."""
+    new_indices: list[int] = []
+    stats = {"added": 0, "blocked_similarity": 0}
+
+    for idx in source_indices:
+        candidate_example = _reverse_complement_example(base_dataset.records[idx])
+        if not _candidate_passes_similarity_filter(
+            candidate_example,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            metric=similarity_metric,
+            min_distance=min_distance,
+            test_signatures_by_idx=test_signatures_by_idx,
+        ):
+            stats["blocked_similarity"] += 1
+            continue
+
+        if test_signatures is not None:
+            candidate_sig = _example_signature(candidate_example)
+            if candidate_sig in test_signatures:
+                stats["blocked_similarity"] += 1
+                continue
+
+        base_dataset.records.append(candidate_example)
+        new_indices.append(len(base_dataset.records) - 1)
+        stats["added"] += 1
+
+    return new_indices, stats
 
 
 def split_groups(examples: list[DirectionExample], seed: int = 13, train_fraction: float = 0.7, val_fraction: float = 0.15) -> dict[str, list[int]]:
@@ -1390,6 +1452,26 @@ def main() -> int:
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for AdamW optimizer (default 3e-4).")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="L2 regularization strength (default 1e-5).")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for regularization (default 0.1).")
+    parser.add_argument(
+        "--positional_encoding",
+        type=str,
+        default="absolute",
+        choices=["absolute", "alibi", "rope"],
+        help="Positional encoding to use for spacer order (default: absolute).",
+    )
+    parser.add_argument(
+        "--reverse_complement_mode",
+        type=str,
+        default="none",
+        choices=["none", "before", "after", "initial_only"],
+        help=(
+            "When and how to apply reverse-complement augmentation to train/val (test always stays untouched):\n"
+            "  none: Do not apply reverse-complement augmentation (default).\n"
+            "  before: Add reverse complements before subarray augmentation; augment all including RC examples.\n"
+            "  after: Apply subarray augmentation first, then add reverse complements of all resulting arrays.\n"
+            "  initial_only: Apply subarray augmentation, then add reverse complements only of the initial (non-augmented) arrays."
+        ),
+    )
     parser.add_argument("--early_stopping_patience", type=int, default=3, help="Stop if val_loss doesn't improve for N epochs (default 3).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default 42).")
     parser.add_argument(
@@ -1655,6 +1737,46 @@ def main() -> int:
             f"test={(len(test_indices) if test_indices else 0)})"
         )
 
+    # Handle reverse-complement augmentation in "before" mode (before subarray augmentation)
+    rc_mode = getattr(args, "reverse_complement_mode", "none")
+    initial_train_indices = None
+    initial_val_indices = None
+    
+    if rc_mode == "before":
+        _print_ts("Augmentation: reverse-complement mode=before (add RC before subarray augmentation; augment all)")
+        train_rc_indices, train_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(train_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        val_rc_indices, val_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(val_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        train_indices = list(train_indices) + train_rc_indices
+        val_indices = list(val_indices) + val_rc_indices
+        _print_ts(
+            "Augmentation: reverse-complement duplication summary "
+            f"train_added={train_rc_stats['added']} train_blocked={train_rc_stats['blocked_similarity']} "
+            f"val_added={val_rc_stats['added']} val_blocked={val_rc_stats['blocked_similarity']}"
+        )
+    elif rc_mode in ("after", "initial_only"):
+        # For "after" and "initial_only" modes, track the original indices before subarray augmentation
+        initial_train_indices = list(train_indices)
+        initial_val_indices = list(val_indices)
+        _print_ts(f"Augmentation: reverse-complement mode={rc_mode} (will apply after subarray augmentation)")
+
     augment_fn = None
     # Detect if we're using subtype balancing with enumerate mode; if so, skip standard enumerate.
     skip_standard_augment_for_balancing = (
@@ -1872,6 +1994,71 @@ def main() -> int:
 
                     _print_ts(f"  Subtype={subtype} balancing complete: added {added_total}/{needed}, final_count={counts.get(subtype, 0)}")
 
+    # Handle reverse-complement augmentation in "after" and "initial_only" modes (after subarray augmentation)
+    if rc_mode == "after":
+        _print_ts("Augmentation: reverse-complement mode=after (augment first, then add RC of all augmented arrays)")
+        train_rc_indices, train_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(train_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        val_rc_indices, val_rc_stats = _materialize_reverse_complement_augmentation(
+            base_dataset=base_dataset,
+            source_indices=list(val_indices),
+            test_signatures=test_signatures,
+            test_signatures_by_idx=test_signatures_by_idx,
+            test_token_sets=test_token_sets,
+            inverted_index=inverted_index,
+            similarity_metric=similarity_metric or "jaccard",
+            min_distance=args.aug_similarity_min_distance,
+        )
+        train_indices = list(train_indices) + train_rc_indices
+        val_indices = list(val_indices) + val_rc_indices
+        _print_ts(
+            "Augmentation: reverse-complement duplication summary "
+            f"train_added={train_rc_stats['added']} train_blocked={train_rc_stats['blocked_similarity']} "
+            f"val_added={val_rc_stats['added']} val_blocked={val_rc_stats['blocked_similarity']}"
+        )
+    elif rc_mode == "initial_only":
+        _print_ts("Augmentation: reverse-complement mode=initial_only (augment first, then add RC only of initial arrays)")
+        if initial_train_indices is not None:
+            train_rc_indices, train_rc_stats = _materialize_reverse_complement_augmentation(
+                base_dataset=base_dataset,
+                source_indices=initial_train_indices,
+                test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
+            )
+            train_indices = list(train_indices) + train_rc_indices
+            _print_ts(
+                f"Augmentation: reverse-complement (initial_only, train) added={train_rc_stats['added']} "
+                f"blocked={train_rc_stats['blocked_similarity']}"
+            )
+        if initial_val_indices is not None:
+            val_rc_indices, val_rc_stats = _materialize_reverse_complement_augmentation(
+                base_dataset=base_dataset,
+                source_indices=initial_val_indices,
+                test_signatures=test_signatures,
+                test_signatures_by_idx=test_signatures_by_idx,
+                test_token_sets=test_token_sets,
+                inverted_index=inverted_index,
+                similarity_metric=similarity_metric or "jaccard",
+                min_distance=args.aug_similarity_min_distance,
+            )
+            val_indices = list(val_indices) + val_rc_indices
+            _print_ts(
+                f"Augmentation: reverse-complement (initial_only, val) added={val_rc_stats['added']} "
+                f"blocked={val_rc_stats['blocked_similarity']}"
+            )
+
     if augmentation_started_at is not None:
         augmentation_elapsed = time.perf_counter() - augmentation_started_at
 
@@ -1964,9 +2151,15 @@ def main() -> int:
     test_loader = build_dataloader(test_dataset, batch_size=args.batch_size, shuffle=False) if test_dataset else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Determine maximum number of spacers in the dataset to size positional embeddings
+    # Determine maximum number of spacers in the dataset to size positional encodings when needed
     max_spacers_in_dataset = max((len(ex.spacers) for ex in base_dataset.records), default=64)
-    model = build_model(vocab_size=len(vocab), include_flanks=args.include_flanks, max_spacers=max_spacers_in_dataset, dropout=args.dropout).to(device)
+    model = build_model(
+        vocab_size=len(vocab),
+        include_flanks=args.include_flanks,
+        max_spacers=max_spacers_in_dataset,
+        dropout=args.dropout,
+        positional_encoding=args.positional_encoding,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 

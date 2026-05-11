@@ -168,6 +168,7 @@ def run_study(args: argparse.Namespace) -> int:
             num_layers=config.num_layers,
             feedforward_dim=config.feedforward_dim,
             activation=config.activation,
+            positional_encoding=args.positional_encoding,
         ).to(device)
 
         optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam", "sgd"])
@@ -251,6 +252,8 @@ def run_study(args: argparse.Namespace) -> int:
             "jsonl": str(jsonl_path),
             "seed": args.seed,
             "include_flanks": args.include_flanks,
+            "positional_encoding": args.positional_encoding,
+            "reverse_complement_mode": args.reverse_complement_mode,
             "train_fraction": args.train_fraction,
             "val_fraction": args.val_fraction,
         },
@@ -317,6 +320,7 @@ def run_study(args: argparse.Namespace) -> int:
             dropout=float(best_params["dropout"]),
             max_spacers=max((len(ex.spacers) for ex in dataset.records), default=64),
             include_flanks=args.include_flanks,
+            positional_encoding=args.positional_encoding,
         )
         model = build_model(
             vocab_size=best_config_obj.vocab_size,
@@ -329,6 +333,7 @@ def run_study(args: argparse.Namespace) -> int:
             num_heads=best_config_obj.num_heads,
             num_layers=best_config_obj.num_layers,
             feedforward_dim=best_config_obj.feedforward_dim,
+            positional_encoding=best_config_obj.positional_encoding,
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=best_params["lr"], weight_decay=best_params["weight_decay"])
         retrain_train_indices = train_indices + val_indices
@@ -372,6 +377,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_fraction", type=float, default=0.64, help="Training fraction (only used if test_size=0; legacy behavior)")
     parser.add_argument("--val_fraction", type=float, default=0.16, help="Validation fraction (only used if test_size=0; legacy behavior)")
     parser.add_argument("--include_flanks", action="store_true", help="Include flank tokens in the model/search")
+    parser.add_argument(
+        "--positional_encoding",
+        type=str,
+        default="absolute",
+        choices=["absolute", "alibi", "rope"],
+        help="Positional encoding to use for spacer order (default: absolute).",
+    )
+    parser.add_argument(
+        "--reverse_complement_mode",
+        type=str,
+        default="none",
+        choices=["none", "before", "after", "initial_only"],
+        help=(
+            "When and how to apply reverse-complement augmentation to train/val (test always stays untouched):\\n"
+            "  none: Do not apply reverse-complement augmentation (default).\\n"
+            "  before: Add reverse complements before subarray augmentation; augment all including RC examples.\\n"
+            "  after: Apply subarray augmentation first, then add reverse complements of all resulting arrays.\\n"
+            "  initial_only: Apply subarray augmentation, then add reverse complements only of the initial (non-augmented) arrays."
+        ),
+    )
     parser.add_argument("--max_epochs", type=int, default=30, help="Maximum epochs per trial")
     parser.add_argument("--early_stopping_patience", type=int, default=5, help="Early stopping patience per trial")
     parser.add_argument("--pruner_warmup_steps", type=int, default=2, help="Median pruner warmup steps")
