@@ -113,6 +113,13 @@ def main() -> int:
         help="Positional encoding to use for spacer order (default: absolute).",
     )
     parser.add_argument(
+        "--pooling_strategy",
+        type=str,
+        default="mean",
+        choices=["mean", "max", "attention", "learnable"],
+        help="Sequence pooling strategy to use in encoder (default: mean).",
+    )
+    parser.add_argument(
         "--reverse_complement_mode",
         type=str,
         default="none",
@@ -155,7 +162,7 @@ def main() -> int:
         dest="test_size",
         type=float,
         default=0.0,
-        help="Fraction of the full dataset to hold out as the final test set (e.g. 0.1 for 10%).",
+        help="Fraction of the full dataset to hold out as the final test set (e.g. 0.1 for 10%%).",
     )
     parser.add_argument(
         "--cv_folds",
@@ -811,6 +818,7 @@ def main() -> int:
         max_spacers=max_spacers_in_dataset,
         dropout=args.dropout,
         positional_encoding=args.positional_encoding,
+        pooling_strategy=args.pooling_strategy,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.BCEWithLogitsLoss()

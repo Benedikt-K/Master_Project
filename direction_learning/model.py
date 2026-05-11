@@ -33,6 +33,7 @@ class DirectionTransformerConfig:
     max_spacers: int = 64
     include_flanks: bool = False
     positional_encoding: str = "absolute"
+    pooling_strategy: str = "mean"
 
 
 def _require_torch() -> None:
@@ -44,14 +45,13 @@ def _require_torch() -> None:
         )
 
 
-class MeanPoolSequenceEncoder(nn.Module if nn is not None else object):
-    """Encodes variable-length DNA sequences to fixed-size embeddings via mean pooling.
+class SequenceEncoderBase(nn.Module if nn is not None else object):
+    """Base class for variable-length sequence encoders with configurable pooling.
     
-    Embeds individual bases and applies mean pooling (optionally masked) to
-    produce a single embedding per sequence. Used as the base encoder for
-    spacers, repeats, and flanks.
+    Embeds tokens and applies a pooling strategy (mean, max, attention, or learnable)
+    to produce fixed-size embeddings per sequence.
     """
-    def __init__(self, vocab_size: int, token_dim: int, spacer_dim: int, dropout: float = 0.1):
+    def __init__(self, vocab_size: int, token_dim: int, spacer_dim: int, dropout: float = 0.1, pooling_strategy: str = "mean"):
         """Initialize the sequence encoder.
         
         Args:
@@ -59,15 +59,25 @@ class MeanPoolSequenceEncoder(nn.Module if nn is not None else object):
             token_dim: Dimension of token embeddings.
             spacer_dim: Output dimension after projection.
             dropout: Dropout rate for regularization.
+            pooling_strategy: One of 'mean', 'max', 'attention', 'learnable'.
         """
         _require_torch()
         super().__init__()
+        if pooling_strategy not in {"mean", "max", "attention", "learnable"}:
+            raise ValueError(f"Unknown pooling_strategy: {pooling_strategy}")
+        
+        self.pooling_strategy = pooling_strategy
         self.embedding = nn.Embedding(vocab_size, token_dim, padding_idx=0)
         self.projection = nn.Sequential(
             nn.Linear(token_dim, spacer_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
+        
+        if pooling_strategy == "attention":
+            self.attention_weights = nn.Linear(token_dim, 1)
+        elif pooling_strategy == "learnable":
+            self.pool_vector = nn.Parameter(torch.randn(token_dim))
 
     def forward(self, token_batch: Any, token_mask: Any = None) -> Any:
         """Encode token sequences to embeddings.
@@ -84,15 +94,48 @@ class MeanPoolSequenceEncoder(nn.Module if nn is not None else object):
             output_dim = self.projection[0].out_features
             return torch.zeros((batch_size, output_dim), device=token_batch.device, dtype=self.embedding.weight.dtype)
 
-        embedded = self.embedding(token_batch)
-        if token_mask is None:
-            pooled = embedded.mean(dim=1)
-        else:
-            weights = token_mask.unsqueeze(-1).float()
-            summed = (embedded * weights).sum(dim=1)
-            denom = weights.sum(dim=1).clamp_min(1.0)
-            pooled = summed / denom
+        embedded = self.embedding(token_batch)  # (batch_size, seq_len, token_dim)
+        
+        if self.pooling_strategy == "mean":
+            if token_mask is None:
+                pooled = embedded.mean(dim=1)
+            else:
+                weights = token_mask.unsqueeze(-1).float()
+                summed = (embedded * weights).sum(dim=1)
+                denom = weights.sum(dim=1).clamp_min(1.0)
+                pooled = summed / denom
+        
+        elif self.pooling_strategy == "max":
+            if token_mask is not None:
+                embedded = embedded.masked_fill(~token_mask.unsqueeze(-1).bool(), float('-inf'))
+            pooled = embedded.max(dim=1)[0]
+            pooled = torch.nan_to_num(pooled, nan=0.0, posinf=0.0)  # Handle all-padding case
+        
+        elif self.pooling_strategy == "attention":
+            attn_scores = self.attention_weights(embedded).squeeze(-1)  # (batch_size, seq_len)
+            if token_mask is not None:
+                attn_scores = attn_scores.masked_fill(~token_mask.bool(), float('-inf'))
+            attn_weights = F.softmax(attn_scores, dim=1)  # (batch_size, seq_len)
+            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)  # Handle all-padding case
+            pooled = (embedded * attn_weights.unsqueeze(-1)).sum(dim=1)  # (batch_size, token_dim)
+        
+        elif self.pooling_strategy == "learnable":
+            # Dot product with learnable vector, then weighted sum
+            scores = torch.matmul(embedded, self.pool_vector)  # (batch_size, seq_len)
+            if token_mask is not None:
+                scores = scores.masked_fill(~token_mask.bool(), float('-inf'))
+            weights = F.softmax(scores, dim=1)  # (batch_size, seq_len)
+            weights = torch.nan_to_num(weights, nan=0.0)  # Handle all-padding case
+            pooled = (embedded * weights.unsqueeze(-1)).sum(dim=1)  # (batch_size, token_dim)
+        
         return self.projection(pooled)
+
+
+# Backward-compatibility alias
+class MeanPoolSequenceEncoder(SequenceEncoderBase):
+    """Legacy alias for mean pooling. Use SequenceEncoderBase with pooling_strategy='mean' instead."""
+    def __init__(self, vocab_size: int, token_dim: int, spacer_dim: int, dropout: float = 0.1):
+        super().__init__(vocab_size, token_dim, spacer_dim, dropout, pooling_strategy="mean")
 
 
 def _alibi_slopes(num_heads: int) -> Any:
@@ -239,17 +282,19 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         self.positional_encoding = config.positional_encoding.lower()
         if self.positional_encoding not in {"absolute", "alibi", "rope"}:
             raise ValueError("positional_encoding must be one of: absolute, alibi, rope")
-        self.sequence_encoder = MeanPoolSequenceEncoder(
+        self.sequence_encoder = SequenceEncoderBase(
             vocab_size=config.vocab_size,
             token_dim=config.token_dim,
             spacer_dim=config.spacer_dim,
             dropout=config.dropout,
+            pooling_strategy=config.pooling_strategy,
         )
-        self.flank_encoder = MeanPoolSequenceEncoder(
+        self.flank_encoder = SequenceEncoderBase(
             vocab_size=config.vocab_size,
             token_dim=config.token_dim,
             spacer_dim=config.spacer_dim,
             dropout=config.dropout,
+            pooling_strategy=config.pooling_strategy,
         )
         self.spacer_projection = nn.Linear(config.spacer_dim, config.transformer_dim)
         feedforward_dim = config.feedforward_dim if config.feedforward_dim is not None else config.transformer_dim * 4
@@ -362,6 +407,7 @@ def build_model(
     feedforward_dim: int | None = None,
     activation: str = "gelu",
     positional_encoding: str = "absolute",
+    pooling_strategy: str = "mean",
 ) -> SpacerDirectionTransformer:
     """Instantiate a SpacerDirectionTransformer with default configuration.
     
@@ -378,6 +424,10 @@ def build_model(
         transformer_dim: Transformer hidden dimension.
         num_heads: Number of attention heads.
         num_layers: Number of transformer encoder layers.
+        feedforward_dim: Feedforward hidden dimension (default 4x transformer_dim).
+        activation: Activation function for feedforward (default 'gelu').
+        positional_encoding: Positional encoding strategy ('absolute', 'alibi', 'rope'; default 'absolute').
+        pooling_strategy: Sequence pooling strategy ('mean', 'max', 'attention', 'learnable'; default 'mean').
         feedforward_dim: Transformer feedforward hidden dimension. If None,
             defaults to four times transformer_dim.
         activation: Transformer activation function (gelu or relu).
@@ -403,5 +453,6 @@ def build_model(
         max_spacers=max_spacers,
         include_flanks=include_flanks,
         positional_encoding=positional_encoding,
+        pooling_strategy=pooling_strategy,
     )
     return SpacerDirectionTransformer(config)
