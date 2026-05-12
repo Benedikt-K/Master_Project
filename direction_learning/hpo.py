@@ -59,13 +59,26 @@ def _choose_num_heads(transformer_dim: int, trial: Any) -> int:
     return trial.suggest_categorical("num_heads", valid_heads)
 
 
+def _build_sampler(args: argparse.Namespace) -> Any:
+    if args.sampler == "random":
+        return optuna.samplers.RandomSampler(seed=args.seed)
+    return optuna.samplers.TPESampler(
+        seed=args.seed,
+        n_startup_trials=args.tpe_startup_trials,
+        n_ei_candidates=args.tpe_ei_candidates,
+        multivariate=args.tpe_multivariate,
+    )
+
+
 def _sample_config(trial: Any, vocab_size: int, max_spacers: int, include_flanks: bool) -> DirectionTransformerConfig:
+    positional_encoding = trial.suggest_categorical("positional_encoding", ["absolute", "alibi", "rope"])
+    pooling_strategy = trial.suggest_categorical("pooling_strategy", ["mean", "max", "attention", "learnable"])
     token_dim = trial.suggest_categorical("token_dim", [32, 48, 64, 96, 128])
     spacer_dim = trial.suggest_categorical("spacer_dim", [64, 96, 128, 160, 192, 256])
     transformer_dim = trial.suggest_categorical("transformer_dim", [64, 96, 128, 160, 192, 256])
     num_heads = _choose_num_heads(transformer_dim, trial)
-    num_layers = trial.suggest_int("num_layers", 1, 4)
-    dropout = trial.suggest_float("dropout", 0.0, 0.4)
+    num_layers = trial.suggest_int("num_layers", 1, 6)
+    dropout = trial.suggest_float("dropout", 0.0, 0.5)
     feedforward_multiplier = trial.suggest_categorical("feedforward_multiplier", [2, 4, 6])
     feedforward_dim = transformer_dim * feedforward_multiplier
     activation = trial.suggest_categorical("activation", ["gelu", "relu"])
@@ -82,6 +95,8 @@ def _sample_config(trial: Any, vocab_size: int, max_spacers: int, include_flanks
         activation=activation,
         max_spacers=max_spacers,
         include_flanks=include_flanks,
+        positional_encoding=positional_encoding,
+        pooling_strategy=pooling_strategy,
     )
 
 
@@ -170,13 +185,14 @@ def run_study(args: argparse.Namespace) -> int:
             num_layers=config.num_layers,
             feedforward_dim=config.feedforward_dim,
             activation=config.activation,
-            positional_encoding=args.positional_encoding,
+            positional_encoding=config.positional_encoding,
+            pooling_strategy=config.pooling_strategy,
         ).to(device)
 
         optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam", "sgd"])
         lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 48, 64, 128])
         if optimizer_name == "sgd":
             momentum = trial.suggest_float("momentum", 0.0, 0.99)
 
@@ -237,7 +253,7 @@ def run_study(args: argparse.Namespace) -> int:
         storage=args.storage,
         load_if_exists=bool(args.storage),
         direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=args.seed),
+        sampler=_build_sampler(args),
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=args.pruner_warmup_steps),
     )
 
@@ -254,7 +270,6 @@ def run_study(args: argparse.Namespace) -> int:
             "jsonl": str(jsonl_path),
             "seed": args.seed,
             "include_flanks": args.include_flanks,
-            "positional_encoding": args.positional_encoding,
             "reverse_complement_mode": args.reverse_complement_mode,
             "train_fraction": args.train_fraction,
             "val_fraction": args.val_fraction,
@@ -322,7 +337,9 @@ def run_study(args: argparse.Namespace) -> int:
             dropout=float(best_params["dropout"]),
             max_spacers=max((len(ex.spacers) for ex in dataset.records), default=64),
             include_flanks=args.include_flanks,
-            positional_encoding=args.positional_encoding,
+            activation=str(best_params["activation"]),
+            positional_encoding=str(best_params["positional_encoding"]),
+            pooling_strategy=str(best_params["pooling_strategy"]),
         )
         model = build_model(
             vocab_size=best_config_obj.vocab_size,
@@ -335,7 +352,9 @@ def run_study(args: argparse.Namespace) -> int:
             num_heads=best_config_obj.num_heads,
             num_layers=best_config_obj.num_layers,
             feedforward_dim=best_config_obj.feedforward_dim,
+            activation=best_config_obj.activation,
             positional_encoding=best_config_obj.positional_encoding,
+            pooling_strategy=best_config_obj.pooling_strategy,
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=best_params["lr"], weight_decay=best_params["weight_decay"])
         retrain_train_indices = train_indices + val_indices
@@ -361,6 +380,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", default="", help="Torch device override")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for the initial split metadata")
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="tpe",
+        choices=["tpe", "random"],
+        help="Optuna sampler to use. 'random' is more exploratory; 'tpe' adapts toward promising regions.",
+    )
+    parser.add_argument(
+        "--tpe_startup_trials",
+        type=int,
+        default=10,
+        help="Number of initial random TPE trials before it starts exploiting promising regions.",
+    )
+    parser.add_argument(
+        "--tpe_ei_candidates",
+        type=int,
+        default=24,
+        help="Number of candidate points sampled internally by TPE per trial.",
+    )
+    parser.add_argument(
+        "--tpe_multivariate",
+        action="store_true",
+        help="Use multivariate TPE to model parameter interactions more directly.",
+    )
     parser.add_argument(
         "--stratify_by",
         type=str,

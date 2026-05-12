@@ -120,6 +120,13 @@ def main() -> int:
         help="Sequence pooling strategy to use in encoder (default: mean).",
     )
     parser.add_argument(
+        "--activation",
+        type=str,
+        default="gelu",
+        choices=["gelu", "relu"],
+        help="Activation function to use in transformer feedforward (default: gelu).",
+    )
+    parser.add_argument(
         "--reverse_complement_mode",
         type=str,
         default="none",
@@ -819,7 +826,10 @@ def main() -> int:
         dropout=args.dropout,
         positional_encoding=args.positional_encoding,
         pooling_strategy=args.pooling_strategy,
+        activation=args.activation,
     ).to(device)
+    print("Model architecture:")
+    print(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = torch.nn.BCEWithLogitsLoss()
 

@@ -26,7 +26,7 @@ class DirectionTransformerConfig:
     spacer_dim: int = 128
     transformer_dim: int = 128
     num_heads: int = 4
-    num_layers: int = 2
+    num_layers: int = 4
     feedforward_dim: int | None = None
     dropout: float = 0.1
     activation: str = "gelu"
@@ -109,7 +109,12 @@ class SequenceEncoderBase(nn.Module if nn is not None else object):
             if token_mask is not None:
                 embedded = embedded.masked_fill(~token_mask.unsqueeze(-1).bool(), float('-inf'))
             pooled = embedded.max(dim=1)[0]
-            pooled = torch.nan_to_num(pooled, nan=0.0, posinf=0.0)  # Handle all-padding case
+            pooled = torch.nan_to_num(
+                pooled,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )  # Handle all-padding case
         
         elif self.pooling_strategy == "attention":
             attn_scores = self.attention_weights(embedded).squeeze(-1)  # (batch_size, seq_len)
