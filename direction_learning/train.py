@@ -58,6 +58,7 @@ from .dataset import (
     build_vocab_from_jsonl,
 )
 from .model import build_model
+from .tokenizers.cnn_tokenizer import CNNTokenizer, CNNTokConfig
 
 
 def main() -> int:
@@ -75,6 +76,19 @@ def main() -> int:
         default="output_dataset/direction_training_dataset.jsonl"
     )
     parser.add_argument("--include_flanks", action="store_true")
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="default",
+        choices=["default", "cnn"],
+        help="Tokenizer to use for per-spacer encoding: 'default' (per-base tokens) or 'cnn' (per-spacer CNN embeddings).",
+    )
+    parser.add_argument("--cnn_output_dim", type=int, default=128, help="CNN tokenizer output embedding dim (default 128)")
+    parser.add_argument("--cnn_filters", type=int, default=64, help="Number of CNN filters per kernel (default 64)")
+    parser.add_argument("--cnn_kernels", type=str, default="3,5,7", help="Comma-separated kernel sizes for CNN (default '3,5,7')")
+    parser.add_argument("--cnn_pooling", type=str, default="max", choices=["max", "avg"], help="Pooling for CNN (default max)")
+    parser.add_argument("--cnn_activation", type=str, default="relu", choices=["relu", "gelu"], help="Activation for CNN (default relu)")
+    parser.add_argument("--exclude_repeats", action="store_true", help="Exclude repeat tokens from encoding; train on spacers only (ablation study).")
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -718,10 +732,17 @@ def main() -> int:
     if augmentation_started_at is not None:
         augmentation_elapsed = time.perf_counter() - augmentation_started_at
 
+    # Create CNN tokenizer if requested
+    cnn_tok = None
+    if args.tokenizer == "cnn":
+        kernels = [int(k.strip()) for k in args.cnn_kernels.split(",") if k.strip()]
+        cnn_cfg = CNNTokConfig(output_dim=args.cnn_output_dim, filters=args.cnn_filters, kernels=kernels, pooling=args.cnn_pooling, activation=args.cnn_activation)
+        cnn_tok = CNNTokenizer(cnn_cfg, vocab_size=len(vocab))
+
     # Create datasets and dataloaders
-    train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn)
-    val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab, augment_fn=augment_fn)
-    test_dataset = DirectionTorchDataset(base_dataset, test_indices, vocab) if test_indices else None
+    train_dataset = DirectionTorchDataset(base_dataset, train_indices, vocab, augment_fn=augment_fn, exclude_repeats=args.exclude_repeats, tokenizer=args.tokenizer, cnn_tokenizer=cnn_tok)
+    val_dataset = DirectionTorchDataset(base_dataset, val_indices, vocab, augment_fn=augment_fn, exclude_repeats=args.exclude_repeats, tokenizer=args.tokenizer, cnn_tokenizer=cnn_tok)
+    test_dataset = DirectionTorchDataset(base_dataset, test_indices, vocab, exclude_repeats=args.exclude_repeats, tokenizer=args.tokenizer, cnn_tokenizer=cnn_tok) if test_indices else None
 
     print(
         f"Split sizes: train={len(train_dataset)}, val={len(val_dataset)}, "
@@ -828,6 +849,19 @@ def main() -> int:
         pooling_strategy=args.pooling_strategy,
         activation=args.activation,
     ).to(device)
+    # If using CNN tokenizer, ensure model spacer_dim matches CNN output dim
+    if args.tokenizer == "cnn":
+        # rebuild model with spacer_dim matching cnn_output_dim
+        model = build_model(
+            vocab_size=len(vocab),
+            include_flanks=args.include_flanks,
+            max_spacers=max_spacers_in_dataset,
+            dropout=args.dropout,
+            positional_encoding=args.positional_encoding,
+            pooling_strategy=args.pooling_strategy,
+            activation=args.activation,
+            spacer_dim=args.cnn_output_dim,
+        ).to(device)
     print("Model architecture:")
     print(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1024,6 +1058,8 @@ def main() -> int:
             loss_fn=loss_fn,
             device=device,
             batch_size=args.batch_size,
+            tokenizer=args.tokenizer,
+            cnn_tokenizer=cnn_tok,
         )
         print("Per-cas_subtype test metrics:")
         print(

@@ -29,6 +29,11 @@ from .data import (
     split_dev_pool_by_mode,
     stratified_holdout_by_mode,
 )
+from .augmentation import (
+    make_subarray_augment_fn,
+    make_subarray_augment_fn_with_similarity_filter,
+    build_test_similarity_index,
+)
 from .training import (
     evaluate,
     train_one_epoch,
@@ -53,7 +58,8 @@ def _print(message: str) -> None:
 
 
 def _choose_num_heads(transformer_dim: int, trial: Any) -> int:
-    valid_heads = [head for head in (1, 2, 4, 8) if transformer_dim % head == 0]
+    #valid_heads = [head for head in (1, 2, 4, 8) if transformer_dim % head == 0]
+    valid_heads = [head for head in (8, 16) if transformer_dim % head == 0]
     if not valid_heads:
         return 1
     return trial.suggest_categorical("num_heads", valid_heads)
@@ -71,17 +77,25 @@ def _build_sampler(args: argparse.Namespace) -> Any:
 
 
 def _sample_config(trial: Any, vocab_size: int, max_spacers: int, include_flanks: bool) -> DirectionTransformerConfig:
-    positional_encoding = trial.suggest_categorical("positional_encoding", ["absolute", "alibi", "rope"])
-    pooling_strategy = trial.suggest_categorical("pooling_strategy", ["mean", "max", "attention", "learnable"])
-    token_dim = trial.suggest_categorical("token_dim", [32, 48, 64, 96, 128])
-    spacer_dim = trial.suggest_categorical("spacer_dim", [64, 96, 128, 160, 192, 256])
-    transformer_dim = trial.suggest_categorical("transformer_dim", [64, 96, 128, 160, 192, 256])
+    #positional_encoding = trial.suggest_categorical("positional_encoding", ["absolute", "alibi", "rope"])
+    positional_encoding = trial.suggest_categorical("positional_encoding", ["alibi", "rope"])
+    #pooling_strategy = trial.suggest_categorical("pooling_strategy", ["mean", "max", "attention", "learnable"])
+    pooling_strategy = trial.suggest_categorical("pooling_strategy", ["mean", "attention", "learnable"])
+    #token_dim = trial.suggest_categorical("token_dim", [32, 48, 64, 96, 128])
+    token_dim = trial.suggest_categorical("token_dim", [32, 48])
+    #spacer_dim = trial.suggest_categorical("spacer_dim", [64, 96, 128, 160, 192, 256])
+    spacer_dim = trial.suggest_categorical("spacer_dim", [192, 256, 512])
+    #transformer_dim = trial.suggest_categorical("transformer_dim", [64, 96, 128, 160, 192, 256])
+    transformer_dim = trial.suggest_categorical("transformer_dim", [192, 256, 512])
     num_heads = _choose_num_heads(transformer_dim, trial)
-    num_layers = trial.suggest_int("num_layers", 1, 6)
-    dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    #num_layers = trial.suggest_int("num_layers", 1, 6)
+    num_layers = trial.suggest_int("num_layers", 1, 3)
+    #dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    dropout = trial.suggest_float("dropout", 0.01, 0.10)
     feedforward_multiplier = trial.suggest_categorical("feedforward_multiplier", [2, 4, 6])
     feedforward_dim = transformer_dim * feedforward_multiplier
-    activation = trial.suggest_categorical("activation", ["gelu", "relu"])
+    #activation = trial.suggest_categorical("activation", ["gelu", "relu"])
+    activation = trial.suggest_categorical("activation", ["gelu"])
 
     return DirectionTransformerConfig(
         vocab_size=vocab_size,
@@ -154,9 +168,9 @@ def run_study(args: argparse.Namespace) -> int:
         f"Loaded dataset={jsonl_path} records={base_len} train={len(train_indices)} val={len(val_indices)} test={len(test_indices)} stratify_by={stratify_mode}"
     )
 
-    train_dataset = DirectionTorchDataset(dataset, train_indices, vocab)
-    val_dataset = DirectionTorchDataset(dataset, val_indices, vocab)
-    test_dataset = DirectionTorchDataset(dataset, test_indices, vocab) if test_indices else None
+    train_dataset = DirectionTorchDataset(dataset, train_indices, vocab, exclude_repeats=args.exclude_repeats)
+    val_dataset = DirectionTorchDataset(dataset, val_indices, vocab, exclude_repeats=args.exclude_repeats)
+    test_dataset = DirectionTorchDataset(dataset, test_indices, vocab, exclude_repeats=args.exclude_repeats) if test_indices else None
 
     train_loader = build_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = build_dataloader(val_dataset, batch_size=args.batch_size, shuffle=False)
@@ -189,15 +203,63 @@ def run_study(args: argparse.Namespace) -> int:
             pooling_strategy=config.pooling_strategy,
         ).to(device)
 
-        optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam", "sgd"])
+        #optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam", "sgd"])
+        optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adam"])
+        #lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
         lr = trial.suggest_float("lr", 1e-5, 5e-3, log=True)
-        weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 48, 64, 128])
+        #weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 7e-5, 2e-4, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [8, 16, 32, 64])
         if optimizer_name == "sgd":
             momentum = trial.suggest_float("momentum", 0.0, 0.99)
 
-        train_loader_trial = build_dataloader(DirectionTorchDataset(dataset, train_indices, vocab), batch_size=batch_size, shuffle=True)
-        val_loader_trial = build_dataloader(DirectionTorchDataset(dataset, val_indices, vocab), batch_size=batch_size, shuffle=False)
+        # Optionally sample augmentation settings and build augment_fn.
+        # If augmentation flags were provided on the CLI, use those values (override sampling).
+        augment_fn = None
+        if args.augment_subarrays:
+            augment_subarrays = True
+            aug_mode = args.augment_subarrays_mode
+            aug_prob = float(args.augment_subarrays_prob)
+            aug_max_per_array = int(args.augment_subarrays_max_per_array)
+            use_similarity = bool(args.augment_use_similarity)
+            if use_similarity:
+                test_token_sets, inverted_index = build_test_similarity_index(dataset.records, test_indices)
+                aug_similarity = args.aug_similarity
+                aug_min_distance = float(args.aug_similarity_min_distance)
+                augment_fn = make_subarray_augment_fn_with_similarity_filter(
+                    prob=aug_prob,
+                    seed=trial_seed,
+                    test_token_sets=test_token_sets,
+                    inverted_index=inverted_index,
+                    similarity_metric=aug_similarity,
+                    min_distance=aug_min_distance,
+                )
+            else:
+                augment_fn = make_subarray_augment_fn(prob=aug_prob, seed=trial_seed)
+        else:
+            augment_subarrays = trial.suggest_categorical("augment_subarrays", [False, True])
+            if augment_subarrays:
+                aug_mode = trial.suggest_categorical("augment_subarrays_mode", ["random", "enumerate"])
+                aug_prob = trial.suggest_float("augment_subarrays_prob", 0.1, 1.0)
+                aug_max_per_array = trial.suggest_categorical("augment_subarrays_max_per_array", [0, 2, 5, 10, 20])
+                use_similarity = trial.suggest_categorical("augment_use_similarity", [False, True])
+                if use_similarity:
+                    test_token_sets, inverted_index = build_test_similarity_index(dataset.records, test_indices)
+                    aug_similarity = trial.suggest_categorical("aug_similarity", ["jaccard", "overlap"])
+                    aug_min_distance = trial.suggest_float("aug_similarity_min_distance", 0.0, 1.0)
+                    augment_fn = make_subarray_augment_fn_with_similarity_filter(
+                        prob=aug_prob,
+                        seed=trial_seed,
+                        test_token_sets=test_token_sets,
+                        inverted_index=inverted_index,
+                        similarity_metric=aug_similarity,
+                        min_distance=aug_min_distance,
+                    )
+                else:
+                    augment_fn = make_subarray_augment_fn(prob=aug_prob, seed=trial_seed)
+
+        train_loader_trial = build_dataloader(DirectionTorchDataset(dataset, train_indices, vocab, augment_fn=augment_fn, exclude_repeats=args.exclude_repeats), batch_size=batch_size, shuffle=True)
+        val_loader_trial = build_dataloader(DirectionTorchDataset(dataset, val_indices, vocab, augment_fn=augment_fn, exclude_repeats=args.exclude_repeats), batch_size=batch_size, shuffle=False)
 
         if optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -358,7 +420,7 @@ def run_study(args: argparse.Namespace) -> int:
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=best_params["lr"], weight_decay=best_params["weight_decay"])
         retrain_train_indices = train_indices + val_indices
-        retrain_train_loader = build_dataloader(DirectionTorchDataset(dataset, retrain_train_indices, vocab), batch_size=best_params["batch_size"], shuffle=True)
+        retrain_train_loader = build_dataloader(DirectionTorchDataset(dataset, retrain_train_indices, vocab, exclude_repeats=args.exclude_repeats), batch_size=best_params["batch_size"], shuffle=True)
         retrain_test_loader = build_dataloader(test_dataset, batch_size=best_params["batch_size"], shuffle=False) if test_dataset else None
         for _ in range(args.final_epochs):
             train_one_epoch(model, retrain_train_loader, optimizer, loss_fn, device)
@@ -422,6 +484,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_fraction", type=float, default=0.64, help="Training fraction (only used if test_size=0; legacy behavior)")
     parser.add_argument("--val_fraction", type=float, default=0.16, help="Validation fraction (only used if test_size=0; legacy behavior)")
     parser.add_argument("--include_flanks", action="store_true", help="Include flank tokens in the model/search")
+    parser.add_argument("--exclude_repeats", action="store_true", help="Exclude repeat tokens from encoding; train on spacers only (ablation study).")
     parser.add_argument(
         "--positional_encoding",
         type=str,
@@ -447,6 +510,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pruner_warmup_steps", type=int, default=2, help="Median pruner warmup steps")
     parser.add_argument("--final_retrain", action="store_true", help="Retrain the best config after the search")
     parser.add_argument("--final_epochs", type=int, default=20, help="Epochs for the optional final retrain")
+    # Optional: force augmentation settings for all trials (overrides Optuna sampling)
+    parser.add_argument("--augment_subarrays", action="store_true", help="Force subarray augmentation for all trials (overrides HPO sampling)")
+    parser.add_argument("--augment_subarrays_mode", type=str, default="random", choices=["random", "enumerate"], help="Augmentation mode when augmentation is forced")
+    parser.add_argument("--augment_subarrays_prob", type=float, default=0.5, help="Probability used by the augmenter when augmentation is forced")
+    parser.add_argument("--augment_subarrays_max_per_array", type=int, default=2, help="Max augmentations per array when augmentation is forced")
+    parser.add_argument("--augment_use_similarity", action="store_true", help="When forcing augmentation, use similarity-based filtering against the test set")
+    parser.add_argument("--aug_similarity", type=str, default="jaccard", choices=["jaccard", "overlap"], help="Similarity metric to use when similarity filtering is enabled")
+    parser.add_argument("--aug_similarity_min_distance", type=float, default=0.5, help="Minimum distance to test set required to accept augmented candidate (0.0-1.0)")
     return parser
 
 

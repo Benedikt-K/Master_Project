@@ -35,6 +35,9 @@ class DirectionTorchDataset(Dataset if Dataset is not object else object):
         indices: list[int],
         vocab: dict[str, int],
         augment_fn: Callable | None = None,
+        exclude_repeats: bool = False,
+        tokenizer: str = "default",
+        cnn_tokenizer: object | None = None,
     ):
         """Initialize the PyTorch dataset.
         
@@ -44,12 +47,16 @@ class DirectionTorchDataset(Dataset if Dataset is not object else object):
             vocab: Token vocabulary for encoding sequences.
             augment_fn: Optional function that takes DirectionExample and returns
                         augmented DirectionExample (for on-the-fly augmentation).
+            exclude_repeats: If True, skip encoding repeat tokens (spacer-only mode).
         """
         _require_torch()
         self.base_dataset = base_dataset
         self.indices = indices
         self.vocab = vocab
         self.augment_fn = augment_fn
+        self.exclude_repeats = exclude_repeats
+        self.tokenizer = tokenizer
+        self.cnn_tokenizer = cnn_tokenizer
 
     def __len__(self) -> int:
         """Return number of examples in this split."""
@@ -75,6 +82,9 @@ class DirectionTorchDataset(Dataset if Dataset is not object else object):
             example,
             vocab=self.vocab,
             include_flanks=self.base_dataset.include_flanks,
+            exclude_repeats=self.exclude_repeats,
+            tokenizer=self.tokenizer,
+            cnn_tokenizer=self.cnn_tokenizer,
         )
 
 
@@ -92,10 +102,24 @@ def batch_to_tensors(batch: dict[str, list]) -> dict[str, Any]:
         dict[str, torch.Tensor]: Same keys with tensor values.
     """
     _require_torch()
+    # Detect whether spacer_tokens are integer token IDs or float embeddings
+    first_spacer = None
+    for row in batch["spacer_tokens"]:
+        if row:
+            first_spacer = row[0]
+            break
+
+    if first_spacer is not None and isinstance(first_spacer[0], int):
+        spacer_tensor = torch.tensor(batch["spacer_tokens"], dtype=torch.long)
+        repeat_tensor = torch.tensor(batch["repeat_tokens"], dtype=torch.long)
+    else:
+        spacer_tensor = torch.tensor(batch["spacer_tokens"], dtype=torch.float32)
+        repeat_tensor = torch.tensor(batch["repeat_tokens"], dtype=torch.float32)
+
     return {
-        "spacer_tokens": torch.tensor(batch["spacer_tokens"], dtype=torch.long),
+        "spacer_tokens": spacer_tensor,
         "spacer_mask": torch.tensor(batch["spacer_mask"], dtype=torch.bool),
-        "repeat_tokens": torch.tensor(batch["repeat_tokens"], dtype=torch.long),
+        "repeat_tokens": repeat_tensor,
         "label": torch.tensor(batch["label"], dtype=torch.float32),
     }
 

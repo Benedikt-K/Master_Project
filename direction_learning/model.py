@@ -357,11 +357,20 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         spacer_mask = batch["spacer_mask"]
         batch_size, max_spacers, _ = spacer_tokens.shape
 
-        flat_tokens = spacer_tokens.view(batch_size * max_spacers, -1)
-        flat_mask = flat_tokens.ne(0)
-        spacer_embeddings = self.sequence_encoder(flat_tokens, flat_mask)
-        spacer_embeddings = self.spacer_projection(spacer_embeddings)
-        spacer_embeddings = spacer_embeddings.view(batch_size, max_spacers, -1)
+        # If spacer_tokens are float tensors (precomputed embeddings from a CNN tokenizer),
+        # bypass the token embedding path and treat them as per-spacer embeddings.
+        if spacer_tokens.is_floating_point():
+            # spacer_tokens shape: (batch, max_spacers, embed_dim)
+            flat_embeddings = spacer_tokens.view(batch_size * max_spacers, -1)
+            spacer_embeddings = self.spacer_projection(flat_embeddings)
+            spacer_embeddings = spacer_embeddings.view(batch_size, max_spacers, -1)
+        else:
+            # spacer_tokens are integer token ids: flatten spacers and encode with SequenceEncoderBase
+            flat_tokens = spacer_tokens.view(batch_size * max_spacers, -1)
+            flat_mask = flat_tokens.ne(0)
+            spacer_embeddings = self.sequence_encoder(flat_tokens, flat_mask)
+            spacer_embeddings = self.spacer_projection(spacer_embeddings)
+            spacer_embeddings = spacer_embeddings.view(batch_size, max_spacers, -1)
 
         if self.include_flanks:
             left_flank_tokens = batch.get("left_flank_tokens")

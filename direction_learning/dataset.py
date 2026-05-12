@@ -162,6 +162,9 @@ def encode_example(
     example: DirectionExample,
     vocab: dict[str, int] | None = None,
     include_flanks: bool = False,
+    exclude_repeats: bool = False,
+    tokenizer: str = "default",
+    cnn_tokenizer: object | None = None,
 ) -> dict[str, Any]:
     """Encode a DirectionExample to token sequences and metadata.
     
@@ -172,6 +175,7 @@ def encode_example(
         example: DirectionExample to encode.
         vocab: Token vocabulary (defaults to DNA_VOCAB if None).
         include_flanks: If True, include left/right flank tokens.
+        exclude_repeats: If True, skip encoding repeats (spacer-only mode for ablation).
         
     Returns:
         dict[str, Any]: Dictionary with spacer_tokens, repeat_tokens,
@@ -179,8 +183,14 @@ def encode_example(
     """
     vocab = dict(DNA_VOCAB) if vocab is None else vocab
 
-    spacer_tokens = [encode_dna_sequence(spacer, vocab) for spacer in example.spacers]
-    repeat_tokens = [encode_dna_sequence(repeat, vocab) for repeat in example.repeats]
+    # Default: per-base integer tokenization for spacers/repeats
+    if tokenizer == "cnn" and cnn_tokenizer is not None:
+        # CNN tokenizer returns per-sequence dense embeddings (list[list[float]])
+        spacer_tokens = cnn_tokenizer.encode_sequences(example.spacers, vocab)
+        repeat_tokens = [] if exclude_repeats else cnn_tokenizer.encode_sequences(example.repeats, vocab)
+    else:
+        spacer_tokens = [encode_dna_sequence(spacer, vocab) for spacer in example.spacers]
+        repeat_tokens = [] if exclude_repeats else [encode_dna_sequence(repeat, vocab) for repeat in example.repeats]
 
     payload: dict[str, Any] = {
         "array_name": example.array_name,
@@ -223,8 +233,35 @@ def collate_encoded_examples(batch: list[dict[str, Any]]) -> dict[str, Any]:
             spacer_mask (binary), repeat_tokens, labels, and metadata lists.
     """
     max_spacers = max((len(item["spacer_tokens"]) for item in batch), default=0)
-    max_spacer_length = max((len(seq) for item in batch for seq in item["spacer_tokens"]), default=0)
-    max_repeat_length = max((len(seq) for item in batch for seq in item["repeat_tokens"]), default=0)
+
+    # Detect whether spacers are integer token sequences or dense embeddings
+    first_spacer_sample = None
+    for item in batch:
+        if item["spacer_tokens"]:
+            first_spacer_sample = item["spacer_tokens"][0]
+            break
+
+    is_embedding = False
+    embedding_dim = 0
+    if first_spacer_sample is not None and not isinstance(first_spacer_sample[0], int):
+        is_embedding = True
+        embedding_dim = len(first_spacer_sample)
+
+    if not is_embedding:
+        max_spacer_length = max((len(seq) for item in batch for seq in item["spacer_tokens"]), default=0)
+        max_repeat_length = max((len(seq) for item in batch for seq in item["repeat_tokens"]), default=0)
+    else:
+        max_spacer_length = embedding_dim
+        # repeats may be embeddings or token sequences; detect similarly
+        first_repeat_sample = None
+        for item in batch:
+            if item["repeat_tokens"]:
+                first_repeat_sample = item["repeat_tokens"][0]
+                break
+        if first_repeat_sample is not None and not isinstance(first_repeat_sample[0], int):
+            max_repeat_length = len(first_repeat_sample)
+        else:
+            max_repeat_length = 0
     max_flank_length = max(
         (
             max(len(item["left_flank_tokens"]), len(item["right_flank_tokens"]))
@@ -236,16 +273,28 @@ def collate_encoded_examples(batch: list[dict[str, Any]]) -> dict[str, Any]:
     def pad_sequence(sequence: list[int], target_length: int) -> list[int]:
         return sequence + [DNA_VOCAB["PAD"]] * (target_length - len(sequence))
 
-    spacer_tensor = [
-        [pad_sequence(spacer, max_spacer_length) for spacer in item["spacer_tokens"]] +
-        [[DNA_VOCAB["PAD"]] * max_spacer_length for _ in range(max_spacers - len(item["spacer_tokens"]))]
-        for item in batch
-    ]
+    if not is_embedding:
+        spacer_tensor = [
+            [pad_sequence(spacer, max_spacer_length) for spacer in item["spacer_tokens"]] +
+            [[DNA_VOCAB["PAD"]] * max_spacer_length for _ in range(max_spacers - len(item["spacer_tokens"]))]
+            for item in batch
+        ]
 
-    spacer_mask = [
-        [1] * len(item["spacer_tokens"]) + [0] * (max_spacers - len(item["spacer_tokens"]))
-        for item in batch
-    ]
+        spacer_mask = [
+            [1] * len(item["spacer_tokens"]) + [0] * (max_spacers - len(item["spacer_tokens"]))
+            for item in batch
+        ]
+    else:
+        spacer_tensor = [
+            [spacer for spacer in item["spacer_tokens"]] +
+            [[0.0] * max_spacer_length for _ in range(max_spacers - len(item["spacer_tokens"]))]
+            for item in batch
+        ]
+
+        spacer_mask = [
+            [1] * len(item["spacer_tokens"]) + [0] * (max_spacers - len(item["spacer_tokens"]))
+            for item in batch
+        ]
 
     # Ensure repeat_tensor is padded to the same outer dimension as spacers
     repeat_tensor = []
@@ -254,8 +303,13 @@ def collate_encoded_examples(batch: list[dict[str, Any]]) -> dict[str, Any]:
         # Truncate repeats if there are more repeats than spacers to keep shapes consistent
         if len(repeats) > max_spacers:
             repeats = repeats[:max_spacers]
-        padded_repeats = [pad_sequence(repeat, max_repeat_length) for repeat in repeats]
-        padded_repeats += [[DNA_VOCAB["PAD"]] * max_repeat_length for _ in range(max_spacers - len(padded_repeats))]
+        if repeats and not isinstance(repeats[0][0], int):
+            # repeats are embeddings
+            padded_repeats = [rep for rep in repeats]
+            padded_repeats += [[0.0] * max_repeat_length for _ in range(max_spacers - len(padded_repeats))]
+        else:
+            padded_repeats = [pad_sequence(repeat, max_repeat_length) for repeat in repeats]
+            padded_repeats += [[DNA_VOCAB["PAD"]] * max_repeat_length for _ in range(max_spacers - len(padded_repeats))]
         repeat_tensor.append(padded_repeats)
 
     labels = [item["label"] for item in batch]

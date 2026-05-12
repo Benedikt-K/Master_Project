@@ -164,6 +164,8 @@ def evaluate_per_subtype(
     loss_fn: Any,
     device: Any,
     batch_size: int,
+    tokenizer: str = "default",
+    cnn_tokenizer: Any = None,
 ) -> dict[str, dict[str, float]]:
     """Evaluate test performance separately for each cas_subtype.
 
@@ -175,6 +177,8 @@ def evaluate_per_subtype(
         loss_fn: Loss function (unused for subtype metrics but kept for API parity).
         device: torch.device to run on.
         batch_size: Batch size for forward passes.
+        tokenizer: Tokenizer type ("default" or "cnn") to match training.
+        cnn_tokenizer: CNN tokenizer instance (required if tokenizer="cnn").
 
     Returns:
         Mapping cas_subtype -> metrics dict with keys:
@@ -194,7 +198,13 @@ def evaluate_per_subtype(
         for start in range(0, len(indices), batch_size):
             batch_indices = indices[start : start + batch_size]
             encoded_batch = [
-                encode_example(base_dataset[i], vocab=vocab, include_flanks=base_dataset.include_flanks)
+                encode_example(
+                    base_dataset[i],
+                    vocab=vocab,
+                    include_flanks=base_dataset.include_flanks,
+                    tokenizer=tokenizer,
+                    cnn_tokenizer=cnn_tokenizer,
+                )
                 for i in batch_indices
             ]
             collated = collate_encoded_examples(encoded_batch)
