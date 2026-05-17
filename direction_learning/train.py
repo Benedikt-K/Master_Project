@@ -224,7 +224,7 @@ def main() -> int:
     parser.add_argument(
         "--augment_subarrays_max_per_array",
         type=int,
-        default=256,
+        default=2,
         help="Maximum number of augmented subarrays to add per original array in enumerate mode (default 256; <=0 means unlimited).",
     )
     parser.add_argument(
@@ -292,6 +292,7 @@ def main() -> int:
         action="store_true",
         help="If set and a test set is present, evaluate the model on the test set once per epoch and include test loss as a third line in the training curves plot.",
     )
+    parser.add_argument("--enable_cls_token", action="store_true", help="Enable learned CLS token prepended to spacer sequence (default: off)")
     args = parser.parse_args()
 
     require_torch()
@@ -848,6 +849,7 @@ def main() -> int:
         positional_encoding=args.positional_encoding,
         pooling_strategy=args.pooling_strategy,
         activation=args.activation,
+        use_cls_token=bool(getattr(args, "enable_cls_token", False)),
     ).to(device)
     # If using CNN tokenizer, ensure model spacer_dim matches CNN output dim
     if args.tokenizer == "cnn":
@@ -861,6 +863,7 @@ def main() -> int:
             pooling_strategy=args.pooling_strategy,
             activation=args.activation,
             spacer_dim=args.cnn_output_dim,
+            use_cls_token=bool(getattr(args, "enable_cls_token", False)),
         ).to(device)
     print("Model architecture:")
     print(model)

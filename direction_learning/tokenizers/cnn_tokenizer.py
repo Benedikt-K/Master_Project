@@ -18,12 +18,12 @@ from ..tokenization import DNA_VOCAB
 
 @dataclass
 class CNNTokConfig:
-    output_dim: int = 128
+    output_dim: int = 256
     embed_dim: int = 8
-    filters: int = 64
-    kernels: list[int] = (3, 5, 7)
+    filters: int = 128
+    kernels: list[int] = (3, 7)
     pooling: str = "max"
-    activation: str = "relu"
+    activation: str = "gelu"
 
 
 class CNNTokenizer(nn.Module if nn is not None else object):

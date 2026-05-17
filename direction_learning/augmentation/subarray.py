@@ -295,6 +295,10 @@ def _materialize_subarray_augmentations(
 
     _print_ts(f"Augmentation: {split_name} starting materialization of {len(source_indices)} source examples...")
     source_list = list(source_indices)
+
+    if max_per_array <= 0:
+        _print_ts(f"Augmentation: {split_name} disabled because max_per_array={max_per_array}")
+        return new_indices, stats
     
     # When balancing, distribute augmentations evenly across all source arrays
     effective_max_per_array = max_per_array

@@ -24,16 +24,17 @@ class DirectionTransformerConfig:
     vocab_size: int
     token_dim: int = 64
     spacer_dim: int = 128
-    transformer_dim: int = 128
-    num_heads: int = 4
-    num_layers: int = 4
-    feedforward_dim: int | None = None
+    transformer_dim: int = 256
+    num_heads: int = 8
+    num_layers: int = 2
+    feedforward_dim: int = 4
     dropout: float = 0.1
     activation: str = "gelu"
     max_spacers: int = 64
     include_flanks: bool = False
     positional_encoding: str = "absolute"
     pooling_strategy: str = "mean"
+    use_cls_token: bool = False
 
 
 def _require_torch() -> None:
@@ -304,7 +305,12 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
         self.spacer_projection = nn.Linear(config.spacer_dim, config.transformer_dim)
         feedforward_dim = config.feedforward_dim if config.feedforward_dim is not None else config.transformer_dim * 4
         self.use_absolute_positional_encoding = self.positional_encoding == "absolute"
-        self.spacer_position_embedding = nn.Embedding(config.max_spacers, config.transformer_dim) if self.use_absolute_positional_encoding else None
+        # If CLS token is enabled, allow one extra position for it when using absolute positional embeddings
+        pos_count = config.max_spacers + (1 if config.use_cls_token else 0)
+        self.spacer_position_embedding = nn.Embedding(pos_count, config.transformer_dim) if self.use_absolute_positional_encoding else None
+        self.use_cls_token = bool(config.use_cls_token)
+        if self.use_cls_token:
+            self.cls_token = nn.Parameter(torch.randn(1, 1, config.transformer_dim))
         if self.use_absolute_positional_encoding:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=config.transformer_dim,
@@ -388,9 +394,21 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
             flank_context = self.flank_projection(flank_context).unsqueeze(1)
             spacer_embeddings = spacer_embeddings + flank_context
 
-        if self.use_absolute_positional_encoding:
-            positions = torch.arange(max_spacers, device=spacer_embeddings.device).unsqueeze(0).expand(batch_size, -1)
-            spacer_embeddings = spacer_embeddings + self.spacer_position_embedding(positions)
+        if self.use_cls_token:
+            # Prepend CLS token
+            cls = self.cls_token.expand(batch_size, -1, -1)
+            spacer_embeddings = torch.cat([cls, spacer_embeddings], dim=1)
+            # update max_spacers to include CLS
+            seq_len = spacer_embeddings.shape[1]
+            if self.use_absolute_positional_encoding:
+                positions = torch.arange(seq_len, device=spacer_embeddings.device).unsqueeze(0).expand(batch_size, -1)
+                spacer_embeddings = spacer_embeddings + self.spacer_position_embedding(positions)
+            # prepend mask for CLS (1)
+            spacer_mask = torch.cat([torch.ones((batch_size, 1), dtype=spacer_mask.dtype, device=spacer_mask.device), spacer_mask], dim=1)
+        else:
+            if self.use_absolute_positional_encoding:
+                positions = torch.arange(max_spacers, device=spacer_embeddings.device).unsqueeze(0).expand(batch_size, -1)
+                spacer_embeddings = spacer_embeddings + self.spacer_position_embedding(positions)
         spacer_embeddings = self.layer_norm(spacer_embeddings)
 
         key_padding_mask = spacer_mask.eq(0)
@@ -401,8 +419,12 @@ class SpacerDirectionTransformer(nn.Module if nn is not None else object):
             for layer in self.relative_transformer_layers:
                 transformed = layer(transformed, key_padding_mask=key_padding_mask)
 
-        mask = spacer_mask.unsqueeze(-1).float()
-        pooled = (transformed * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        if self.use_cls_token:
+            # CLS token is at index 0
+            pooled = transformed[:, 0, :]
+        else:
+            mask = spacer_mask.unsqueeze(-1).float()
+            pooled = (transformed * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         pooled = self.dropout(pooled)
         logits = self.classifier(pooled).squeeze(-1)
         return logits
@@ -422,6 +444,7 @@ def build_model(
     activation: str = "gelu",
     positional_encoding: str = "absolute",
     pooling_strategy: str = "mean",
+    use_cls_token: bool = False,
 ) -> SpacerDirectionTransformer:
     """Instantiate a SpacerDirectionTransformer with default configuration.
     
@@ -468,5 +491,6 @@ def build_model(
         include_flanks=include_flanks,
         positional_encoding=positional_encoding,
         pooling_strategy=pooling_strategy,
+        use_cls_token=bool(use_cls_token),
     )
     return SpacerDirectionTransformer(config)
