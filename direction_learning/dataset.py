@@ -31,6 +31,9 @@ class DirectionExample:
     left_flank: str = ""
     right_flank: str = ""
     source_json: str = ""
+    source_spacer_count: int = 0
+    deleted_spacers: int = 0
+    spacer_deletion_fraction: float = 0.0
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -123,6 +126,9 @@ class DirectionJsonlDataset:
                     left_flank=str(raw.get("left_flank", "")),
                     right_flank=str(raw.get("right_flank", "")),
                     source_json=str(raw.get("source_json", "")),
+                    source_spacer_count=int(raw.get("source_spacer_count", 0)),
+                    deleted_spacers=int(raw.get("deleted_spacers", 0)),
+                    spacer_deletion_fraction=float(raw.get("spacer_deletion_fraction", 0.0)),
                 )
             )
         return records

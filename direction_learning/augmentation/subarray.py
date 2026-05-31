@@ -361,6 +361,9 @@ def _materialize_subarray_augmentations(
         for keep in keep_sets:
             new_spacers = [ex.spacers[i] for i in keep]
             new_repeats = [ex.repeats[i] for i in keep]
+            original_spacer_count = len(ex.spacers)
+            deleted_spacers = original_spacer_count - len(new_spacers)
+            deletion_fraction = deleted_spacers / original_spacer_count if original_spacer_count > 0 else 0.0
             aug_sig = (tuple(new_spacers), tuple(new_repeats))
             if aug_sig in seen_signatures:
                 stats["blocked_overlap"] += 1
@@ -384,6 +387,9 @@ def _materialize_subarray_augmentations(
                 left_flank=ex.left_flank,
                 right_flank=ex.right_flank,
                 source_json=ex.source_json,
+                source_spacer_count=original_spacer_count,
+                deleted_spacers=deleted_spacers,
+                spacer_deletion_fraction=deletion_fraction,
             )
             if not _candidate_passes_similarity_filter(
                 candidate_example,

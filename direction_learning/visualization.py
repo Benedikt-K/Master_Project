@@ -5,6 +5,7 @@ can import and reuse the functions without embedding matplotlib code.
 """
 from __future__ import annotations
 
+from itertools import combinations
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -32,6 +33,71 @@ def _array_lengths(records: Sequence[object], indices: Sequence[int]) -> tuple[l
         bp_lengths.append(sum(len(sequence) for sequence in spacers) + sum(len(sequence) for sequence in repeats))
 
     return spacer_counts, bp_lengths
+
+
+def _spacer_signature(example: object) -> set[str]:
+    spacers = getattr(example, "spacers", []) or []
+    return set(spacers)
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
+def _pairwise_spacer_similarities(records: Sequence[object], indices: Sequence[int]) -> list[float]:
+    signatures = [(_spacer_signature(records[index])) for index in indices]
+    similarities: list[float] = []
+
+    for left, right in combinations(signatures, 2):
+        similarities.append(_jaccard_similarity(left, right))
+
+    return similarities
+
+
+def _augmented_deletion_fractions(records: Sequence[object], indices: Sequence[int]) -> list[float]:
+    fractions: list[float] = []
+    for index in indices:
+        example = records[index]
+        source_count = int(getattr(example, "source_spacer_count", 0) or 0)
+        deleted = int(getattr(example, "deleted_spacers", 0) or 0)
+        fraction = getattr(example, "spacer_deletion_fraction", None)
+        if fraction is not None and float(fraction) > 0:
+            fractions.append(float(fraction))
+        elif source_count > 0:
+            fractions.append(deleted / source_count)
+    return fractions
+
+
+def _subtype_counts(records: Sequence[object], indices: Sequence[int]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for index in indices:
+        example = records[index]
+        subtype = (getattr(example, "cas_subtype", "") or "Unknown").strip() or "Unknown"
+        counts[subtype] = counts.get(subtype, 0) + 1
+    return counts
+
+
+def _filter_subtypes_by_min_arrays(
+    subtype_to_indices: dict[str, list[int]],
+    min_arrays: int,
+    reference_counts: dict[str, int] | None = None,
+) -> tuple[dict[str, list[int]], list[str]]:
+    if min_arrays <= 1:
+        return subtype_to_indices, []
+
+    if reference_counts is None:
+        reference_counts = {subtype: len(indices) for subtype, indices in subtype_to_indices.items()}
+
+    filtered = {
+        subtype: indices
+        for subtype, indices in subtype_to_indices.items()
+        if reference_counts.get(subtype, 0) >= min_arrays
+    }
+    skipped = [subtype for subtype in subtype_to_indices.keys() if reference_counts.get(subtype, 0) < min_arrays]
+    return filtered, skipped
 
 
 def _format_stats(values: Sequence[int]) -> str:
@@ -115,6 +181,8 @@ def plot_subtype_length_statistics(
     indices: Sequence[int],
     title: str,
     output_path: Path | str,
+    min_arrays: int = 0,
+    reference_indices: Sequence[int] | None = None,
 ) -> None:
     """Plot per-subtype spacer-count and bp-length summaries for original samples.
 
@@ -136,6 +204,13 @@ def plot_subtype_length_statistics(
         repeats = getattr(example, "repeats", []) or []
         grouped_spacer_counts.setdefault(subtype, []).append(len(spacers))
         grouped_bp_lengths.setdefault(subtype, []).append(sum(len(sequence) for sequence in spacers) + sum(len(sequence) for sequence in repeats))
+
+    reference_counts = _subtype_counts(records, reference_indices) if reference_indices is not None else None
+    grouped_spacer_counts, skipped = _filter_subtypes_by_min_arrays(grouped_spacer_counts, min_arrays, reference_counts)
+    grouped_bp_lengths = {subtype: grouped_bp_lengths[subtype] for subtype in grouped_spacer_counts.keys()}
+
+    if skipped:
+        print(f"Subtype length statistics: skipped subtypes below min_arrays={min_arrays}: {skipped}")
 
     subtype_order = sorted(grouped_spacer_counts.keys(), key=lambda key: (-len(grouped_spacer_counts[key]), key))
     labels = [f"{subtype}\nn={len(grouped_spacer_counts[subtype])}" for subtype in subtype_order]
@@ -191,6 +266,257 @@ def plot_subtype_length_statistics(
     subtype_counts = Counter((getattr(records[index], "cas_subtype", "") or "Unknown").strip() or "Unknown" for index in indices)
     print(f"Subtype length statistics saved to {output_path}")
     print(f"  subtype_counts={dict(sorted(subtype_counts.items(), key=lambda kv: kv[0]))}")
+    plt.close(fig)
+
+
+def plot_spacer_similarity_statistics(
+    records: Sequence[object],
+    indices: Sequence[int],
+    title: str,
+    output_path: Path | str,
+    min_arrays: int = 0,
+    reference_indices: Sequence[int] | None = None,
+) -> None:
+    """Plot average spacer similarity overall and per subtype for original samples.
+
+    Spacer similarity is computed as the Jaccard similarity between the sets of
+    spacer sequences in each pair of arrays. The figure also includes an intra-
+    subtype distribution panel.
+    """
+    plt = _ensure_matplotlib()
+    if plt is None:
+        print(f"matplotlib not available; skipping spacer similarity visualization for {title}.")
+        return
+
+    subtype_to_indices: dict[str, list[int]] = {}
+    for index in indices:
+        example = records[index]
+        subtype = (getattr(example, "cas_subtype", "") or "Unknown").strip() or "Unknown"
+        subtype_to_indices.setdefault(subtype, []).append(index)
+
+    reference_counts = _subtype_counts(records, reference_indices) if reference_indices is not None else None
+    subtype_to_indices, skipped = _filter_subtypes_by_min_arrays(subtype_to_indices, min_arrays, reference_counts)
+    if skipped:
+        print(f"Spacer similarity statistics: skipped subtypes below min_arrays={min_arrays}: {skipped}")
+
+    subtype_order = sorted(subtype_to_indices.keys(), key=lambda key: (-len(subtype_to_indices[key]), key))
+    overall_similarities = _pairwise_spacer_similarities(records, indices)
+    overall_mean = sum(overall_similarities) / len(overall_similarities) if overall_similarities else 0.0
+
+    subtype_means: list[float] = []
+    subtype_pair_counts: list[int] = []
+    subtype_similarity_values: list[list[float]] = []
+    for subtype in subtype_order:
+        subtype_sims = _pairwise_spacer_similarities(records, subtype_to_indices[subtype])
+        subtype_similarity_values.append(subtype_sims)
+        subtype_means.append(sum(subtype_sims) / len(subtype_sims) if subtype_sims else 0.0)
+        subtype_pair_counts.append(len(subtype_sims))
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(16, 1.3 * len(subtype_order) + 8), 6))
+
+    # Panel 1: average similarity by subtype with overall reference line.
+    ax = axes[0]
+    if subtype_order:
+        x_positions = list(range(len(subtype_order)))
+        bars = ax.bar(x_positions, subtype_means, color="#60a5fa", alpha=0.85, edgecolor="white")
+        ax.axhline(overall_mean, color="#dc2626", linestyle="--", linewidth=2, label=f"overall mean={overall_mean:.3f}")
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(
+            [f"{subtype}\nn={len(subtype_to_indices[subtype])}" for subtype in subtype_order],
+            rotation=30,
+            ha="right",
+        )
+        ax.set_ylim(0, max(0.05, max([overall_mean] + subtype_means) * 1.25))
+        ax.set_ylabel("Mean pairwise Jaccard similarity")
+        ax.set_title("Average spacer similarity by subtype")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(fontsize=9)
+        for bar, subtype, pair_count in zip(bars, subtype_order, subtype_pair_counts):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(0.005, overall_mean * 0.03),
+                f"pairs={pair_count}\navg={bar.get_height():.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
+            )
+    else:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+
+    # Panel 2: intra-subtype pairwise distribution.
+    ax = axes[1]
+    box_values = [values for values in subtype_similarity_values if values]
+    box_labels = [f"{subtype}\npairs={len(values)}" for subtype, values in zip(subtype_order, subtype_similarity_values) if values]
+    if box_values:
+        box = ax.boxplot(box_values, labels=box_labels, showmeans=True, patch_artist=True)
+        for patch in box["boxes"]:
+            patch.set_facecolor("#34d399")
+            patch.set_alpha(0.75)
+        for median in box["medians"]:
+            median.set_color("#111827")
+            median.set_linewidth(2)
+        for mean in box["means"]:
+            mean.set_marker("o")
+            mean.set_markerfacecolor("white")
+            mean.set_markeredgecolor("#111827")
+            mean.set_markersize(5)
+
+        ax.set_title("Intra-subtype spacer similarity distribution")
+        ax.set_ylabel("Pairwise Jaccard similarity")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.tick_params(axis="x", labelrotation=30)
+        ax.text(
+            0.98,
+            0.97,
+            f"overall_pairs={len(overall_similarities)}\noverall_mean={overall_mean:.3f}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=10,
+            family="monospace",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+    else:
+        ax.text(0.5, 0.5, "Not enough samples per subtype for pairwise similarity", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+
+    fig.suptitle(title, fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    output_path = Path(output_path)
+    fig.savefig(str(output_path), dpi=100, bbox_inches="tight")
+    print(f"Spacer similarity statistics saved to {output_path}")
+    print(f"  overall_pairwise_mean={overall_mean:.4f} overall_pairs={len(overall_similarities)}")
+    for subtype, values in zip(subtype_order, subtype_similarity_values):
+        mean = sum(values) / len(values) if values else 0.0
+        print(
+            f"  {subtype}: n={len(subtype_to_indices[subtype])} pairwise_pairs={len(values)} pairwise_mean={mean:.4f}"
+        )
+    plt.close(fig)
+
+
+def plot_augmented_spacer_deletion_statistics(
+    records: Sequence[object],
+    indices: Sequence[int],
+    title: str,
+    output_path: Path | str,
+    min_arrays: int = 0,
+    reference_indices: Sequence[int] | None = None,
+) -> None:
+    """Plot spacer deletion fractions for augmented samples overall and by subtype.
+
+    Deletion fraction is defined as deleted_spacers / original_spacer_count for
+    each augmented sample.
+    """
+    plt = _ensure_matplotlib()
+    if plt is None:
+        print(f"matplotlib not available; skipping deletion statistics visualization for {title}.")
+        return
+
+    subtype_to_indices: dict[str, list[int]] = {}
+    for index in indices:
+        example = records[index]
+        subtype = (getattr(example, "cas_subtype", "") or "Unknown").strip() or "Unknown"
+        subtype_to_indices.setdefault(subtype, []).append(index)
+
+    reference_counts = _subtype_counts(records, reference_indices) if reference_indices is not None else None
+    subtype_to_indices, skipped = _filter_subtypes_by_min_arrays(subtype_to_indices, min_arrays, reference_counts)
+    if skipped:
+        print(f"Deletion-fraction statistics: skipped subtypes below min_arrays={min_arrays}: {skipped}")
+
+    subtype_order = sorted(subtype_to_indices.keys(), key=lambda key: (-len(subtype_to_indices[key]), key))
+    overall_fractions = _augmented_deletion_fractions(records, indices)
+    overall_mean = sum(overall_fractions) / len(overall_fractions) if overall_fractions else 0.0
+
+    subtype_fraction_values: list[list[float]] = []
+    subtype_means: list[float] = []
+    subtype_counts: list[int] = []
+    for subtype in subtype_order:
+        values = _augmented_deletion_fractions(records, subtype_to_indices[subtype])
+        subtype_fraction_values.append(values)
+        subtype_means.append(sum(values) / len(values) if values else 0.0)
+        subtype_counts.append(len(values))
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(16, 1.3 * len(subtype_order) + 8), 6))
+
+    ax = axes[0]
+    if subtype_order:
+        x_positions = list(range(len(subtype_order)))
+        bars = ax.bar(x_positions, subtype_means, color="#f59e0b", alpha=0.85, edgecolor="white")
+        ax.axhline(overall_mean, color="#2563eb", linestyle="--", linewidth=2, label=f"overall mean={overall_mean:.3f}")
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(
+            [f"{subtype}\nn={len(subtype_to_indices[subtype])}" for subtype in subtype_order],
+            rotation=30,
+            ha="right",
+        )
+        ax.set_ylim(0, max(0.05, max([overall_mean] + subtype_means) * 1.25))
+        ax.set_ylabel("Mean deletion fraction")
+        ax.set_title("Average spacer deletion fraction by subtype")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(fontsize=9)
+        for bar, pair_count in zip(bars, subtype_counts):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(0.005, overall_mean * 0.03),
+                f"n={pair_count}\navg={bar.get_height():.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
+            )
+    else:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+
+    ax = axes[1]
+    box_values = [values for values in subtype_fraction_values if values]
+    box_labels = [f"{subtype}\nn={len(values)}" for subtype, values in zip(subtype_order, subtype_fraction_values) if values]
+    if box_values:
+        box = ax.boxplot(box_values, labels=box_labels, showmeans=True, patch_artist=True)
+        for patch in box["boxes"]:
+            patch.set_facecolor("#fb7185")
+            patch.set_alpha(0.75)
+        for median in box["medians"]:
+            median.set_color("#111827")
+            median.set_linewidth(2)
+        for mean in box["means"]:
+            mean.set_marker("o")
+            mean.set_markerfacecolor("white")
+            mean.set_markeredgecolor("#111827")
+            mean.set_markersize(5)
+
+        ax.set_title("Intra-subtype spacer deletion fraction distribution")
+        ax.set_ylabel("Deletion fraction")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.tick_params(axis="x", labelrotation=30)
+        ax.text(
+            0.98,
+            0.97,
+            f"overall_mean={overall_mean:.3f}\noverall_n={len(overall_fractions)}",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=10,
+            family="monospace",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+    else:
+        ax.text(0.5, 0.5, "No augmented samples available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+
+    fig.suptitle(title, fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    output_path = Path(output_path)
+    fig.savefig(str(output_path), dpi=100, bbox_inches="tight")
+    print(f"Deletion-fraction statistics saved to {output_path}")
+    print(f"  overall_mean={overall_mean:.4f} overall_n={len(overall_fractions)}")
+    for subtype, values in zip(subtype_order, subtype_fraction_values):
+        mean = sum(values) / len(values) if values else 0.0
+        print(f"  {subtype}: n={len(values)} mean={mean:.4f}")
     plt.close(fig)
 
 

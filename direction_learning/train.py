@@ -10,6 +10,7 @@ from importlib import import_module
 import time
 from collections import Counter
 from datetime import datetime
+from dataclasses import asdict
 from pathlib import Path
 
 try:
@@ -45,6 +46,8 @@ from .training import (
 _visualization = import_module("direction_learning.visualization")
 plot_array_length_statistics = _visualization.plot_array_length_statistics
 plot_subtype_length_statistics = _visualization.plot_subtype_length_statistics
+plot_spacer_similarity_statistics = _visualization.plot_spacer_similarity_statistics
+plot_augmented_spacer_deletion_statistics = _visualization.plot_augmented_spacer_deletion_statistics
 plot_confusion_matrix = _visualization.plot_confusion_matrix
 plot_training_curves = _visualization.plot_training_curves
 from .utils import (
@@ -288,6 +291,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--not_augment",
+        type=str,
+        default="",
+        help=(
+            "Subtype label to exclude from all augmentation steps. "
+            "For example, --not_augment II-A keeps II-A arrays in the original data only."
+        ),
+    )
+    parser.add_argument(
         "--aug_similarity",
         type=str,
         default="",
@@ -322,6 +334,23 @@ def main() -> int:
             "(combined original+RC samples) and on the RC samples alone."
         ),
     )
+    parser.add_argument(
+        "--save_model",
+        action="store_true",
+        help=(
+            "If set, save the restored best validation model checkpoint to the output directory "
+            "so it can be reused later."
+        ),
+    )
+    parser.add_argument(
+        "--vis_min_arrays",
+        type=int,
+        default=0,
+        help=(
+            "Minimum number of arrays a subtype must have in the plotted split before it is shown in the subtype comparison plots. "
+            "Default 0 shows all subtypes."
+        ),
+    )
     parser.add_argument("--enable_cls_token", action="store_true", help="Enable learned CLS token prepended to spacer sequence (default: off)")
     parser.add_argument(
         "--label_smoothing",
@@ -336,6 +365,8 @@ def main() -> int:
     output_dir = Path(args.out_name) if str(args.out_name).strip() else Path("/tmp")
     if str(args.out_name).strip():
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    blocked_subtype = (args.not_augment or "").strip()
     
     augmentation_elapsed = 0.0
     training_elapsed = 0.0
@@ -417,6 +448,25 @@ def main() -> int:
         test_token_sets, inverted_index = build_test_similarity_index(
             base_dataset.records, test_indices
         )
+
+    def _is_blocked_subtype(index: int) -> bool:
+        if not blocked_subtype:
+            return False
+        subtype = (base_dataset.records[index].cas_subtype or "Unknown").strip() or "Unknown"
+        return subtype == blocked_subtype
+
+    def _filter_subarray_augmentable_indices(indices: list[int]) -> list[int]:
+        if not blocked_subtype:
+            return list(indices)
+        return [index for index in indices if not _is_blocked_subtype(index)]
+
+    if blocked_subtype:
+        blocked_counts = Counter(
+            (base_dataset.records[index].cas_subtype or "Unknown").strip() or "Unknown"
+            for index in range(base_len)
+            if _is_blocked_subtype(index)
+        )
+        print_ts(f"Augmentation: subtype '{blocked_subtype}' will not be subarray-augmented (blocked_count={sum(blocked_counts.values())})")
 
     # Handle CV and final train/val split
     if use_explicit_test_holdout:
@@ -557,7 +607,7 @@ def main() -> int:
 
             train_new_indices, train_aug_stats = materialize_subarray_augmentations(
                 base_dataset=base_dataset,
-                source_indices=list(train_indices),
+                source_indices=_filter_subarray_augmentable_indices(list(train_indices)),
                 seen_signatures=seen_signatures,
                 test_signatures=test_signatures,
                 test_signatures_by_idx=test_signatures_by_idx,
@@ -577,7 +627,7 @@ def main() -> int:
 
             val_new_indices, val_aug_stats = materialize_subarray_augmentations(
                 base_dataset=base_dataset,
-                source_indices=list(val_indices),
+                source_indices=_filter_subarray_augmentable_indices(list(val_indices)),
                 seen_signatures=seen_signatures,
                 test_signatures=test_signatures,
                 test_signatures_by_idx=test_signatures_by_idx,
@@ -657,6 +707,7 @@ def main() -> int:
                     )
 
                     source_pool = [i for i in list(split_indices) if _subtype_of(i) == subtype]
+                    source_pool = _filter_subarray_augmentable_indices(source_pool)
                     if not source_pool:
                         print_ts(f"  No source examples for subtype {subtype}; skipping")
                         continue
@@ -786,6 +837,16 @@ def main() -> int:
         indices=original_indices,
         title="Original dataset length statistics by subtype",
         output_path=output_dir / "original_dataset_length_stats_by_subtype.png",
+        min_arrays=args.vis_min_arrays,
+        reference_indices=test_indices if test_indices else None,
+    )
+    plot_spacer_similarity_statistics(
+        records=base_dataset.records,
+        indices=original_indices,
+        title="Original dataset spacer similarity by subtype",
+        output_path=output_dir / "original_dataset_spacer_similarity_by_subtype.png",
+        min_arrays=args.vis_min_arrays,
+        reference_indices=test_indices if test_indices else None,
     )
     plot_array_length_statistics(
         records=base_dataset.records,
@@ -798,6 +859,16 @@ def main() -> int:
         indices=augmented_indices,
         title="Augmented array length statistics by subtype",
         output_path=output_dir / "augmented_array_length_stats_by_subtype.png",
+        min_arrays=args.vis_min_arrays,
+        reference_indices=test_indices if test_indices else None,
+    )
+    plot_augmented_spacer_deletion_statistics(
+        records=base_dataset.records,
+        indices=augmented_indices,
+        title="Augmented spacer deletion fraction by subtype",
+        output_path=output_dir / "augmented_spacer_deletion_fraction_by_subtype.png",
+        min_arrays=args.vis_min_arrays,
+        reference_indices=test_indices if test_indices else None,
     )
 
     # Create CNN tokenizer if requested
@@ -1127,6 +1198,26 @@ def main() -> int:
                     metrics["f1"],
                 )
             )
+
+    if getattr(args, "save_model", False):
+        checkpoint_path = output_dir / "model_checkpoint.pt"
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "model_config": asdict(model.config),
+            "vocab_size": len(vocab),
+            "include_flanks": args.include_flanks,
+            "tokenizer": args.tokenizer,
+            "cnn_output_dim": getattr(args, "cnn_output_dim", None),
+            "cnn_filters": getattr(args, "cnn_filters", None),
+            "cnn_kernels": getattr(args, "cnn_kernels", None),
+            "cnn_pooling": getattr(args, "cnn_pooling", None),
+            "cnn_activation": getattr(args, "cnn_activation", None),
+            "best_val_loss": best_val_loss,
+            "epochs_completed": len(train_losses),
+            "args": vars(args),
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved model checkpoint to {checkpoint_path}")
 
     total_elapsed = augmentation_elapsed + training_elapsed
     print_ts(
