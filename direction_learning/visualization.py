@@ -6,6 +6,7 @@ can import and reuse the functions without embedding matplotlib code.
 from __future__ import annotations
 
 from itertools import combinations
+import random
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
@@ -55,6 +56,83 @@ def _pairwise_spacer_similarities(records: Sequence[object], indices: Sequence[i
         similarities.append(_jaccard_similarity(left, right))
 
     return similarities
+
+
+def _sample_indices(indices: Sequence[int], max_samples: int, rng: random.Random) -> list[int]:
+    if max_samples <= 0 or len(indices) <= max_samples:
+        return list(indices)
+    return rng.sample(list(indices), max_samples)
+
+
+def _sampled_pairwise_spacer_similarities(
+    records: Sequence[object],
+    indices: Sequence[int],
+    max_pair_samples: int,
+    rng: random.Random,
+) -> tuple[list[float], int]:
+    if len(indices) < 2:
+        return [], 0
+
+    signatures = [_spacer_signature(records[index]) for index in indices]
+    n = len(signatures)
+    total_pairs = n * (n - 1) // 2
+
+    if max_pair_samples <= 0 or total_pairs <= max_pair_samples:
+        similarities: list[float] = []
+        for left, right in combinations(signatures, 2):
+            similarities.append(_jaccard_similarity(left, right))
+        return similarities, total_pairs
+
+    similarities = []
+    seen_pairs: set[tuple[int, int]] = set()
+    while len(similarities) < max_pair_samples:
+        left = rng.randrange(n)
+        right = rng.randrange(n - 1)
+        if right >= left:
+            right += 1
+        if right < left:
+            left, right = right, left
+        key = (left, right)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        similarities.append(_jaccard_similarity(signatures[left], signatures[right]))
+    return similarities, total_pairs
+
+
+def _sampled_cross_spacer_similarities(
+    records: Sequence[object],
+    left_indices: Sequence[int],
+    right_indices: Sequence[int],
+    max_pair_samples: int,
+    rng: random.Random,
+) -> tuple[list[float], int]:
+    if not left_indices or not right_indices:
+        return [], 0
+
+    left_signatures = [_spacer_signature(records[index]) for index in left_indices]
+    right_signatures = [_spacer_signature(records[index]) for index in right_indices]
+    total_pairs = len(left_signatures) * len(right_signatures)
+
+    if max_pair_samples <= 0 or total_pairs <= max_pair_samples:
+        similarities = [
+            _jaccard_similarity(left, right)
+            for left in left_signatures
+            for right in right_signatures
+        ]
+        return similarities, total_pairs
+
+    similarities = []
+    seen_pairs: set[tuple[int, int]] = set()
+    while len(similarities) < max_pair_samples:
+        left = rng.randrange(len(left_signatures))
+        right = rng.randrange(len(right_signatures))
+        key = (left, right)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        similarities.append(_jaccard_similarity(left_signatures[left], right_signatures[right]))
+    return similarities, total_pairs
 
 
 def _augmented_deletion_fractions(records: Sequence[object], indices: Sequence[int]) -> list[float]:
@@ -276,6 +354,9 @@ def plot_spacer_similarity_statistics(
     output_path: Path | str,
     min_arrays: int = 0,
     reference_indices: Sequence[int] | None = None,
+    max_samples_per_subtype: int = 1000,
+    max_pair_samples: int = 50000,
+    random_seed: int = 42,
 ) -> None:
     """Plot average spacer similarity overall and per subtype for original samples.
 
@@ -299,18 +380,38 @@ def plot_spacer_similarity_statistics(
     if skipped:
         print(f"Spacer similarity statistics: skipped subtypes below min_arrays={min_arrays}: {skipped}")
 
+    rng = random.Random(random_seed)
     subtype_order = sorted(subtype_to_indices.keys(), key=lambda key: (-len(subtype_to_indices[key]), key))
-    overall_similarities = _pairwise_spacer_similarities(records, indices)
+    sampled_overall_indices = _sample_indices(indices, max_samples_per_subtype, rng)
+    overall_similarities, overall_total_pairs = _sampled_pairwise_spacer_similarities(
+        records,
+        sampled_overall_indices,
+        max_pair_samples=max_pair_samples,
+        rng=rng,
+    )
     overall_mean = sum(overall_similarities) / len(overall_similarities) if overall_similarities else 0.0
 
     subtype_means: list[float] = []
     subtype_pair_counts: list[int] = []
+    subtype_total_pairs: list[int] = []
+    subtype_sample_sizes: list[int] = []
+    subtype_original_sizes: list[int] = []
     subtype_similarity_values: list[list[float]] = []
     for subtype in subtype_order:
-        subtype_sims = _pairwise_spacer_similarities(records, subtype_to_indices[subtype])
+        original_indices = subtype_to_indices[subtype]
+        sampled_indices = _sample_indices(original_indices, max_samples_per_subtype, rng)
+        subtype_sims, total_pairs = _sampled_pairwise_spacer_similarities(
+            records,
+            sampled_indices,
+            max_pair_samples=max_pair_samples,
+            rng=rng,
+        )
         subtype_similarity_values.append(subtype_sims)
         subtype_means.append(sum(subtype_sims) / len(subtype_sims) if subtype_sims else 0.0)
         subtype_pair_counts.append(len(subtype_sims))
+        subtype_total_pairs.append(total_pairs)
+        subtype_sample_sizes.append(len(sampled_indices))
+        subtype_original_sizes.append(len(original_indices))
 
     fig, axes = plt.subplots(1, 2, figsize=(max(16, 1.3 * len(subtype_order) + 8), 6))
 
@@ -322,7 +423,10 @@ def plot_spacer_similarity_statistics(
         ax.axhline(overall_mean, color="#dc2626", linestyle="--", linewidth=2, label=f"overall mean={overall_mean:.3f}")
         ax.set_xticks(x_positions)
         ax.set_xticklabels(
-            [f"{subtype}\nn={len(subtype_to_indices[subtype])}" for subtype in subtype_order],
+            [
+                f"{subtype}\nn={sampled_n}/{original_n}"
+                for subtype, sampled_n, original_n in zip(subtype_order, subtype_sample_sizes, subtype_original_sizes)
+            ],
             rotation=30,
             ha="right",
         )
@@ -331,11 +435,11 @@ def plot_spacer_similarity_statistics(
         ax.set_title("Average spacer similarity by subtype")
         ax.grid(True, axis="y", alpha=0.25)
         ax.legend(fontsize=9)
-        for bar, subtype, pair_count in zip(bars, subtype_order, subtype_pair_counts):
+        for bar, subtype, pair_count, total_pairs in zip(bars, subtype_order, subtype_pair_counts, subtype_total_pairs):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + max(0.005, overall_mean * 0.03),
-                f"pairs={pair_count}\navg={bar.get_height():.3f}",
+                f"pairs={pair_count}/{total_pairs}\navg={bar.get_height():.3f}",
                 ha="center",
                 va="bottom",
                 fontsize=8,
@@ -370,7 +474,7 @@ def plot_spacer_similarity_statistics(
         ax.text(
             0.98,
             0.97,
-            f"overall_pairs={len(overall_similarities)}\noverall_mean={overall_mean:.3f}",
+            f"overall_pairs={len(overall_similarities)}/{overall_total_pairs}\noverall_mean={overall_mean:.3f}",
             transform=ax.transAxes,
             ha="right",
             va="top",
@@ -388,13 +492,317 @@ def plot_spacer_similarity_statistics(
     output_path = Path(output_path)
     fig.savefig(str(output_path), dpi=100, bbox_inches="tight")
     print(f"Spacer similarity statistics saved to {output_path}")
-    print(f"  overall_pairwise_mean={overall_mean:.4f} overall_pairs={len(overall_similarities)}")
-    for subtype, values in zip(subtype_order, subtype_similarity_values):
+    print(
+        f"  overall_pairwise_mean={overall_mean:.4f} "
+        f"overall_pairs={len(overall_similarities)}/{overall_total_pairs} "
+        f"overall_n={len(sampled_overall_indices)}/{len(indices)}"
+    )
+    for subtype, values, sampled_n, original_n, pair_count, total_pairs in zip(
+        subtype_order,
+        subtype_similarity_values,
+        subtype_sample_sizes,
+        subtype_original_sizes,
+        subtype_pair_counts,
+        subtype_total_pairs,
+    ):
         mean = sum(values) / len(values) if values else 0.0
         print(
-            f"  {subtype}: n={len(subtype_to_indices[subtype])} pairwise_pairs={len(values)} pairwise_mean={mean:.4f}"
+            f"  {subtype}: n={sampled_n}/{original_n} pairwise_pairs={pair_count}/{total_pairs} pairwise_mean={mean:.4f}"
         )
     plt.close(fig)
+
+
+def plot_split_spacer_similarity_statistics(
+    records: Sequence[object],
+    train_indices: Sequence[int],
+    val_indices: Sequence[int],
+    test_indices: Sequence[int],
+    title: str,
+    output_path: Path | str,
+    max_samples_per_split: int = 1000,
+    max_pair_samples: int = 50000,
+    random_seed: int = 42,
+) -> None:
+    """Plot train/val/test spacer-similarity statistics after augmentation.
+
+    Uses bounded sampling so the visualization remains tractable for large
+    augmented datasets.
+    """
+    plt = _ensure_matplotlib()
+    if plt is None:
+        print(f"matplotlib not available; skipping split similarity visualization for {title}.")
+        return
+
+    rng = random.Random(random_seed)
+    split_indices_map: dict[str, list[int]] = {
+        "train": _sample_indices(train_indices, max_samples_per_split, rng),
+        "val": _sample_indices(val_indices, max_samples_per_split, rng),
+        "test": _sample_indices(test_indices, max_samples_per_split, rng),
+    }
+    split_order = ["train", "val", "test"]
+
+    split_intra_means: dict[str, float] = {}
+    split_sampled_pairs: dict[str, int] = {}
+    split_total_pairs: dict[str, int] = {}
+    for split_name in split_order:
+        values, total_pairs = _sampled_pairwise_spacer_similarities(
+            records,
+            split_indices_map[split_name],
+            max_pair_samples=max_pair_samples,
+            rng=rng,
+        )
+        split_intra_means[split_name] = (sum(values) / len(values)) if values else 0.0
+        split_sampled_pairs[split_name] = len(values)
+        split_total_pairs[split_name] = total_pairs
+
+    matrix_values: list[list[float]] = []
+    matrix_labels: list[list[str]] = []
+    for left_name in split_order:
+        row_values: list[float] = []
+        row_labels: list[str] = []
+        for right_name in split_order:
+            if left_name == right_name:
+                row_values.append(split_intra_means[left_name])
+                row_labels.append(
+                    f"{split_sampled_pairs[left_name]}/{split_total_pairs[left_name]}"
+                )
+                continue
+
+            values, total_pairs = _sampled_cross_spacer_similarities(
+                records,
+                split_indices_map[left_name],
+                split_indices_map[right_name],
+                max_pair_samples=max_pair_samples,
+                rng=rng,
+            )
+            mean = (sum(values) / len(values)) if values else 0.0
+            row_values.append(mean)
+            row_labels.append(f"{len(values)}/{total_pairs}")
+        matrix_values.append(row_values)
+        matrix_labels.append(row_labels)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    ax = axes[0]
+    bar_values = [split_intra_means[split_name] for split_name in split_order]
+    bars = ax.bar(split_order, bar_values, color=["#3b82f6", "#10b981", "#f59e0b"], alpha=0.85, edgecolor="white")
+    ax.set_ylim(0, max(0.05, max(bar_values) * 1.3))
+    ax.set_ylabel("Mean pairwise Jaccard similarity")
+    ax.set_title("Intra-split spacer similarity")
+    ax.grid(True, axis="y", alpha=0.25)
+    for bar, split_name in zip(bars, split_order):
+        sampled_n = len(split_indices_map[split_name])
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(0.005, max(bar_values) * 0.04),
+            (
+                f"n={sampled_n}\n"
+                f"pairs={split_sampled_pairs[split_name]}/{split_total_pairs[split_name]}\n"
+                f"avg={bar.get_height():.3f}"
+            ),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
+        )
+
+    ax = axes[1]
+    image = ax.imshow(matrix_values, vmin=0.0, vmax=1.0, cmap="YlGnBu")
+    ax.set_xticks(list(range(len(split_order))))
+    ax.set_yticks(list(range(len(split_order))))
+    ax.set_xticklabels(split_order)
+    ax.set_yticklabels(split_order)
+    ax.set_title("Mean Jaccard similarity matrix")
+    for i, left_name in enumerate(split_order):
+        for j, right_name in enumerate(split_order):
+            color = "white" if matrix_values[i][j] > 0.5 else "black"
+            ax.text(
+                j,
+                i,
+                f"{matrix_values[i][j]:.3f}\n({matrix_labels[i][j]})",
+                ha="center",
+                va="center",
+                color=color,
+                fontsize=8,
+            )
+    plt.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Mean Jaccard")
+
+    fig.suptitle(title, fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    output_path = Path(output_path)
+    fig.savefig(str(output_path), dpi=100, bbox_inches="tight")
+    print(f"Split spacer similarity statistics saved to {output_path}")
+    for split_name in split_order:
+        print(
+            f"  {split_name}: n={len(split_indices_map[split_name])} "
+            f"pair_samples={split_sampled_pairs[split_name]}/{split_total_pairs[split_name]} "
+            f"intra_mean={split_intra_means[split_name]:.4f}"
+        )
+    plt.close(fig)
+
+
+def plot_subtype_split_spacer_similarity_statistics(
+    records: Sequence[object],
+    train_indices: Sequence[int],
+    val_indices: Sequence[int],
+    test_indices: Sequence[int],
+    title: str,
+    output_dir: Path | str,
+    min_arrays: int = 0,
+    reference_indices: Sequence[int] | None = None,
+    max_samples_per_split: int = 400,
+    max_pair_samples: int = 20000,
+    random_seed: int = 42,
+    subtypes_per_figure: int = 4,
+) -> None:
+    """Plot per-subtype train/val/test similarity matrices in paginated figures.
+
+    For each subtype, a 3x3 matrix is generated where diagonal cells are
+    intra-split similarities and off-diagonal cells are cross-split
+    similarities. Sampling caps keep runtime bounded on large datasets.
+    """
+    plt = _ensure_matplotlib()
+    if plt is None:
+        print(f"matplotlib not available; skipping per-subtype split similarity visualization for {title}.")
+        return
+
+    def _get_subtype(index: int) -> str:
+        example = records[index]
+        return (getattr(example, "cas_subtype", "") or "Unknown").strip() or "Unknown"
+
+    train_by_subtype: dict[str, list[int]] = {}
+    val_by_subtype: dict[str, list[int]] = {}
+    test_by_subtype: dict[str, list[int]] = {}
+    combined_by_subtype: dict[str, list[int]] = {}
+
+    for index in train_indices:
+        subtype = _get_subtype(index)
+        train_by_subtype.setdefault(subtype, []).append(index)
+        combined_by_subtype.setdefault(subtype, []).append(index)
+    for index in val_indices:
+        subtype = _get_subtype(index)
+        val_by_subtype.setdefault(subtype, []).append(index)
+        combined_by_subtype.setdefault(subtype, []).append(index)
+    for index in test_indices:
+        subtype = _get_subtype(index)
+        test_by_subtype.setdefault(subtype, []).append(index)
+        combined_by_subtype.setdefault(subtype, []).append(index)
+
+    reference_counts = _subtype_counts(records, reference_indices) if reference_indices is not None else None
+    filtered_subtypes, skipped = _filter_subtypes_by_min_arrays(combined_by_subtype, min_arrays, reference_counts)
+    if skipped:
+        print(f"Per-subtype split similarity: skipped subtypes below min_arrays={min_arrays}: {skipped}")
+
+    subtype_order = sorted(filtered_subtypes.keys())
+    if not subtype_order:
+        print("Per-subtype split similarity: no subtypes to plot after filtering.")
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    split_order = ["train", "val", "test"]
+    rng = random.Random(random_seed)
+
+    def _matrix_for_subtype(subtype: str) -> tuple[list[list[float]], list[list[str]], dict[str, tuple[int, int]]]:
+        original_map = {
+            "train": train_by_subtype.get(subtype, []),
+            "val": val_by_subtype.get(subtype, []),
+            "test": test_by_subtype.get(subtype, []),
+        }
+        sampled_map = {
+            split_name: _sample_indices(original_map[split_name], max_samples_per_split, rng)
+            for split_name in split_order
+        }
+        split_n = {
+            split_name: (len(sampled_map[split_name]), len(original_map[split_name]))
+            for split_name in split_order
+        }
+
+        matrix_values: list[list[float]] = []
+        matrix_labels: list[list[str]] = []
+        for left_name in split_order:
+            row_values: list[float] = []
+            row_labels: list[str] = []
+            for right_name in split_order:
+                if left_name == right_name:
+                    values, total_pairs = _sampled_pairwise_spacer_similarities(
+                        records,
+                        sampled_map[left_name],
+                        max_pair_samples=max_pair_samples,
+                        rng=rng,
+                    )
+                else:
+                    values, total_pairs = _sampled_cross_spacer_similarities(
+                        records,
+                        sampled_map[left_name],
+                        sampled_map[right_name],
+                        max_pair_samples=max_pair_samples,
+                        rng=rng,
+                    )
+                mean = (sum(values) / len(values)) if values else 0.0
+                row_values.append(mean)
+                row_labels.append(f"{len(values)}/{total_pairs}")
+            matrix_values.append(row_values)
+            matrix_labels.append(row_labels)
+
+        return matrix_values, matrix_labels, split_n
+
+    total_subtypes = len(subtype_order)
+    per_figure = max(1, subtypes_per_figure)
+    total_pages = (total_subtypes + per_figure - 1) // per_figure
+
+    for page in range(total_pages):
+        start = page * per_figure
+        page_subtypes = subtype_order[start:start + per_figure]
+
+        cols = 2
+        rows = (len(page_subtypes) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(7.2 * cols, 5.2 * rows))
+        axes_list = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+        for axis, subtype in zip(axes_list, page_subtypes):
+            matrix_values, matrix_labels, split_n = _matrix_for_subtype(subtype)
+            image = axis.imshow(matrix_values, vmin=0.0, vmax=1.0, cmap="YlGnBu")
+            axis.set_xticks(list(range(len(split_order))))
+            axis.set_yticks(list(range(len(split_order))))
+            axis.set_xticklabels(split_order)
+            axis.set_yticklabels(split_order)
+            axis.set_title(
+                (
+                    f"{subtype}\n"
+                    f"train n={split_n['train'][0]}/{split_n['train'][1]} | "
+                    f"val n={split_n['val'][0]}/{split_n['val'][1]} | "
+                    f"test n={split_n['test'][0]}/{split_n['test'][1]}"
+                ),
+                fontsize=10,
+            )
+
+            for i in range(len(split_order)):
+                for j in range(len(split_order)):
+                    color = "white" if matrix_values[i][j] > 0.5 else "black"
+                    axis.text(
+                        j,
+                        i,
+                        f"{matrix_values[i][j]:.3f}\n({matrix_labels[i][j]})",
+                        ha="center",
+                        va="center",
+                        color=color,
+                        fontsize=8,
+                    )
+
+            fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+
+        for axis in axes_list[len(page_subtypes):]:
+            axis.set_axis_off()
+
+        fig.suptitle(f"{title} (part {page + 1}/{total_pages})", fontsize=15, fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+        out_path = output_dir / f"subtype_split_spacer_similarity_after_augmentation_part{page + 1}.png"
+        fig.savefig(str(out_path), dpi=100, bbox_inches="tight")
+        print(f"Per-subtype split similarity statistics saved to {out_path}")
+        plt.close(fig)
 
 
 def plot_augmented_spacer_deletion_statistics(

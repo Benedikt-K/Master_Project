@@ -46,7 +46,9 @@ from .training import (
 _visualization = import_module("direction_learning.visualization")
 plot_array_length_statistics = _visualization.plot_array_length_statistics
 plot_subtype_length_statistics = _visualization.plot_subtype_length_statistics
-plot_spacer_similarity_statistics = _visualization.plot_spacer_similarity_statistics
+plot_split_spacer_similarity_statistics = _visualization.plot_split_spacer_similarity_statistics
+plot_subtype_split_spacer_similarity_statistics = _visualization.plot_subtype_split_spacer_similarity_statistics
+#plot_spacer_similarity_statistics = _visualization.plot_spacer_similarity_statistics
 plot_augmented_spacer_deletion_statistics = _visualization.plot_augmented_spacer_deletion_statistics
 plot_confusion_matrix = _visualization.plot_confusion_matrix
 plot_training_curves = _visualization.plot_training_curves
@@ -840,14 +842,14 @@ def main() -> int:
         min_arrays=args.vis_min_arrays,
         reference_indices=test_indices if test_indices else None,
     )
-    plot_spacer_similarity_statistics(
+    """plot_spacer_similarity_statistics(
         records=base_dataset.records,
         indices=original_indices,
         title="Original dataset spacer similarity by subtype",
         output_path=output_dir / "original_dataset_spacer_similarity_by_subtype.png",
         min_arrays=args.vis_min_arrays,
         reference_indices=test_indices if test_indices else None,
-    )
+    )"""
     plot_array_length_statistics(
         records=base_dataset.records,
         indices=augmented_indices,
@@ -862,11 +864,37 @@ def main() -> int:
         min_arrays=args.vis_min_arrays,
         reference_indices=test_indices if test_indices else None,
     )
+    """plot_spacer_similarity_statistics(
+        records=base_dataset.records,
+        indices=augmented_indices,
+        title="Augmented dataset spacer similarity by subtype",
+        output_path=output_dir / "augmented_dataset_spacer_similarity_by_subtype.png",
+        min_arrays=args.vis_min_arrays,
+        reference_indices=test_indices if test_indices else None,
+    )"""
     plot_augmented_spacer_deletion_statistics(
         records=base_dataset.records,
         indices=augmented_indices,
         title="Augmented spacer deletion fraction by subtype",
         output_path=output_dir / "augmented_spacer_deletion_fraction_by_subtype.png",
+        min_arrays=args.vis_min_arrays,
+        reference_indices=test_indices if test_indices else None,
+    )
+    plot_split_spacer_similarity_statistics(
+        records=base_dataset.records,
+        train_indices=train_indices,
+        val_indices=val_indices,
+        test_indices=test_indices,
+        title="Train/val/test spacer similarity after augmentation",
+        output_path=output_dir / "split_spacer_similarity_after_augmentation.png",
+    )
+    plot_subtype_split_spacer_similarity_statistics(
+        records=base_dataset.records,
+        train_indices=train_indices,
+        val_indices=val_indices,
+        test_indices=test_indices,
+        title="Per-subtype train/val/test spacer similarity after augmentation",
+        output_dir=output_dir,
         min_arrays=args.vis_min_arrays,
         reference_indices=test_indices if test_indices else None,
     )
