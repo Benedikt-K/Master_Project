@@ -22,13 +22,13 @@ class DirectionTransformerConfig:
     maximum array size, and whether to include flanking sequences.
     """
     vocab_size: int
-    token_dim: int = 64
+    token_dim: int = 32
     spacer_dim: int = 128
-    transformer_dim: int = 256
+    transformer_dim: int = 192
     num_heads: int = 8
     num_layers: int = 2
     feedforward_dim: int = 4
-    dropout: float = 0.1
+    dropout: float = 0.06
     activation: str = "gelu"
     max_spacers: int = 64
     include_flanks: bool = False

@@ -305,6 +305,7 @@ def run_study(args: argparse.Namespace) -> int:
             trial.set_user_attr("augment_subarrays_mode", aug_mode)
             trial.set_user_attr("augment_subarrays_prob", float(aug_prob))
             trial.set_user_attr("augment_subarrays_used", aug_max_per_array > 0)
+            #print to see how augmentation is done to understand when its taking very long
             print("max aug setting", aug_max_per_array)
             use_similarity = bool(args.augment_use_similarity)
             if use_similarity:
@@ -577,14 +578,21 @@ def run_study(args: argparse.Namespace) -> int:
             optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         else:
             optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
 
         best_val_loss = float("inf")
         best_val_metrics = None
         best_model_state = None
         patience_counter = 0
         for epoch in range(1, args.max_epochs + 1):
-            train_one_epoch(model, train_loader_trial, optimizer, loss_fn, device)
-            metrics = evaluate(model, val_loader_trial, loss_fn, device)
+            train_one_epoch(model, train_loader_trial, optimizer, loss_fn, device, label_smoothing=args.label_smoothing)
+            metrics = evaluate(model, val_loader_trial, loss_fn, device, label_smoothing=args.label_smoothing)
             val_loss = float(metrics["loss"])
             trial.report(val_loss, step=epoch)
             if trial.should_prune():
@@ -596,6 +604,9 @@ def run_study(args: argparse.Namespace) -> int:
                 patience_counter = 0
             else:
                 patience_counter += 1
+
+            scheduler.step(val_loss)
+
             if patience_counter >= args.early_stopping_patience:
                 break
 
@@ -605,7 +616,7 @@ def run_study(args: argparse.Namespace) -> int:
         
         best_test_metrics = None
         if test_loader_trial is not None:
-            best_test_metrics = evaluate(model, test_loader_trial, loss_fn, device)
+            best_test_metrics = evaluate(model, test_loader_trial, loss_fn, device, label_smoothing=args.label_smoothing)
         
         # Store metrics in trial for later retrieval
         trial.set_user_attr("best_val_loss", best_val_loss)
@@ -753,6 +764,13 @@ def run_study(args: argparse.Namespace) -> int:
             use_cls_token=bool(best_config_obj.use_cls_token),
         ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=best_params["lr"], weight_decay=best_params["weight_decay"])
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
         retrain_train_indices = train_indices + val_indices
         retrain_train_loader = build_dataloader(
             DirectionTorchDataset(
@@ -794,9 +812,19 @@ def run_study(args: argparse.Namespace) -> int:
             batch_size=best_params["batch_size"],
             shuffle=False,
         )
+        retrain_best_state = None
+        retrain_best_val_loss = float("inf")
         for _ in range(args.final_epochs):
-            train_one_epoch(model, retrain_train_loader, optimizer, loss_fn, device)
-        final_metrics = evaluate(model, retrain_test_loader, loss_fn, device) if retrain_test_loader is not None else evaluate(model, retrain_val_loader, loss_fn, device)
+            train_one_epoch(model, retrain_train_loader, optimizer, loss_fn, device, label_smoothing=args.label_smoothing)
+            retrain_val_metrics = evaluate(model, retrain_val_loader, loss_fn, device, label_smoothing=args.label_smoothing)
+            retrain_val_loss = float(retrain_val_metrics["loss"])
+            scheduler.step(retrain_val_loss)
+            if retrain_val_loss < retrain_best_val_loss:
+                retrain_best_val_loss = retrain_val_loss
+                retrain_best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        if retrain_best_state is not None:
+            model.load_state_dict(retrain_best_state)
+        final_metrics = evaluate(model, retrain_test_loader, loss_fn, device, label_smoothing=args.label_smoothing) if retrain_test_loader is not None else evaluate(model, retrain_val_loader, loss_fn, device, label_smoothing=args.label_smoothing)
         (results_dir / "final_metrics.json").write_text(json.dumps(final_metrics, indent=2, sort_keys=True) + "\n")
         _print(f"Final retrain metrics written to {results_dir / 'final_metrics.json'}")
 
@@ -898,6 +926,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aug_similarity", type=str, default="jaccard", choices=["jaccard", "overlap"], help="Similarity metric to use when similarity filtering is enabled")
     parser.add_argument("--aug_similarity_min_distance", type=float, default=0.5, help="Minimum distance to test set required to accept augmented candidate (0.0-1.0)")
     parser.add_argument("--enable_cls_token", action="store_true", help="Enable learned CLS token prepended to spacer sequence (default: off)")
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing epsilon (0.0 = disabled) applied during HPO training.",
+    )
     return parser
 
 

@@ -18,10 +18,10 @@ from ..tokenization import DNA_VOCAB
 
 @dataclass
 class CNNTokConfig:
-    output_dim: int = 256
-    embed_dim: int = 8
-    filters: int = 128
-    kernels: list[int] = (3, 7)
+    output_dim: int = 64
+    embed_dim: int = 32
+    filters: int = 64
+    kernels: list[int] = (3, 5, 9)
     pooling: str = "max"
     activation: str = "gelu"
 

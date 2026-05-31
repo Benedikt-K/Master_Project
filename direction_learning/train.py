@@ -6,6 +6,7 @@ trains transformer with validation monitoring, and reports metrics.
 from __future__ import annotations
 
 import argparse
+from importlib import import_module
 import time
 from collections import Counter
 from datetime import datetime
@@ -16,13 +17,6 @@ try:
 except ModuleNotFoundError:
     torch = None
 
-try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError:
-    plt = None
-
 # Import from new modular structure
 from .augmentation import (
     materialize_reverse_complement_augmentation,
@@ -31,6 +25,7 @@ from .augmentation import (
     build_test_similarity_index,
     make_subarray_augment_fn,
     make_subarray_augment_fn_with_similarity_filter,
+    reverse_complement_example,
 )
 from .data import (
     split_dev_pool_by_mode,
@@ -47,6 +42,11 @@ from .training import (
     evaluate,
     evaluate_per_subtype,
 )
+_visualization = import_module("direction_learning.visualization")
+plot_array_length_statistics = _visualization.plot_array_length_statistics
+plot_subtype_length_statistics = _visualization.plot_subtype_length_statistics
+plot_confusion_matrix = _visualization.plot_confusion_matrix
+plot_training_curves = _visualization.plot_training_curves
 from .utils import (
     require_torch,
     timestamp,
@@ -57,6 +57,19 @@ from .dataset import (
     DirectionJsonlDataset,
     build_vocab_from_jsonl,
 )
+
+
+class _InMemoryDirectionDataset:
+    def __init__(self, records: list[object], include_flanks: bool = False):
+        self.records = list(records)
+        self.include_flanks = include_flanks
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> object:
+        return self.records[index]
+
 from .model import build_model
 from .tokenizers.cnn_tokenizer import CNNTokenizer, CNNTokConfig
 
@@ -292,10 +305,37 @@ def main() -> int:
         action="store_true",
         help="If set and a test set is present, evaluate the model on the test set once per epoch and include test loss as a third line in the training curves plot.",
     )
+    parser.add_argument(
+        "--out_name",
+        type=str,
+        default="",
+        help=(
+            "Optional output folder name for plots and diagnostics. "
+            "If omitted, outputs are written to /tmp."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate_rc_test",
+        action="store_true",
+        help=(
+            "If set and a test set is present, also evaluate on a reverse-complemented copy of the test set "
+            "(combined original+RC samples) and on the RC samples alone."
+        ),
+    )
     parser.add_argument("--enable_cls_token", action="store_true", help="Enable learned CLS token prepended to spacer sequence (default: off)")
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing epsilon (0.0 = disabled). Applies eps/2 to both classes for binary targets.",
+    )
     args = parser.parse_args()
 
     require_torch()
+
+    output_dir = Path(args.out_name) if str(args.out_name).strip() else Path("/tmp")
+    if str(args.out_name).strip():
+        output_dir.mkdir(parents=True, exist_ok=True)
     
     augmentation_elapsed = 0.0
     training_elapsed = 0.0
@@ -733,6 +773,33 @@ def main() -> int:
     if augmentation_started_at is not None:
         augmentation_elapsed = time.perf_counter() - augmentation_started_at
 
+    original_indices = list(range(base_len))
+    augmented_indices = list(range(base_len, len(base_dataset.records)))
+    plot_array_length_statistics(
+        records=base_dataset.records,
+        indices=original_indices,
+        title="Original dataset length statistics",
+        output_path=output_dir / "original_dataset_length_stats.png",
+    )
+    plot_subtype_length_statistics(
+        records=base_dataset.records,
+        indices=original_indices,
+        title="Original dataset length statistics by subtype",
+        output_path=output_dir / "original_dataset_length_stats_by_subtype.png",
+    )
+    plot_array_length_statistics(
+        records=base_dataset.records,
+        indices=augmented_indices,
+        title="Augmented array length statistics",
+        output_path=output_dir / "augmented_array_length_stats.png",
+    )
+    plot_subtype_length_statistics(
+        records=base_dataset.records,
+        indices=augmented_indices,
+        title="Augmented array length statistics by subtype",
+        output_path=output_dir / "augmented_array_length_stats_by_subtype.png",
+    )
+
     # Create CNN tokenizer if requested
     cnn_tok = None
     if args.tokenizer == "cnn":
@@ -868,6 +935,13 @@ def main() -> int:
     print("Model architecture:")
     print(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+    )
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
     # Training loop
@@ -881,14 +955,14 @@ def main() -> int:
     training_started_at = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device)
-        val_metrics = evaluate(model, val_loader, loss_fn, device)
+        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device, label_smoothing=args.label_smoothing)
+        val_metrics = evaluate(model, val_loader, loss_fn, device, label_smoothing=args.label_smoothing)
         val_loss = val_metrics["loss"]
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
         if getattr(args, "plot_test_curve", False) and test_loader is not None:
-            test_metrics_epoch = evaluate(model, test_loader, loss_fn, device)
+            test_metrics_epoch = evaluate(model, test_loader, loss_fn, device, label_smoothing=args.label_smoothing)
             test_loss = test_metrics_epoch.get("loss", float("nan"))
             test_losses.append(test_loss)
         else:
@@ -900,6 +974,8 @@ def main() -> int:
             best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
         else:
             patience_counter += 1
+
+        scheduler.step(val_loss)
 
         es_marker = (
             " (BEST)"
@@ -926,54 +1002,21 @@ def main() -> int:
         model.load_state_dict(best_model_state)
         print("Restored best model (lowest validation loss).")
 
-    # Plot training curves
-    if plt is not None:
-        fig, ax = plt.subplots(figsize=(12, 7))
-        epochs_range = range(1, len(train_losses) + 1)
-        ax.plot(epochs_range, train_losses, marker='o', label='Train Loss', linewidth=2)
-        ax.plot(epochs_range, val_losses, marker='s', label='Val Loss', linewidth=2)
-        if getattr(args, "plot_test_curve", False) and test_loader is not None and len(test_losses) > 0:
-            test_plot = [
-                test_losses[i] if i < len(test_losses) else float('nan')
-                for i in range(len(train_losses))
-            ]
-            ax.plot(epochs_range, test_plot, marker='^', label='Test Loss', linewidth=2)
-        ax.set_xlabel('Epoch', fontsize=12)
-        ax.set_ylabel('Loss', fontsize=12)
-        ax.set_title('Training vs Validation Loss', fontsize=14, fontweight='bold')
-        ax.legend(fontsize=11)
-        ax.grid(True, alpha=0.3)
-
-        params_text = (
-            f"batch_size={args.batch_size}\n"
-            f"lr={args.lr}\n"
-            f"weight_decay={args.weight_decay}\n"
-            f"dropout={args.dropout}\n"
-            f"early_stopping_patience={args.early_stopping_patience}\n"
-            f"stratify_by={stratify_mode}\n"
-            f"seed={args.seed}\n"
-            f"train_size={len(train_dataset)}\n"
-            f"val_size={len(val_dataset)}\n"
-            f"epochs_completed={len(train_losses)}\n"
-            f"best_val_loss={min(val_losses):.4f}"
-        )
-        ax.text(
-            0.98, 0.97, params_text, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', horizontalalignment='right',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-            family='monospace'
-        )
-
-        output_path = Path("/tmp/training_curves.png")
-        fig.savefig(str(output_path), dpi=100, bbox_inches='tight')
-        print(f"Training curves saved to {output_path}")
-        plt.close(fig)
-    else:
-        print("matplotlib not available; skipping training curves visualization.")
+    # Plot training curves (module handles matplotlib availability)
+    plot_training_curves(
+        train_losses=train_losses,
+        val_losses=val_losses,
+        test_losses=(test_losses if getattr(args, "plot_test_curve", False) and test_loader is not None else None),
+        args=args,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        stratify_mode=stratify_mode,
+        output_path=output_dir / "training_curves.png",
+    )
 
     # Test evaluation
     if test_loader is not None:
-        test_metrics = evaluate(model, test_loader, loss_fn, device)
+        test_metrics = evaluate(model, test_loader, loss_fn, device, label_smoothing=args.label_smoothing)
         auc_text = (
             f"{test_metrics['auc']:.4f}" if not (test_metrics['auc'] != test_metrics['auc']) else "nan"
         )
@@ -986,71 +1029,70 @@ def main() -> int:
             f"recall={test_metrics['recall']:.4f} f1={test_metrics['f1']:.4f}"
         )
 
-        # Confusion matrix
-        if plt is not None:
+        # Confusion matrix (delegated to visualization module)
+        try:
+            plot_confusion_matrix(model=model, test_loader=test_loader, device=device, output_path=output_dir / "confusion_matrix.png")
+        except Exception as e:
+            print(f"Could not generate confusion matrix: {e}")
+
+        if getattr(args, "evaluate_rc_test", False):
+            rc_examples = [reverse_complement_example(base_dataset.records[idx]) for idx in test_indices]
+            combined_examples = [base_dataset.records[idx] for idx in test_indices] + rc_examples
+
+            combined_base = _InMemoryDirectionDataset(combined_examples, include_flanks=base_dataset.include_flanks)
+            rc_only_base = _InMemoryDirectionDataset(rc_examples, include_flanks=base_dataset.include_flanks)
+
+            combined_dataset = DirectionTorchDataset(
+                combined_base,
+                list(range(len(combined_examples))),
+                vocab,
+                exclude_repeats=args.exclude_repeats,
+                tokenizer=args.tokenizer,
+                cnn_tokenizer=cnn_tok,
+            )
+            rc_only_dataset = DirectionTorchDataset(
+                rc_only_base,
+                list(range(len(rc_examples))),
+                vocab,
+                exclude_repeats=args.exclude_repeats,
+                tokenizer=args.tokenizer,
+                cnn_tokenizer=cnn_tok,
+            )
+
+            combined_loader = build_dataloader(combined_dataset, batch_size=args.batch_size, shuffle=False)
+            rc_only_loader = build_dataloader(rc_only_dataset, batch_size=args.batch_size, shuffle=False)
+
+            combined_metrics = evaluate(model, combined_loader, loss_fn, device, label_smoothing=args.label_smoothing)
+            rc_only_metrics = evaluate(model, rc_only_loader, loss_fn, device, label_smoothing=args.label_smoothing)
+
+            print(
+                f"rc_combined_test_loss={combined_metrics['loss']:.4f} rc_combined_test_accuracy={combined_metrics['accuracy']:.4f} "
+                f"rc_combined_auc={combined_metrics['auc']:.4f} rc_combined_aupr={combined_metrics['aupr']:.4f} "
+                f"rc_combined_precision={combined_metrics['precision']:.4f} rc_combined_recall={combined_metrics['recall']:.4f} "
+                f"rc_combined_f1={combined_metrics['f1']:.4f}"
+            )
+            print(
+                f"rc_only_test_loss={rc_only_metrics['loss']:.4f} rc_only_test_accuracy={rc_only_metrics['accuracy']:.4f} "
+                f"rc_only_auc={rc_only_metrics['auc']:.4f} rc_only_aupr={rc_only_metrics['aupr']:.4f} "
+                f"rc_only_precision={rc_only_metrics['precision']:.4f} rc_only_recall={rc_only_metrics['recall']:.4f} "
+                f"rc_only_f1={rc_only_metrics['f1']:.4f}"
+            )
+
             try:
-                import numpy as np
-                from sklearn.metrics import confusion_matrix
-                from matplotlib.colors import LinearSegmentedColormap
-
-                all_probs = []
-                all_labels = []
-                model.eval()
-                with torch.no_grad():
-                    for batch in test_loader:
-                        batch = {key: value.to(device) for key, value in batch.items()}
-                        logits = model(batch)
-                        probs = torch.sigmoid(logits).cpu().numpy()
-                        labels = batch["label"].cpu().numpy()
-                        all_probs.extend(probs.flatten())
-                        all_labels.extend(labels.flatten())
-
-                y_pred = (np.array(all_probs) >= 0.5).astype(int)
-                y_true = np.array(all_labels, dtype=int)
-                cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-
-                blue_purple = LinearSegmentedColormap.from_list(
-                    "blue_purple", ["#dbeafe", "#a78bfa", "#7c3aed"], N=256
+                plot_confusion_matrix(
+                    model=model,
+                    test_loader=combined_loader,
+                    device=device,
+                    output_path=output_dir / "confusion_matrix_rc_combined.png",
                 )
-                fig, ax = plt.subplots(figsize=(8, 6))
-                im = ax.imshow(cm, interpolation='nearest', cmap=blue_purple)
-
-                total_examples = int(cm.sum()) if int(cm.sum()) > 0 else 1
-                row_sums = cm.sum(axis=1)
-                class_names = [
-                    f"Backward (n={int(row_sums[0])}, {row_sums[0] / total_examples:.1%})",
-                    f"Forward (n={int(row_sums[1])}, {row_sums[1] / total_examples:.1%})",
-                ]
-                tick_marks = np.arange(len(class_names))
-                ax.set_xticks(tick_marks)
-                ax.set_yticks(tick_marks)
-                ax.set_xticklabels(class_names)
-                ax.set_yticklabels(class_names)
-
-                thresh = cm.max() * 0.65
-                for i in range(cm.shape[0]):
-                    for j in range(cm.shape[1]):
-                        count = cm[i, j]
-                        pct_all = (count / total_examples) * 100.0
-                        pct_row = (count / row_sums[i]) * 100.0 if row_sums[i] > 0 else 0.0
-                        ax.text(
-                            j, i, f'{count}\n{pct_all:.1f}% total\n{pct_row:.1f}% row',
-                            ha="center", va="center",
-                            color="white" if cm[i, j] > thresh else "black",
-                            fontsize=10, fontweight='bold'
-                        )
-
-                ax.set_ylabel('True Label', fontsize=12)
-                ax.set_xlabel('Predicted Label', fontsize=12)
-                ax.set_title('Test Set Confusion Matrix', fontsize=14, fontweight='bold')
-                plt.colorbar(im, ax=ax, label='Count')
-
-                output_path = Path("/tmp/confusion_matrix.png")
-                fig.savefig(str(output_path), dpi=100, bbox_inches='tight')
-                print(f"Confusion matrix saved to {output_path}")
-                plt.close(fig)
+                plot_confusion_matrix(
+                    model=model,
+                    test_loader=rc_only_loader,
+                    device=device,
+                    output_path=output_dir / "confusion_matrix_rc_only.png",
+                )
             except Exception as e:
-                print(f"Could not generate confusion matrix: {e}")
+                print(f"Could not generate RC confusion matrices: {e}")
 
         # Per-subtype metrics
         per_subtype_metrics = evaluate_per_subtype(

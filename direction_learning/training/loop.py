@@ -26,6 +26,7 @@ def train_one_epoch(
     optimizer: Any,
     loss_fn: Any,
     device: Any,
+    label_smoothing: float = 0.0,
 ) -> float:
     """Train model for one epoch on all batches from loader.
     
@@ -47,7 +48,11 @@ def train_one_epoch(
         batch = {key: value.to(device) for key, value in batch.items()}
         optimizer.zero_grad(set_to_none=True)
         logits = model(batch)
-        loss = loss_fn(logits, batch["label"])
+        labels = batch["label"]
+        if label_smoothing and label_smoothing > 0.0:
+            eps = float(label_smoothing)
+            labels = labels * (1.0 - eps) + (eps / 2.0)
+        loss = loss_fn(logits, labels)
         loss.backward()
         optimizer.step()
         total_loss += float(loss.item()) * batch["label"].shape[0]
@@ -60,6 +65,7 @@ def evaluate(
     loader: Any,
     loss_fn: Any,
     device: Any,
+    label_smoothing: float = 0.0,
 ) -> dict[str, float]:
     """Evaluate model on all batches without gradient updates.
     
@@ -83,7 +89,13 @@ def evaluate(
         for batch in loader:
             batch = {key: value.to(device) for key, value in batch.items()}
             logits = model(batch)
-            loss = loss_fn(logits, batch["label"])
+            labels = batch["label"]
+            if label_smoothing and label_smoothing > 0.0:
+                eps = float(label_smoothing)
+                labels_for_loss = labels * (1.0 - eps) + (eps / 2.0)
+            else:
+                labels_for_loss = labels
+            loss = loss_fn(logits, labels_for_loss)
             probs = torch.sigmoid(logits)
             predictions = (probs >= 0.5).long()
             correct += int((predictions == batch["label"].long()).sum().item())
