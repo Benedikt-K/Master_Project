@@ -48,7 +48,7 @@ plot_array_length_statistics = _visualization.plot_array_length_statistics
 plot_subtype_length_statistics = _visualization.plot_subtype_length_statistics
 plot_split_spacer_similarity_statistics = _visualization.plot_split_spacer_similarity_statistics
 plot_subtype_split_spacer_similarity_statistics = _visualization.plot_subtype_split_spacer_similarity_statistics
-#plot_spacer_similarity_statistics = _visualization.plot_spacer_similarity_statistics
+plot_spacer_similarity_statistics = _visualization.plot_spacer_similarity_statistics
 plot_augmented_spacer_deletion_statistics = _visualization.plot_augmented_spacer_deletion_statistics
 plot_confusion_matrix = _visualization.plot_confusion_matrix
 plot_training_curves = _visualization.plot_training_curves
@@ -169,6 +169,17 @@ def main() -> int:
             "  before: Add reverse complements before subarray augmentation; augment all including RC examples.\n"
             "  after: Apply subarray augmentation first, then add reverse complements of all resulting arrays.\n"
             "  initial_only: Apply subarray augmentation, then add reverse complements only of the initial (non-augmented) arrays."
+        ),
+    )
+    parser.add_argument(
+        "--plot",
+        nargs="?",
+        const="all",
+        default="none",
+        choices=["none", "all", "no_similarity"],
+        help=(
+            "Control plotting output. Omit the flag to disable plots entirely, use --plot to generate all plots, "
+            "or use --plot no_similarity to skip the similarity-heavy plots."
         ),
     )
     parser.add_argument(
@@ -826,78 +837,83 @@ def main() -> int:
     if augmentation_started_at is not None:
         augmentation_elapsed = time.perf_counter() - augmentation_started_at
 
+    do_plots = getattr(args, "plot", "none") != "none"
+    plot_similarity = getattr(args, "plot", "none") == "all"
+
     original_indices = list(range(base_len))
     augmented_indices = list(range(base_len, len(base_dataset.records)))
-    plot_array_length_statistics(
-        records=base_dataset.records,
-        indices=original_indices,
-        title="Original dataset length statistics",
-        output_path=output_dir / "original_dataset_length_stats.png",
-    )
-    plot_subtype_length_statistics(
-        records=base_dataset.records,
-        indices=original_indices,
-        title="Original dataset length statistics by subtype",
-        output_path=output_dir / "original_dataset_length_stats_by_subtype.png",
-        min_arrays=args.vis_min_arrays,
-        reference_indices=test_indices if test_indices else None,
-    )
-    """plot_spacer_similarity_statistics(
-        records=base_dataset.records,
-        indices=original_indices,
-        title="Original dataset spacer similarity by subtype",
-        output_path=output_dir / "original_dataset_spacer_similarity_by_subtype.png",
-        min_arrays=args.vis_min_arrays,
-        reference_indices=test_indices if test_indices else None,
-    )"""
-    plot_array_length_statistics(
-        records=base_dataset.records,
-        indices=augmented_indices,
-        title="Augmented array length statistics",
-        output_path=output_dir / "augmented_array_length_stats.png",
-    )
-    plot_subtype_length_statistics(
-        records=base_dataset.records,
-        indices=augmented_indices,
-        title="Augmented array length statistics by subtype",
-        output_path=output_dir / "augmented_array_length_stats_by_subtype.png",
-        min_arrays=args.vis_min_arrays,
-        reference_indices=test_indices if test_indices else None,
-    )
-    """plot_spacer_similarity_statistics(
-        records=base_dataset.records,
-        indices=augmented_indices,
-        title="Augmented dataset spacer similarity by subtype",
-        output_path=output_dir / "augmented_dataset_spacer_similarity_by_subtype.png",
-        min_arrays=args.vis_min_arrays,
-        reference_indices=test_indices if test_indices else None,
-    )"""
-    plot_augmented_spacer_deletion_statistics(
-        records=base_dataset.records,
-        indices=augmented_indices,
-        title="Augmented spacer deletion fraction by subtype",
-        output_path=output_dir / "augmented_spacer_deletion_fraction_by_subtype.png",
-        min_arrays=args.vis_min_arrays,
-        reference_indices=test_indices if test_indices else None,
-    )
-    plot_split_spacer_similarity_statistics(
-        records=base_dataset.records,
-        train_indices=train_indices,
-        val_indices=val_indices,
-        test_indices=test_indices,
-        title="Train/val/test spacer similarity after augmentation",
-        output_path=output_dir / "split_spacer_similarity_after_augmentation.png",
-    )
-    plot_subtype_split_spacer_similarity_statistics(
-        records=base_dataset.records,
-        train_indices=train_indices,
-        val_indices=val_indices,
-        test_indices=test_indices,
-        title="Per-subtype train/val/test spacer similarity after augmentation",
-        output_dir=output_dir,
-        min_arrays=args.vis_min_arrays,
-        reference_indices=test_indices if test_indices else None,
-    )
+    if do_plots:
+        plot_array_length_statistics(
+            records=base_dataset.records,
+            indices=original_indices,
+            title="Original dataset length statistics",
+            output_path=output_dir / "original_dataset_length_stats.png",
+        )
+        plot_subtype_length_statistics(
+            records=base_dataset.records,
+            indices=original_indices,
+            title="Original dataset length statistics by subtype",
+            output_path=output_dir / "original_dataset_length_stats_by_subtype.png",
+            min_arrays=args.vis_min_arrays,
+            reference_indices=test_indices if test_indices else None,
+        )
+        plot_array_length_statistics(
+            records=base_dataset.records,
+            indices=augmented_indices,
+            title="Augmented array length statistics",
+            output_path=output_dir / "augmented_array_length_stats.png",
+        )
+        plot_subtype_length_statistics(
+            records=base_dataset.records,
+            indices=augmented_indices,
+            title="Augmented array length statistics by subtype",
+            output_path=output_dir / "augmented_array_length_stats_by_subtype.png",
+            min_arrays=args.vis_min_arrays,
+            reference_indices=test_indices if test_indices else None,
+        )
+        plot_augmented_spacer_deletion_statistics(
+            records=base_dataset.records,
+            indices=augmented_indices,
+            title="Augmented spacer deletion fraction by subtype",
+            output_path=output_dir / "augmented_spacer_deletion_fraction_by_subtype.png",
+            min_arrays=args.vis_min_arrays,
+            reference_indices=test_indices if test_indices else None,
+        )
+        if plot_similarity:
+            plot_spacer_similarity_statistics(
+                records=base_dataset.records,
+                indices=augmented_indices,
+                title="Augmented dataset spacer similarity by subtype",
+                output_path=output_dir / "augmented_dataset_spacer_similarity_by_subtype.png",
+                min_arrays=args.vis_min_arrays,
+                reference_indices=test_indices if test_indices else None,
+            )
+            plot_spacer_similarity_statistics(
+                records=base_dataset.records,
+                indices=original_indices,
+                title="Original dataset spacer similarity by subtype",
+                output_path=output_dir / "original_dataset_spacer_similarity_by_subtype.png",
+                min_arrays=args.vis_min_arrays,
+                reference_indices=test_indices if test_indices else None,
+            )
+            plot_split_spacer_similarity_statistics(
+                records=base_dataset.records,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                test_indices=test_indices,
+                title="Train/val/test spacer similarity after augmentation",
+                output_path=output_dir / "split_spacer_similarity_after_augmentation.png",
+            )
+            plot_subtype_split_spacer_similarity_statistics(
+                records=base_dataset.records,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                test_indices=test_indices,
+                title="Per-subtype train/val/test spacer similarity after augmentation",
+                output_dir=output_dir,
+                min_arrays=args.vis_min_arrays,
+                reference_indices=test_indices if test_indices else None,
+            )
 
     # Create CNN tokenizer if requested
     cnn_tok = None
@@ -1050,6 +1066,7 @@ def main() -> int:
     train_losses = []
     val_losses = []
     test_losses = []
+    track_test_curve = do_plots and getattr(args, "plot_test_curve", False)
 
     training_started_at = time.perf_counter()
 
@@ -1060,7 +1077,7 @@ def main() -> int:
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        if getattr(args, "plot_test_curve", False) and test_loader is not None:
+        if track_test_curve and test_loader is not None:
             test_metrics_epoch = evaluate(model, test_loader, loss_fn, device, label_smoothing=args.label_smoothing)
             test_loss = test_metrics_epoch.get("loss", float("nan"))
             test_losses.append(test_loss)
@@ -1102,16 +1119,17 @@ def main() -> int:
         print("Restored best model (lowest validation loss).")
 
     # Plot training curves (module handles matplotlib availability)
-    plot_training_curves(
-        train_losses=train_losses,
-        val_losses=val_losses,
-        test_losses=(test_losses if getattr(args, "plot_test_curve", False) and test_loader is not None else None),
-        args=args,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        stratify_mode=stratify_mode,
-        output_path=output_dir / "training_curves.png",
-    )
+    if do_plots:
+        plot_training_curves(
+            train_losses=train_losses,
+            val_losses=val_losses,
+            test_losses=(test_losses if track_test_curve and test_loader is not None else None),
+            args=args,
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            stratify_mode=stratify_mode,
+            output_path=output_dir / "training_curves.png",
+        )
 
     # Test evaluation
     if test_loader is not None:
@@ -1128,11 +1146,12 @@ def main() -> int:
             f"recall={test_metrics['recall']:.4f} f1={test_metrics['f1']:.4f}"
         )
 
-        # Confusion matrix (delegated to visualization module)
-        try:
-            plot_confusion_matrix(model=model, test_loader=test_loader, device=device, output_path=output_dir / "confusion_matrix.png")
-        except Exception as e:
-            print(f"Could not generate confusion matrix: {e}")
+        if do_plots:
+            # Confusion matrix (delegated to visualization module)
+            try:
+                plot_confusion_matrix(model=model, test_loader=test_loader, device=device, output_path=output_dir / "confusion_matrix.png")
+            except Exception as e:
+                print(f"Could not generate confusion matrix: {e}")
 
         if getattr(args, "evaluate_rc_test", False):
             rc_examples = [reverse_complement_example(base_dataset.records[idx]) for idx in test_indices]
@@ -1177,21 +1196,22 @@ def main() -> int:
                 f"rc_only_f1={rc_only_metrics['f1']:.4f}"
             )
 
-            try:
-                plot_confusion_matrix(
-                    model=model,
-                    test_loader=combined_loader,
-                    device=device,
-                    output_path=output_dir / "confusion_matrix_rc_combined.png",
-                )
-                plot_confusion_matrix(
-                    model=model,
-                    test_loader=rc_only_loader,
-                    device=device,
-                    output_path=output_dir / "confusion_matrix_rc_only.png",
-                )
-            except Exception as e:
-                print(f"Could not generate RC confusion matrices: {e}")
+            if do_plots:
+                try:
+                    plot_confusion_matrix(
+                        model=model,
+                        test_loader=combined_loader,
+                        device=device,
+                        output_path=output_dir / "confusion_matrix_rc_combined.png",
+                    )
+                    plot_confusion_matrix(
+                        model=model,
+                        test_loader=rc_only_loader,
+                        device=device,
+                        output_path=output_dir / "confusion_matrix_rc_only.png",
+                    )
+                except Exception as e:
+                    print(f"Could not generate RC confusion matrices: {e}")
 
         # Per-subtype metrics
         per_subtype_metrics = evaluate_per_subtype(
