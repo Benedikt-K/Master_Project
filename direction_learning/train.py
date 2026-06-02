@@ -534,6 +534,10 @@ def main() -> int:
             f"test={(len(test_indices) if test_indices else 0)})"
         )
 
+    pre_augmentation_train_indices = list(train_indices)
+    pre_augmentation_val_indices = list(val_indices)
+    pre_augmentation_test_indices = list(test_indices)
+
     # Handle reverse-complement in "before" mode
     rc_mode = getattr(args, "reverse_complement_mode", "none")
     initial_train_indices = None
@@ -839,6 +843,8 @@ def main() -> int:
 
     do_plots = getattr(args, "plot", "none") != "none"
     plot_similarity = getattr(args, "plot", "none") == "all"
+    subtype_length_min_arrays = max(10, int(getattr(args, "vis_min_arrays", 0) or 0))
+    subtype_length_dir = output_dir / "subtype lengths"
 
     original_indices = list(range(base_len))
     augmented_indices = list(range(base_len, len(base_dataset.records)))
@@ -852,9 +858,9 @@ def main() -> int:
         plot_subtype_length_statistics(
             records=base_dataset.records,
             indices=original_indices,
-            title="Original dataset length statistics by subtype",
-            output_path=output_dir / "original_dataset_length_stats_by_subtype.png",
-            min_arrays=args.vis_min_arrays,
+            title="Original dataset spacer-count distributions by subtype",
+            output_dir=subtype_length_dir / "original",
+            min_arrays=subtype_length_min_arrays,
             reference_indices=test_indices if test_indices else None,
         )
         plot_array_length_statistics(
@@ -866,9 +872,9 @@ def main() -> int:
         plot_subtype_length_statistics(
             records=base_dataset.records,
             indices=augmented_indices,
-            title="Augmented array length statistics by subtype",
-            output_path=output_dir / "augmented_array_length_stats_by_subtype.png",
-            min_arrays=args.vis_min_arrays,
+            title="Augmented dataset spacer-count distributions by subtype",
+            output_dir=subtype_length_dir / "augmented",
+            min_arrays=subtype_length_min_arrays,
             reference_indices=test_indices if test_indices else None,
         )
         plot_augmented_spacer_deletion_statistics(
@@ -880,6 +886,16 @@ def main() -> int:
             reference_indices=test_indices if test_indices else None,
         )
         if plot_similarity:
+            plot_split_spacer_similarity_statistics(
+                records=base_dataset.records,
+                train_indices=pre_augmentation_train_indices,
+                val_indices=pre_augmentation_val_indices,
+                test_indices=pre_augmentation_test_indices,
+                title="Train/val/test spacer similarity before augmentation",
+                output_path=output_dir / "split_spacer_similarity_before_augmentation.png",
+                max_samples_per_split=2000,
+                max_pair_samples=100000,
+            )
             plot_spacer_similarity_statistics(
                 records=base_dataset.records,
                 indices=augmented_indices,
@@ -903,6 +919,16 @@ def main() -> int:
                 test_indices=test_indices,
                 title="Train/val/test spacer similarity after augmentation",
                 output_path=output_dir / "split_spacer_similarity_after_augmentation.png",
+            )
+            plot_subtype_split_spacer_similarity_statistics(
+                records=base_dataset.records,
+                train_indices=pre_augmentation_train_indices,
+                val_indices=pre_augmentation_val_indices,
+                test_indices=pre_augmentation_test_indices,
+                title="Per-subtype train/val/test spacer similarity before augmentation",
+                output_dir=output_dir / "subtype split similarity before augmentation",
+                min_arrays=args.vis_min_arrays,
+                reference_indices=test_indices if test_indices else None,
             )
             plot_subtype_split_spacer_similarity_statistics(
                 records=base_dataset.records,

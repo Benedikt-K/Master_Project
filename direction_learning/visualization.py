@@ -11,6 +11,7 @@ from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Iterable
+import re
 
 def _ensure_matplotlib():
     try:
@@ -188,6 +189,12 @@ def _format_stats(values: Sequence[int]) -> str:
     return f"n={len(values)}\nmin={minimum}\nmax={maximum}\navg={average:.2f}"
 
 
+def _safe_filename_component(text: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
+
+
 def _plot_length_histogram(ax, values: Sequence[int], title: str, xlabel: str, color: str) -> None:
     if not values:
         ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes)
@@ -209,6 +216,49 @@ def _plot_length_histogram(ax, values: Sequence[int], title: str, xlabel: str, c
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count")
+    ax.legend(fontsize=9)
+    ax.text(
+        0.98,
+        0.97,
+        _format_stats(values),
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        family="monospace",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
+
+
+def _plot_discrete_histogram(ax, values: Sequence[int], title: str, xlabel: str, color: str) -> None:
+    if not values:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Count")
+        ax.set_axis_off()
+        return
+
+    minimum = min(values)
+    maximum = max(values)
+    average = sum(values) / len(values)
+    bins = list(range(minimum, maximum + 2))
+    ax.hist(values, bins=bins, color=color, alpha=0.88, edgecolor="white", rwidth=0.9)
+    try:
+        from matplotlib.ticker import MaxNLocator
+
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
+    except Exception:
+        ax.set_xticks(list(range(minimum, maximum + 1, max(1, (maximum - minimum) // 10 or 1))))
+    ax.set_xlim(minimum - 0.5, maximum + 0.5)
+    ax.axvline(minimum, color="#0f172a", linestyle=":", linewidth=2, label=f"min={minimum}")
+    ax.axvline(average, color="#dc2626", linestyle="--", linewidth=2, label=f"avg={average:.2f}")
+    ax.axvline(maximum, color="#0f172a", linestyle="-.", linewidth=2, label=f"max={maximum}")
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Count")
+    ax.tick_params(axis="x", labelrotation=0, labelsize=9)
+    ax.grid(True, axis="y", alpha=0.25)
     ax.legend(fontsize=9)
     ax.text(
         0.98,
@@ -258,14 +308,14 @@ def plot_subtype_length_statistics(
     records: Sequence[object],
     indices: Sequence[int],
     title: str,
-    output_path: Path | str,
+    output_dir: Path | str,
     min_arrays: int = 0,
     reference_indices: Sequence[int] | None = None,
 ) -> None:
-    """Plot per-subtype spacer-count and bp-length summaries for original samples.
+    """Plot per-subtype spacer-count histograms.
 
-    Each subtype is shown even if it only occurs once. The subtype count is
-    included in the x-axis label so the plot makes class imbalance visible.
+    Only the number of spacers is considered here, not basepair length.
+    A separate PNG is written for each subtype so the charts stay readable.
     """
     plt = _ensure_matplotlib()
     if plt is None:
@@ -273,78 +323,45 @@ def plot_subtype_length_statistics(
         return
 
     grouped_spacer_counts: dict[str, list[int]] = {}
-    grouped_bp_lengths: dict[str, list[int]] = {}
 
     for index in indices:
         example = records[index]
         subtype = (getattr(example, "cas_subtype", "") or "Unknown").strip() or "Unknown"
         spacers = getattr(example, "spacers", []) or []
-        repeats = getattr(example, "repeats", []) or []
         grouped_spacer_counts.setdefault(subtype, []).append(len(spacers))
-        grouped_bp_lengths.setdefault(subtype, []).append(sum(len(sequence) for sequence in spacers) + sum(len(sequence) for sequence in repeats))
 
     reference_counts = _subtype_counts(records, reference_indices) if reference_indices is not None else None
     grouped_spacer_counts, skipped = _filter_subtypes_by_min_arrays(grouped_spacer_counts, min_arrays, reference_counts)
-    grouped_bp_lengths = {subtype: grouped_bp_lengths[subtype] for subtype in grouped_spacer_counts.keys()}
 
     if skipped:
         print(f"Subtype length statistics: skipped subtypes below min_arrays={min_arrays}: {skipped}")
 
+    if not grouped_spacer_counts:
+        print(f"Subtype length statistics: no subtypes met the min_arrays={min_arrays} threshold for {title}.")
+        return
+
     subtype_order = sorted(grouped_spacer_counts.keys(), key=lambda key: (-len(grouped_spacer_counts[key]), key))
-    labels = [f"{subtype}\nn={len(grouped_spacer_counts[subtype])}" for subtype in subtype_order]
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _subplot(ax, grouped_values: dict[str, list[int]], metric_title: str, ylabel: str, color: str) -> None:
-        values = [grouped_values[subtype] for subtype in subtype_order]
-        box = ax.boxplot(values, labels=labels, showmeans=True, patch_artist=True)
-        for patch in box["boxes"]:
-            patch.set_facecolor(color)
-            patch.set_alpha(0.75)
-        for median in box["medians"]:
-            median.set_color("#111827")
-            median.set_linewidth(2)
-        for mean in box["means"]:
-            mean.set_marker("o")
-            mean.set_markerfacecolor("white")
-            mean.set_markeredgecolor("#111827")
-            mean.set_markersize(5)
-
-        ax.set_title(metric_title)
-        ax.set_ylabel(ylabel)
-        ax.grid(True, axis="y", alpha=0.3)
-        ax.tick_params(axis="x", labelrotation=30)
-
-        global_max = max(max(item) for item in values if item)
-        y_offset = max(0.5, global_max * 0.06)
-        for position, subtype in enumerate(subtype_order, start=1):
-            subtype_values = grouped_values[subtype]
-            minimum = min(subtype_values)
-            maximum = max(subtype_values)
-            average = sum(subtype_values) / len(subtype_values)
-            ax.text(
-                position,
-                maximum + y_offset,
-                f"min={minimum}\nmax={maximum}\navg={average:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                rotation=0,
-                bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
-            )
-
-        ax.set_ylim(top=global_max + y_offset * 5)
-
-    fig, axes = plt.subplots(2, 1, figsize=(max(14, 1.2 * len(subtype_order) + 6), 12))
-    _subplot(axes[0], grouped_spacer_counts, "Spacer count per subtype", "Number of spacers", "#60a5fa")
-    _subplot(axes[1], grouped_bp_lengths, "Array length in bp per subtype", "Total bp (spacers + repeats)", "#34d399")
-    fig.suptitle(title, fontsize=15, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-    output_path = Path(output_path)
-    fig.savefig(str(output_path), dpi=100, bbox_inches="tight")
     subtype_counts = Counter((getattr(records[index], "cas_subtype", "") or "Unknown").strip() or "Unknown" for index in indices)
-    print(f"Subtype length statistics saved to {output_path}")
+    print(f"Subtype length statistics: saving per-subtype spacer-count histograms to {output_dir}")
     print(f"  subtype_counts={dict(sorted(subtype_counts.items(), key=lambda kv: kv[0]))}")
-    plt.close(fig)
+
+    for subtype in subtype_order:
+        values = grouped_spacer_counts[subtype]
+        subtype_file = output_dir / f"{_safe_filename_component(subtype)}.png"
+        fig, ax = plt.subplots(figsize=(7.5, 5.5), constrained_layout=True)
+        _plot_discrete_histogram(
+            ax,
+            values,
+            f"{title}: {subtype}",
+            "Number of spacers per array",
+            "#60a5fa",
+        )
+        fig.savefig(str(subtype_file), dpi=180, bbox_inches="tight", pad_inches=0.12)
+        print(f"  saved {subtype_file} (n={len(values)})")
+        plt.close(fig)
 
 
 def plot_spacer_similarity_statistics(
