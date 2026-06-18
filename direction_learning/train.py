@@ -358,10 +358,10 @@ def main() -> int:
     parser.add_argument(
         "--vis_min_arrays",
         type=int,
-        default=0,
+        default=10,
         help=(
             "Minimum number of arrays a subtype must have in the plotted split before it is shown in the subtype comparison plots. "
-            "Default 0 shows all subtypes."
+            "Default 10."
         ),
     )
     parser.add_argument("--enable_cls_token", action="store_true", help="Enable learned CLS token prepended to spacer sequence (default: off)")
@@ -843,7 +843,7 @@ def main() -> int:
 
     do_plots = getattr(args, "plot", "none") != "none"
     plot_similarity = getattr(args, "plot", "none") == "all"
-    subtype_length_min_arrays = max(10, int(getattr(args, "vis_min_arrays", 0) or 0))
+    subtype_length_min_arrays = int(getattr(args, "vis_min_arrays", 10) or 10)
     subtype_length_dir = output_dir / "subtype lengths"
 
     original_indices = list(range(base_len))
@@ -893,8 +893,8 @@ def main() -> int:
                 test_indices=pre_augmentation_test_indices,
                 title="Train/val/test spacer similarity before augmentation",
                 output_path=output_dir / "split_spacer_similarity_before_augmentation.png",
-                max_samples_per_split=2000,
-                max_pair_samples=100000,
+                max_samples_per_split=0,
+                max_pair_samples=0,
             )
             plot_spacer_similarity_statistics(
                 records=base_dataset.records,
@@ -911,6 +911,9 @@ def main() -> int:
                 output_path=output_dir / "original_dataset_spacer_similarity_by_subtype.png",
                 min_arrays=args.vis_min_arrays,
                 reference_indices=test_indices if test_indices else None,
+                # Uncapped: allow all samples and all pairwise comparisons for the original dataset
+                max_samples_per_subtype=0,
+                max_pair_samples=0,
             )
             plot_split_spacer_similarity_statistics(
                 records=base_dataset.records,

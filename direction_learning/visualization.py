@@ -60,6 +60,10 @@ def _pairwise_spacer_similarities(records: Sequence[object], indices: Sequence[i
 
 
 def _sample_indices(indices: Sequence[int], max_samples: int, rng: random.Random) -> list[int]:
+    """
+    Return a random sample of indices up to the specified maximum. 
+    If max_samples is zero or non-positive or exceeds the number of available indices, returns all indices.
+    """
     if max_samples <= 0 or len(indices) <= max_samples:
         return list(indices)
     return rng.sample(list(indices), max_samples)

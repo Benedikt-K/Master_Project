@@ -16,3 +16,13 @@ __pycache__/
 extraced_arrays.txt
 *.sh
 *.json
+
+# ignore generated images
+*.png
+*.html
+
+# ignore run notes
+*.txt
+
+# ignore model checkpoints
+*.pt
