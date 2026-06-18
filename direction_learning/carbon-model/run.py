@@ -674,8 +674,10 @@ def main() -> int:
 		
 		epoch_end = time.time()
 		epoch_duration = epoch_end - epoch_start
+		epoch_duration_minutes = epoch_duration // 60
+		epoch_duration_seconds = epoch_duration % 60
 
-		print(f"Epoch {epoch:02d} | time={epoch_duration:.2f}s | train_loss={train_loss:.4f} | val={_format_metrics(val_metrics)}")
+		print(f"Epoch {epoch:02d} | time={epoch_duration_minutes:.2f}min:{epoch_duration_seconds:.2f}s | train_loss={train_loss:.4f} | val={_format_metrics(val_metrics)}")
 
 		if current_metric > best_val_metric:
 			best_val_metric = current_metric
