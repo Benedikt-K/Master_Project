@@ -13,6 +13,10 @@ from pathlib import Path
 from importlib import import_module
 from typing import Any
 from dataclasses import replace
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    matthews_corrcoef, roc_auc_score, confusion_matrix,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -221,32 +225,25 @@ def _binary_auc(labels: list[int], scores: list[float]) -> float:
 	return (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
 
 
-def _classification_metrics(labels: list[int], scores: list[float], threshold: float = 0.5) -> dict[str, float]:
-	predictions = [1 if score >= threshold else 0 for score in scores]
-	tp = sum(1 for label, pred in zip(labels, predictions) if label == 1 and pred == 1)
-	tn = sum(1 for label, pred in zip(labels, predictions) if label == 0 and pred == 0)
-	fp = sum(1 for label, pred in zip(labels, predictions) if label == 0 and pred == 1)
-	fn = sum(1 for label, pred in zip(labels, predictions) if label == 1 and pred == 0)
+def _classification_metrics(labels, scores, threshold: float = 0.5) -> dict[str, float]:
+    predictions = [1 if s >= threshold else 0 for s in scores]
 
-	accuracy = _safe_divide(tp + tn, len(labels))
-	precision = _safe_divide(tp, tp + fp)
-	recall = _safe_divide(tp, tp + fn)
-	f1 = _safe_divide(2.0 * precision * recall, precision + recall)
-	mcc_denominator = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-	mcc = _safe_divide((tp * tn) - (fp * fn), mcc_denominator)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
 
-	return {
-		"accuracy": accuracy,
-		"precision": precision,
-		"recall": recall,
-		"f1": f1,
-		"mcc": mcc,
-		"auroc": _binary_auc(labels, scores),
-		"tp": float(tp),
-		"tn": float(tn),
-		"fp": float(fp),
-		"fn": float(fn),
-	}
+    try:
+        auroc = roc_auc_score(labels, scores)
+    except ValueError:
+        auroc = float("nan")  # only one class present in this split/batch
+
+    return {
+        "accuracy": accuracy_score(labels, predictions),
+        "precision": precision_score(labels, predictions, zero_division=0),
+        "recall": recall_score(labels, predictions, zero_division=0),
+        "f1": f1_score(labels, predictions, zero_division=0),
+        "mcc": matthews_corrcoef(labels, predictions),
+        "auroc": auroc,
+        "tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn),
+    }
 
 
 def _print_split_summary(name: str, examples: list[DirectionExample]) -> None:
