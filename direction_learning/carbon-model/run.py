@@ -274,6 +274,36 @@ def _build_splits(
 		seed=seed,
 		stratify_mode=stratify_mode,
 	)
+
+	# --- sanity check: verify splits don't leak indices into each other ---
+	train_set, val_set, test_set = set(train_indices), set(val_indices), set(test_indices)
+	train_val_overlap = train_set & val_set
+	train_test_overlap = train_set & test_set
+	val_test_overlap = val_set & test_set
+ 
+	print(
+		f"[split check] sizes: train={len(train_indices)} val={len(val_indices)} test={len(test_indices)} "
+		f"total={len(train_indices) + len(val_indices) + len(test_indices)} | dataset size={len(examples)}"
+	)
+	print(
+		f"[split check] duplicates within a split: "
+		f"train={len(train_indices) - len(train_set)} val={len(val_indices) - len(val_set)} test={len(test_indices) - len(test_set)}"
+	)
+	print(
+		f"[split check] overlap counts: train&val={len(train_val_overlap)} "
+		f"train&test={len(train_test_overlap)} val&test={len(val_test_overlap)}"
+	)
+	if train_val_overlap or train_test_overlap or val_test_overlap:
+		print(f"[split check] OVERLAPPING INDICES train&val={sorted(train_val_overlap)[:20]} "
+			  f"train&test={sorted(train_test_overlap)[:20]} val&test={sorted(val_test_overlap)[:20]}")
+		raise ValueError("Index leakage detected between splits — train/val/test sets are not disjoint.")
+ 
+	all_covered = train_set | val_set | test_set
+	missing = set(range(len(examples))) - all_covered
+	if missing:
+		print(f"[split check] WARNING: {len(missing)} dataset indices not assigned to any split (e.g. {sorted(missing)[:10]})")
+	# --- end sanity check ---
+
 	return {"train": train_indices, "val": val_indices, "test": test_indices}
 
 
@@ -492,33 +522,30 @@ def main() -> int:
 	print(dataset.records[0])
 
 	
-	# test for memorization due to foundation model having seen all data and only remembering
+		# test for memorization due to foundation model having seen all data and only remembering
 	if args.shuffle_labels:
-		dataset_shuffeled = dataset.records.copy()
-		dataset_shuffeled["id2label"] = np.random.permutation(dataset_shuffeled["id2label"].values)
-		dataset = dataset_shuffeled
-		print("shuffeled labels randomly")
 		# --- MEMORIZATION TEST: randomize labels ---
 		labels = [r.label for r in dataset.records]
 		print(f"Before shuffle - first 10 labels: {labels[:10]}")
 		print(f"Before shuffle - label distribution: {sum(labels)} forward, {len(labels)-sum(labels)} reverse")
-
+ 
 		labels = [r.label for r in dataset.records]
 		random.shuffle(labels)
 		dataset.records = [replace(r, label=new_label) for r, new_label in zip(dataset.records, labels)]
-
+ 
 		labels_after = [r.label for r in dataset.records]
 		print(f"After shuffle  - first 10 labels: {labels_after[:10]}")
 		print(f"After shuffle  - label distribution: {sum(labels_after)} forward, {len(labels_after)-sum(labels_after)} reverse")
-
+ 
 		print(f"Shuffled labels randomly. Sample check: {dataset.records[0].label}, {dataset.records[1].label}")
-
+ 
 		mismatches = sum(
 			1 for r in dataset.records
 			if (r.label == 1) != (r.evor_direction == "Forward")
 		)
 		print(f"Label/direction mismatches: {mismatches}/{len(dataset.records)} (should be ~50% if shuffled correctly)")
 		# ------------------------------------------
+
 	
 
 	splits = _build_splits(dataset.records, seed=args.seed, test_fraction=args.test_fraction, stratify_mode=args.stratify_mode)
