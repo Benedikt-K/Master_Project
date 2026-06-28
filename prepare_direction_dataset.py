@@ -142,6 +142,7 @@ def reverse_complement_array(record: dict[str, Any]) -> dict[str, Any]:
     # RC example must carry the opposite class of the native orientation.
     flipped["label"] = 1 - int(record["label"])
     flipped["source_variant"] = record["orientation_variant"]
+    flipped["evor_direction"] = "Reverse" if record["evor_direction"] == "Forward" else "Forward"
     return flipped
 
 
@@ -198,10 +199,15 @@ def summarize_collapse(records: list[dict[str, Any]]) -> tuple[
     dict[str, int],
     list[dict[str, Any]],
 ]:
-    """Summarize duplicate collapse impact by cas_subtype."""
-    signature_to_records: dict[tuple[tuple[str, ...], tuple[str, ...]], list[dict[str, Any]]] = {}
+    """Summarize duplicate collapse impact by cas_subtype.
+
+    Groups by EXACT spacer tuple only (no repeats, no RC-matching).
+    This only catches true copy-paste duplicates within the same
+    orientation -- a native record and its reverse complement have
+    different spacer tuples and are NOT touched here."""
+    signature_to_records: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     for record in records:
-        signature = (tuple(record["spacers"]), tuple(record["repeats"]))
+        signature = tuple(record["spacers"])
         signature_to_records.setdefault(signature, []).append(record)
 
     pre_counts = Counter(str(record.get("cas_subtype", "") or "Unknown") for record in records)
@@ -228,6 +234,66 @@ def summarize_collapse(records: list[dict[str, Any]]) -> tuple[
             )
 
     return dict(sorted(pre_counts.items(), key=lambda kv: kv[0])), dict(sorted(post_counts.items(), key=lambda kv: kv[0])), dict(sorted(removed_counts.items(), key=lambda kv: kv[0])), cross_subtype_groups
+
+def audit_rc_pairing(records: list[dict[str, Any]]) -> None:
+    """Diagnostic only -- does not remove anything. Flags loci where BOTH
+    orientations already exist as separate records BEFORE this script's own
+    RC augmentation runs (e.g. the same array submitted under both
+    orientation calls in different genome assemblies). Worth inspecting,
+    but these are not duplicates in the sense collapse_records handles."""
+    sig_set = {tuple(r["spacers"]) for r in records}
+    seen_pairs: set[frozenset] = set()
+    examples: list[tuple[str, Any]] = []
+
+    for record in records:
+        spacers = tuple(record["spacers"])
+        if not spacers:
+            continue
+        rc = tuple(reverse_complement(s) for s in reversed(spacers))
+        if rc in sig_set and rc != spacers:
+            pair_key = frozenset((spacers, rc))
+            if pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                if len(examples) < 5:
+                    examples.append((record.get("array_name", ""), record.get("label")))
+
+    print(f"Accidental native RC pairs found (both orientations already present pre-augmentation): {len(seen_pairs)}")
+    if examples:
+        print(f"  Sample array_names involved: {examples}")
+
+def collapse_records(records: list[dict[str, Any]], audit_rc: bool = True) -> list[dict[str, Any]]:
+    """Collapse EXACT spacer-tuple duplicates (same orientation, same
+    content appearing more than once) into a single record each.
+
+    Does NOT merge a record with its reverse complement -- those are
+    intentionally kept as separate, distinct records."""
+    pre_counts, post_counts, removed_counts, cross_subtype_groups = summarize_collapse(records)
+
+    signature_to_record: dict[tuple[str, ...], dict[str, Any]] = {}
+    for record in records:
+        sig = tuple(record["spacers"])
+        if sig not in signature_to_record:
+            signature_to_record[sig] = record
+    collapsed = list(signature_to_record.values())
+
+    total_collapsed = sum(removed_counts.values())
+    print(f"Collapsed {total_collapsed} duplicate records (by exact spacer signature)")
+    print(f"Subtype counts before collapse: {pre_counts}")
+    print(f"Subtype counts after collapse:  {post_counts}")
+    print(f"Subtype counts removed by collapse: {removed_counts}")
+    print(f"Collapsed signatures spanning multiple CRISPR types: {len(cross_subtype_groups)}")
+    if cross_subtype_groups:
+        print("Examples of cross-subtype collapsed signatures:")
+        for entry in cross_subtype_groups[:10]:
+            print(
+                f"  canonical={entry['canonical_subtype']} collapsed_total={entry['collapsed_total']} "
+                f"subtypes={entry['subtype_counts']}"
+            )
+
+    if audit_rc:
+        audit_rc_pairing(records)
+
+    return collapsed
 
 
 def main() -> int:
@@ -273,6 +339,15 @@ def main() -> int:
         action="store_true",
         help="Collapse exact spacer/repeat duplicates into single canonical records",
     )
+    parser.add_argument(
+        "--collapse_before_rc",
+        action="store_true",
+        help=(
+            "Collapse duplicates among native records BEFORE generating "
+            "reverse-complement augmentations, instead of the default "
+            "behavior of collapsing after RC records are added."
+        ),
+    )
     args = parser.parse_args()
 
     curated_tsv = Path(args.curated_tsv)
@@ -304,44 +379,44 @@ def main() -> int:
     written = 0
     skipped = 0
 
-    # Build all records first
-    all_records: list[dict[str, Any]] = []
+    # Build native records first
+    native_records: list[dict[str, Any]] = []
     for row in filtered_rows:
         try:
             base_record = build_example(row, include_flanks=args.include_flanks)
-            all_records.append(base_record)
-
-            if not args.no_augmentation:
-                rc_record = reverse_complement_array(base_record)
-                all_records.append(rc_record)
+            native_records.append(base_record)
         except Exception as exc:
             skipped += 1
             print(f"WARNING: skipping {row.get('array_name', '<unknown>')}: {exc}", file=sys.stderr)
 
-    # Optionally collapse duplicates by (spacers, repeats) signature
-    if args.collapse_duplicates:
-        pre_counts, post_counts, removed_counts, cross_subtype_groups = summarize_collapse(all_records)
+    print("=== Collapsing NATIVE records before RC augmentation ===")
+    native_records = collapse_records(native_records)
+    if args.collapse_duplicates and args.collapse_before_rc:
+        # NEW ORDER: collapse native duplicates first, then RC the survivors.
+        # No second collapse pass here on purpose: every native survivor gets
+        # exactly one RC partner with the flipped label, so this preserves an
+        # exact 50/50 label split. A second collapse pass after RC would be
+        # asymmetric (it could remove one half of a native/RC pair without
+        # removing its partner) and silently break that balance.
+        
+        all_records: list[dict[str, Any]] = []
+        for base_record in native_records:
+            all_records.append(base_record)
+            if not args.no_augmentation:
+                rc_record = reverse_complement_array(base_record)
+                all_records.append(rc_record)
 
-        signature_to_record: dict[tuple, dict[str, Any]] = {}
-        for record in all_records:
-            sig = (tuple(record["spacers"]), tuple(record["repeats"]))
-            if sig not in signature_to_record:
-                signature_to_record[sig] = record
-        all_records = list(signature_to_record.values())
+    else:
+        # ORIGINAL ORDER: build native + RC together, then collapse once at the end.
+        all_records = []
+        for base_record in native_records:
+            all_records.append(base_record)
+            if not args.no_augmentation:
+                rc_record = reverse_complement_array(base_record)
+                all_records.append(rc_record)
 
-        total_collapsed = sum(removed_counts.values())
-        print(f"Collapsed {total_collapsed} duplicate records (by spacer/repeat signature)")
-        print(f"Subtype counts before collapse: {pre_counts}")
-        print(f"Subtype counts after collapse:  {post_counts}")
-        print(f"Subtype counts removed by collapse: {removed_counts}")
-        print(f"Collapsed signatures spanning multiple CRISPR types: {len(cross_subtype_groups)}")
-        if cross_subtype_groups:
-            print("Examples of cross-subtype collapsed signatures:")
-            for entry in cross_subtype_groups[:10]:
-                print(
-                    f"  canonical={entry['canonical_subtype']} collapsed_total={entry['collapsed_total']} "
-                    f"subtypes={entry['subtype_counts']}"
-                )
+        if args.collapse_duplicates:
+            all_records = collapse_records(all_records, audit_rc=False)
 
     final_label_counts = Counter(record["evor_direction"] for record in all_records)
 
@@ -361,6 +436,7 @@ def main() -> int:
     print(f"Include flanks: {parse_bool(args.include_flanks)}")
     print(f"Augmentation enabled: {not args.no_augmentation}")
     print(f"Collapse duplicates: {args.collapse_duplicates}")
+    print(f"Collapse before RC: {args.collapse_before_rc}")
 
     return 0
 
