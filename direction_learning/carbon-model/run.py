@@ -6,11 +6,13 @@ import math
 import random
 import sys
 import time
+import numpy as np
 from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from importlib import import_module
 from typing import Any
+from dataclasses import replace
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -469,6 +471,7 @@ def main() -> int:
 	parser.add_argument("--cpu", action="store_true")
 	parser.add_argument("--bf16", action="store_true", help="Use bfloat16 on CUDA when available.")
 	parser.add_argument("--dry_run", action="store_true", help="Load the model and run a single forward pass, then exit.")
+	parser.add_argument("--shuffle_labels", action="store_true", help="Randomly shuffle labels as a control to test for memorization.")
 
 	args = parser.parse_args()
 	_require_runtime()
@@ -489,6 +492,37 @@ def main() -> int:
 	dataset = DirectionJsonlDataset(dataset_path, include_flanks=args.include_flanks)
 	if len(dataset) == 0:
 		raise ValueError("The dataset is empty.")
+	print(dataset.records[0])
+
+	
+	# test for memorization due to foundation model having seen all data and only remembering
+	if args.shuffle_labels:
+		dataset_shuffeled = dataset.records.copy()
+		dataset_shuffeled["id2label"] = np.random.permutation(dataset_shuffeled["id2label"].values)
+		dataset = dataset_shuffeled
+		print("shuffeled labels randomly")
+		# --- MEMORIZATION TEST: randomize labels ---
+		labels = [r.label for r in dataset.records]
+		print(f"Before shuffle - first 10 labels: {labels[:10]}")
+		print(f"Before shuffle - label distribution: {sum(labels)} forward, {len(labels)-sum(labels)} reverse")
+
+		labels = [r.label for r in dataset.records]
+		random.shuffle(labels)
+		dataset.records = [replace(r, label=new_label) for r, new_label in zip(dataset.records, labels)]
+
+		labels_after = [r.label for r in dataset.records]
+		print(f"After shuffle  - first 10 labels: {labels_after[:10]}")
+		print(f"After shuffle  - label distribution: {sum(labels_after)} forward, {len(labels_after)-sum(labels_after)} reverse")
+
+		print(f"Shuffled labels randomly. Sample check: {dataset.records[0].label}, {dataset.records[1].label}")
+
+		mismatches = sum(
+			1 for r in dataset.records
+			if (r.label == 1) != (r.evor_direction == "Forward")
+		)
+		print(f"Label/direction mismatches: {mismatches}/{len(dataset.records)} (should be ~50% if shuffled correctly)")
+		# ------------------------------------------
+	
 
 	splits = _build_splits(dataset.records, seed=args.seed, test_fraction=args.test_fraction, stratify_mode=args.stratify_mode)
 	train_indices = _truncate_indices(splits["train"], args.max_train_examples)
@@ -674,8 +708,8 @@ def main() -> int:
 		
 		epoch_end = time.time()
 		epoch_duration = epoch_end - epoch_start
-		epoch_duration_minutes = epoch_duration // 60
-		epoch_duration_seconds = epoch_duration % 60
+		epoch_duration_minutes = int(epoch_duration // 60)
+		epoch_duration_seconds = int(epoch_duration % 60)
 
 		print(f"Epoch {epoch:02d} | time={epoch_duration_minutes:.2f}min:{epoch_duration_seconds:.2f}s | train_loss={train_loss:.4f} | val={_format_metrics(val_metrics)}")
 
