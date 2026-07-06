@@ -18,6 +18,12 @@ from sklearn.metrics import (
     matthews_corrcoef, roc_auc_score, confusion_matrix,
 )
 
+from direction_learning.augmentation import (
+	build_test_similarity_index,
+	example_signature,
+	materialize_subarray_augmentations,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
 	sys.path.insert(0, str(ROOT))
@@ -45,6 +51,8 @@ from direction_learning.dataset import DirectionExample, DirectionJsonlDataset
 
 DNA_SEPARATOR = "NNNNNN"
 DEFAULT_MODEL_ID = "HuggingFaceBio/Carbon-500M"
+AUGMENT_SPACER_DELETION_SIMILARITY_METRIC = "jaccard"
+AUGMENT_SPACER_DELETION_MIN_DISTANCE = 0.7
 
 
 def _require_runtime() -> None:
@@ -481,6 +489,17 @@ def main() -> int:
 	parser.add_argument("--max_train_examples", type=int, default=0)
 	parser.add_argument("--max_val_examples", type=int, default=0)
 	parser.add_argument("--max_test_examples", type=int, default=0)
+	parser.add_argument(
+		"--augment_spacer_deletion",
+		action="store_true",
+		help="If set, materialize spacer-deletion augmentations for the training split.",
+	)
+	parser.add_argument(
+		"--augment_spacer_deletion_count",
+		type=int,
+		default=5,
+		help="Number of spacer-deletion augmentations to add when --augment_spacer_deletion is set (default: 5).",
+	)
 	parser.add_argument("--freeze_backbone", action="store_true")
 	parser.add_argument("--use_lora", action="store_true", help="Attach LoRA adapters to the Carbon backbone.")
 	parser.add_argument("--lora_task_type", choices=["SEQ_CLS", "CAUSAL_LM"], default="SEQ_CLS")
@@ -561,6 +580,59 @@ def main() -> int:
 	_print_split_summary("train", train_examples)
 	_print_split_summary("val", val_examples)
 	_print_split_summary("test", test_examples)
+
+	augment_spacer_deletion_count = max(0, int(args.augment_spacer_deletion_count))
+	if args.augment_spacer_deletion:
+		if augment_spacer_deletion_count <= 0:
+			print("Spacer deletion augmentation requested, but the augmentation count is <= 0; skipping.")
+		else:
+			test_signatures = None
+			test_signatures_by_idx = None
+			test_token_sets = None
+			inverted_index = None
+			if test_indices:
+				test_signatures = {example_signature(dataset.records[index]) for index in test_indices}
+				test_signatures_by_idx = {
+					index: example_signature(dataset.records[index])
+					for index in test_indices
+				}
+				test_token_sets, inverted_index = build_test_similarity_index(
+					dataset.records,
+					list(test_indices),
+				)
+			else:
+				print("Spacer deletion augmentation requested, but no test split is present; similarity filtering will be skipped.")
+
+			seen_signatures = {example_signature(example) for example in dataset.records}
+			train_new_indices, train_aug_stats = materialize_subarray_augmentations(
+				base_dataset=dataset,
+				source_indices=list(train_indices),
+				seen_signatures=seen_signatures,
+				test_signatures=test_signatures,
+				test_signatures_by_idx=test_signatures_by_idx,
+				test_token_sets=test_token_sets,
+				inverted_index=inverted_index,
+				seed=args.seed,
+				mode="enumerate",
+				prob=1.0,
+				min_spacers=2,
+				max_per_array=augment_spacer_deletion_count,
+				split_name="train",
+				use_diversity=True,
+				similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
+				min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
+				target_additions=augment_spacer_deletion_count,
+				balance_per_array=True,
+			)
+			train_indices = list(train_indices) + train_new_indices
+			train_examples = [dataset.records[index] for index in train_indices]
+			print(
+				"Spacer deletion augmentation summary: "
+				f"requested={augment_spacer_deletion_count} added={train_aug_stats['added']} "
+				f"blocked_overlap={train_aug_stats['blocked_overlap']} "
+				f"blocked_similarity={train_aug_stats['blocked_similarity']} "
+				f"skipped_short={train_aug_stats['skipped_short']}"
+			)
 
 	tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
 	if tokenizer.pad_token is None:
