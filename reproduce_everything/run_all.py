@@ -36,6 +36,10 @@ try:
 except ModuleNotFoundError:
 	raise
 
+"""
+all hyperparameters are located here at the start so it is more easily reproducible
+also here are the paths to some files needed for the dataset creation
+"""
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # standard paths generated from the scripts where they are located on my computer,
