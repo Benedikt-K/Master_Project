@@ -9,7 +9,7 @@ Pipeline:
   2. For every CRISPR array, find the nearest Cas cassette by genomic distance
   3. Assign Cas type from that cassette → intermediate annotated file
   4. Join with the evOr cluster CSV (agreement filter: keep only "agree")
-  5. Write final ML-ready dataset
+  5. Write final dataset
 
 Usage:
   python build_crispr_dataset.py \
@@ -20,9 +20,10 @@ Usage:
 Outputs:
   output_dataset/intermediate_array_cas_annotations.tsv   - every array + nearest Cas type
   output_dataset/curated_dataset.tsv                      - filtered, ML-ready rows
-    output_dataset/low_evidence_analysis.tsv                - optional analysis of evidence < 4 arrays
-    output_dataset/evidence4_all_cas_links.tsv             - optional: all Cas cassettes within distance window
   output_dataset/build_report.txt                         - summary statistics
+  optional:
+  output_dataset/low_evidence_analysis.tsv                - optional analysis of evidence < 4 arrays
+  output_dataset/evidence4_all_cas_links.tsv             - optional: all Cas cassettes within distance window
 """
 
 import os
