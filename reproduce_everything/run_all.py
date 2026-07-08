@@ -232,7 +232,6 @@ def extract_region_sequences(crispr: dict[str, Any]) -> dict[str, Any]:
 """
 build one data point
 """
-# TODO delete all non essentail ones
 def build_example(row: dict[str, str], include_flanks: bool) -> dict[str, Any]:
 	json_path = Path(row["source_json"])
 	result_json = load_result_json(json_path)
@@ -487,7 +486,6 @@ def build_signature_components(examples: list[DirectionExample]) -> dict[int, li
 splitting into train/val/test
 -> splitting based on subtype and orientation label is used
 """
-# TODO check which of these are actually used, some are leftovers from original code
 def stratified_holdout_by_mode(
 	examples: list[DirectionExample],
 	seed: int,
