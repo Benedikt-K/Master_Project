@@ -87,6 +87,8 @@ bash /home/benni/ccf.sh
 
 # 3. run EvOr (in spacerplacer)
 
+-> configure spacerplacer like specified in their repo, then activate env.
+
 check for bad json files (I encountered some broken json files that then crash spacerPlacer, so remove those)
 
 ```bash
