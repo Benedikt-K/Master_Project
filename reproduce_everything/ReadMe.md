@@ -4,7 +4,7 @@ Also i have provided you with the two files I have after comparing the predictio
 -> the first one has the predictions of casfinder and adds the crispr type and the second one combines both predictions in a file, ready for processing.
 -> if you want to use them you can skip to step #5, and uncomment the paths for these at the beginning of run_all.py (line 45+46)
 
-If you want to also do the getting the predictions of both tools steps, i have provided my documentation here, But I did this now 2 months ago and it isnt much present in my memory anymore, so i have not cleaned them up properly. though i think i have documented it enough to use them, so here you go. the scripts used are located in the "scripts" subfolder here. they are supposed to be in the same folder as the results they are used for, they are only placed here in this subfolder for a better overview for you.
+If you want to also do the getting the predictions of both tools steps, i have provided my documentation here, But I did this now 2 months ago and it isnt much present in my memory anymore, so i have not cleaned them up properly. (for instance a lot of the compare-results.py script is just analyzing and printing out stats of the predictions) though i think i have documented it enough to use them, so here you go. the scripts used are located in the "scripts" subfolder here. they are supposed to be in the same folder as the results they are used for, they are only placed here in this subfolder for a better overview for you.
 
 
 # 1. download all bacterial and archea data from ncbi
@@ -28,12 +28,16 @@ split into batches:
 split -l 6000 --numeric-suffixes=1 --suffix-length=3 --additional-suffix=.txt all_accessions.txt batch_
 ```
 
-download batch (change batch name):
+download batch (change batch name for each one):
 
 ```bash
-./datasets download genome accession --inputfile batch_003.txt --include genome --dehydrated --filename batch_003.zip
-unzip batch_003.zip -d batch_003/
-./datasets rehydrate --directory batch_003/
+./datasets download genome accession --inputfile batch_001.txt --include genome --dehydrated --filename batch_001.zip
+```
+```bash
+unzip batch_001.zip -d batch_001/
+```
+```bash
+./datasets rehydrate --directory batch_001/
 ```
 
 # 2. run CRISPRCasFinder on it
@@ -87,7 +91,9 @@ check for bad json files (I encountered some broken json files that then crash s
 
 ```bash
 mkdir -p bad_json
+```
 
+```bash
 for f in $(find . -name "result.json"); do
     if ! jq empty "$f" 2>/dev/null; then
         dir=$(dirname "$f")
