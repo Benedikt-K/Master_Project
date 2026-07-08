@@ -554,6 +554,57 @@ def split_dev_pool_by_mode(
 
 
 """
+make sure that no indices are shared between train/val/test and print a report of the split
+"""
+def _print_split_overlap_report(
+	train_indices: list[int],
+	val_indices: list[int],
+	test_indices: list[int],
+	examples: list[DirectionExample],
+	max_examples: int = 10,
+) -> None:
+	all_sets = {
+		"train": set(train_indices),
+		"val": set(val_indices),
+		"test": set(test_indices),
+	}
+	counts = {
+		name: len(indices)
+		for name, indices in (("train", train_indices), ("val", val_indices), ("test", test_indices))
+	}
+	overlaps: list[tuple[str, str, set[int]]] = []
+	for left_name, left_indices in all_sets.items():
+		for right_name, right_indices in all_sets.items():
+			if left_name >= right_name:
+				continue
+			shared = left_indices & right_indices
+			if shared:
+				overlaps.append((left_name, right_name, shared))
+
+	print("Split overlap report:")
+	print(f"  train examples: {counts['train']}")
+	print(f"  val examples:   {counts['val']}")
+	print(f"  test examples:  {counts['test']}")
+	if not overlaps:
+		print("  No index overlap detected between train/val/test splits.")
+		return
+
+	print("  Overlaps detected:")
+	for left_name, right_name, shared in overlaps:
+		shared_list = sorted(shared)
+		print(f"    {left_name} ∩ {right_name}: {len(shared_list)} shared indices")
+		for index in shared_list[:max_examples]:
+			example = examples[index]
+			print(
+				f"      idx={index} array_name={example.array_name!r} "
+				f"group_name={example.group_name!r} label={example.label} "
+				f"cas_subtype={example.cas_subtype!r}"
+			)
+		if len(shared_list) > max_examples:
+			print(f"      ... {len(shared_list) - max_examples} more")
+
+
+"""
 splitting based on subtype and orientation label
 """
 def stratified_train_test_and_val_by_cas_subtype_and_label(
@@ -905,6 +956,7 @@ def train_carbon() -> None:
 	# The line above gives us the dev pool split; recover the held-out test set from the first split call.
 	dev_indices, test_indices = stratified_holdout_by_mode(dataset, seed=TRAIN_SEED, holdout_fraction=TRAIN_TEST_FRACTION, stratify_mode=TRAIN_STRATIFY_MODE)
 	train_indices, val_indices = split_dev_pool_by_mode(dataset, pool_indices=dev_indices, seed=TRAIN_SEED, stratify_mode=TRAIN_STRATIFY_MODE)
+	_print_split_overlap_report(train_indices, val_indices, test_indices, dataset)
 
 	train_examples = [dataset[index] for index in train_indices]
 	val_examples = [dataset[index] for index in val_indices]

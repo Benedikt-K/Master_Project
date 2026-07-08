@@ -46,7 +46,7 @@ TaskType = None
 get_peft_model = None
 prepare_model_for_kbit_training = None
 
-from direction_learning.data import split_dev_pool_by_mode, stratified_holdout_by_mode
+from direction_learning.data import print_split_overlap_report, split_dev_pool_by_mode, stratified_holdout_by_mode
 from direction_learning.dataset import DirectionExample, DirectionJsonlDataset
 
 DNA_SEPARATOR = "NNNNNN"
@@ -282,6 +282,7 @@ def _build_splits(
 		seed=seed,
 		stratify_mode=stratify_mode,
 	)
+	print_split_overlap_report(train_indices, val_indices, test_indices, examples)
 
 	# --- sanity check: verify splits don't leak indices into each other ---
 	train_set, val_set, test_set = set(train_indices), set(val_indices), set(test_indices)

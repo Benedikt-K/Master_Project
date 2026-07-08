@@ -27,6 +27,7 @@ from .data import (
     build_dataloader,
     split_groups,
     split_dev_pool_by_mode,
+    print_split_overlap_report,
     stratified_holdout_by_mode,
 )
 from .augmentation import (
@@ -221,6 +222,8 @@ def run_study(args: argparse.Namespace) -> int:
         train_indices = splits["train"]
         val_indices = splits["val"]
         test_indices = splits["test"]
+
+    print_split_overlap_report(train_indices, val_indices, test_indices, dataset.records)
 
     _print(
         f"Loaded dataset={jsonl_path} records={base_len} train={len(train_indices)} val={len(val_indices)} test={len(test_indices)} stratify_by={stratify_mode}"

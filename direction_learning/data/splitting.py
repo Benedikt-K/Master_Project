@@ -167,6 +167,61 @@ def split_dev_pool_by_mode(
     return sorted(train_indices), sorted(val_indices)
 
 
+def print_split_overlap_report(
+    train_indices: list[int],
+    val_indices: list[int],
+    test_indices: list[int],
+    examples: list[DirectionExample],
+    max_examples: int = 10,
+) -> None:
+    """Print a compact report for overlap across train/val/test splits.
+
+    The report shows split sizes, whether any index appears in more than one
+    split, and a few example records for each overlap pair.
+    """
+    split_sets = {
+        "train": set(train_indices),
+        "val": set(val_indices),
+        "test": set(test_indices),
+    }
+    split_sizes = {
+        "train": len(train_indices),
+        "val": len(val_indices),
+        "test": len(test_indices),
+    }
+
+    print("Split overlap report:")
+    print(f"  train examples: {split_sizes['train']}")
+    print(f"  val examples:   {split_sizes['val']}")
+    print(f"  test examples:  {split_sizes['test']}")
+
+    overlaps: list[tuple[str, str, set[int]]] = []
+    split_names = ["train", "val", "test"]
+    for i, left_name in enumerate(split_names):
+        for right_name in split_names[i + 1 :]:
+            shared = split_sets[left_name] & split_sets[right_name]
+            if shared:
+                overlaps.append((left_name, right_name, shared))
+
+    if not overlaps:
+        print("  No index overlap detected between train/val/test splits.")
+        return
+
+    print("  Overlaps detected:")
+    for left_name, right_name, shared in overlaps:
+        shared_list = sorted(shared)
+        print(f"    {left_name} ∩ {right_name}: {len(shared_list)} shared indices")
+        for index in shared_list[:max_examples]:
+            example = examples[index]
+            print(
+                f"      idx={index} array_name={example.array_name!r} "
+                f"group_name={example.group_name!r} label={example.label} "
+                f"cas_subtype={example.cas_subtype!r}"
+            )
+        if len(shared_list) > max_examples:
+            print(f"      ... {len(shared_list) - max_examples} more")
+
+
 def stratified_split_by_cas_subtype(
     examples: list[DirectionExample],
     seed: int = 13,

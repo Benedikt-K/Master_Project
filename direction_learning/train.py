@@ -31,6 +31,7 @@ from .augmentation import (
 from .data import (
     split_dev_pool_by_mode,
     stratified_holdout_by_mode,
+    print_split_overlap_report,
     stratified_train_test_and_val_by_label,
     stratified_split_by_cas_subtype,
     stratified_train_test_and_val_by_cas_subtype_and_label,
@@ -533,6 +534,8 @@ def main() -> int:
             f"(dev pool={len(dev_indices)}; train={len(train_indices)}, val={len(val_indices)}, "
             f"test={(len(test_indices) if test_indices else 0)})"
         )
+
+    print_split_overlap_report(train_indices, val_indices, test_indices, base_dataset.records)
 
     pre_augmentation_train_indices = list(train_indices)
     pre_augmentation_val_indices = list(val_indices)
