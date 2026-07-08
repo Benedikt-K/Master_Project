@@ -107,15 +107,6 @@ for f in $(find . -name "result.json"); do
 done
 ```
 
-then onyl get all of the evidence level 4 arrays (test_out here is the folder with all of the results from casfinder):
--> description of extract-arrays.py:
-Reads test_out/Result_*/result.json for all present json files in that folder
-has to be placed in the same directory as the test_out folder of CasFinder
-
-```bash
-python extract-arrays.py test_out extracted_arrays.txt 4
-```
-
 when using the native SpacerPlacer clustering, with all the data I get too large of clusters, that then crash the process, so I build my own clustering trying to copy theirs with max-size constraints (dont know if you can use the native one of them, otherwise mine is provided here as cluster_like_spacerplacer.py. this can then be run with this command, i used max-size 300 in the end.)
 --> description of cluster_like_spacerplacer.py:
 Reads test_out/Result_*/result.json for all present json files in that folder
