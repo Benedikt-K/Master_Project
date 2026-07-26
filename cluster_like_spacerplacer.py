@@ -629,35 +629,67 @@ def rescue_singletons(clusters: list[list[str]],
 # STEP 6 — ENFORCE MAX CLUSTER SIZE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def enforce_max_size(clusters: list[list[str]],
-                     spacer_map: dict[str, list[int]],
-                     max_size: int,
-                     depth: int = 0) -> list[list[str]]:
+def _child_parent_cluster_id(parent_cluster_id: str | None, child_index: int) -> str | None:
+    if parent_cluster_id is None:
+        return None
+    return f"{parent_cluster_id}__child_{child_index:02d}"
+
+
+def enforce_max_size_with_metadata(
+    clusters: list[list[str]],
+    spacer_map: dict[str, list[int]],
+    max_size: int,
+    depth: int = 0,
+    parent_cluster_ids: list[str | None] | None = None,
+) -> tuple[list[list[str]], list[dict]]:
     """
-    Recursively split clusters exceeding max_size.
-    Falls back to sequential partitioning when greedy splitting stalls.
+    Recursively split clusters exceeding max_size while retaining parent/child
+    metadata for downstream naming and traceability.
     """
     MAX_DEPTH = 5
-    result = []
-    for cluster in clusters:
+    parent_cluster_ids = parent_cluster_ids or [None] * len(clusters)
+    result_clusters: list[list[str]] = []
+    result_meta: list[dict] = []
+
+    for cluster, parent_cluster_id in zip(clusters, parent_cluster_ids):
         if len(cluster) <= max_size:
-            result.append(cluster)
+            result_clusters.append(cluster)
+            result_meta.append({
+                "parent_cluster_id": parent_cluster_id,
+                "child_index": None,
+            })
             continue
+
         if depth < MAX_DEPTH:
             sub = cluster_by_overlap(cluster, spacer_map)
             if max(len(s) for s in sub) < len(cluster):
-                result.extend(enforce_max_size(sub, spacer_map,
-                                               max_size, depth + 1))
+                child_clusters, child_meta = enforce_max_size_with_metadata(
+                    sub,
+                    spacer_map,
+                    max_size,
+                    depth + 1,
+                    parent_cluster_ids=[
+                        _child_parent_cluster_id(parent_cluster_id, child_index)
+                        for child_index in range(len(sub))
+                    ],
+                )
+                result_clusters.extend(child_clusters)
+                result_meta.extend(child_meta)
                 continue
-        # Force partition
+
         n_parts = (len(cluster) // max_size) + 1
         size = len(cluster) // n_parts
-        for i in range(n_parts):
-            part = cluster[i * size: (i + 1) * size if i < n_parts - 1
-                          else len(cluster)]
+        for child_index in range(n_parts):
+            part = cluster[child_index * size: (child_index + 1) * size if child_index < n_parts - 1
+                           else len(cluster)]
             if part:
-                result.append(part)
-    return result
+                result_clusters.append(part)
+                result_meta.append({
+                    "parent_cluster_id": _child_parent_cluster_id(parent_cluster_id, child_index),
+                    "child_index": child_index,
+                })
+
+    return result_clusters, result_meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -711,8 +743,16 @@ def write_clusters(all_clusters: list[dict],
         cluster = cluster_info["arrays"]
         origin_group = cluster_info["origin_group"]
         subgroup_index = int(cluster_info["subgroup_index"])
+        parent_cluster_id = cluster_info.get("parent_cluster_id")
+        child_index = cluster_info.get("child_index")
         origin_tag = _cluster_origin_tag(origin_group)
         cluster_id = f"orig_{origin_tag}__sub_{subgroup_index:04d}__g_{idx:06d}"
+        if parent_cluster_id:
+            parent_token = re.sub(r"[^A-Za-z0-9._-]+", "-", str(parent_cluster_id).strip())
+            parent_token = parent_token.strip("-._") or "parent"
+            cluster_id = f"{cluster_id}__parent_{parent_token[:24]}"
+        if child_index is not None:
+            cluster_id = f"{cluster_id}__child_{int(child_index):02d}"
         local_ids = assign_local_ids(cluster, spacer_map)
 
         if len(cluster) == 1:
@@ -732,6 +772,8 @@ def write_clusters(all_clusters: list[dict],
             "size": len(cluster),
             "origin_group": origin_group,
             "subgroup_index": subgroup_index,
+            "parent_cluster_id": parent_cluster_id,
+            "child_index": child_index,
             "arrays": {
                 aid: {
                     "was_flipped": flip_map.get(aid, False),
@@ -841,7 +883,14 @@ def run(input_dir: Path, output_dir: Path,
 
         # Step 6: enforce max size
         if max_size is not None:
-            clusters = enforce_max_size(clusters, spacer_map, max_size)
+            clusters, cluster_meta = enforce_max_size_with_metadata(
+                clusters,
+                spacer_map,
+                max_size,
+            )
+        else:
+            cluster_meta = [{"parent_cluster_id": None, "child_index": None} for _ in clusters]
+
 
         # Optional singleton rescue pass
         if singleton_rescue:
@@ -860,12 +909,14 @@ def run(input_dir: Path, output_dir: Path,
                 print("    Rescued singletons in this group: "
                       f"{rescued_here} (iterations: {rescue_iterations})")
 
-        for local_idx, cluster in enumerate(clusters):
+        for local_idx, (cluster, meta) in enumerate(zip(clusters, cluster_meta)):
             all_clusters.append(
                 {
                     "origin_group": repeat,
                     "subgroup_index": local_idx,
                     "arrays": cluster,
+                    "parent_cluster_id": meta.get("parent_cluster_id"),
+                    "child_index": meta.get("child_index"),
                 }
             )
 

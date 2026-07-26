@@ -265,6 +265,41 @@ def _print_split_summary(name: str, examples: list[DirectionExample]) -> None:
 	)
 
 
+def _print_split_group_names(name: str, examples: list[DirectionExample], indices: list[int], *, max_names: int = 30) -> None:
+	group_names = sorted({_example_group_name(examples[index], index) for index in indices})
+	if not group_names:
+		print(f"{name} groups: none")
+		return
+
+	display_names = group_names[:max_names]
+	if len(group_names) > max_names:
+		display_names.append(f"... (+{len(group_names) - max_names} more)")
+
+	print(f"{name} groups ({len(group_names)}): {', '.join(display_names)}")
+
+
+def _print_group_overlap_report(examples: list[DirectionExample], split_indices: dict[str, list[int]]) -> None:
+	group_to_splits: dict[str, set[str]] = defaultdict(set)
+	for split_name, indices in split_indices.items():
+		for index in indices:
+			group_to_splits[_example_group_name(examples[index], index)].add(split_name)
+
+	overlaps = sorted(
+		(group_name, sorted(split_names))
+		for group_name, split_names in group_to_splits.items()
+		if len(split_names) > 1
+	)
+	if not overlaps:
+		print("[overlap] no group names appear in multiple splits")
+		return
+
+	print(f"[overlap] {len(overlaps)} group names appear in multiple splits:")
+	for group_name, split_names in overlaps[:30]:
+		print(f"[overlap] {group_name}: {', '.join(split_names)}")
+	if len(overlaps) > 30:
+		print(f"[overlap] ... (+{len(overlaps) - 30} more)")
+
+
 def _example_group_name(example: DirectionExample, fallback_index: int) -> str:
 	group_name = (example.group_name or "").strip()
 	if group_name:
@@ -448,6 +483,7 @@ def _split_candidate_objective(
 	*,
 	n_examples: int,
 	target_test_fraction: float,
+	optimize_target: str,
 	per_example_subarrays: list[set[tuple[str, ...]]],
 ) -> dict[str, float]:
 	train_indices = candidate["train"]
@@ -470,13 +506,24 @@ def _split_candidate_objective(
 	observed_val_fraction = _safe_divide(len(val_indices), n_examples)
 	size_penalty = abs(observed_test_fraction - target_test_fraction) + abs(observed_val_fraction - target_val_fraction)
 
-	objective = test_leak_fraction + (0.35 * val_leak_fraction) + (0.05 * size_penalty)
+	worst_query_leak = max(test_leak_fraction, val_leak_fraction)
+	leak_balance_penalty = abs(test_leak_fraction - val_leak_fraction)
+
+	if optimize_target == "test":
+		objective = test_leak_fraction + (0.05 * size_penalty)
+	elif optimize_target == "both":
+		objective = worst_query_leak + (0.5 * leak_balance_penalty) + (0.05 * size_penalty)
+	else:
+		raise ValueError(f"Unknown split optimization target: {optimize_target}")
+
 	return {
 		"objective": objective,
 		"test_leak_fraction": test_leak_fraction,
 		"test_leak_count": float(test_leak_count),
 		"val_leak_fraction": val_leak_fraction,
 		"val_leak_count": float(val_leak_count),
+		"worst_query_leak": worst_query_leak,
+		"leak_balance_penalty": leak_balance_penalty,
 		"size_penalty": size_penalty,
 	}
 
@@ -826,9 +873,12 @@ def _build_splits(
 	split_group: bool,
 	split_optimize_trials: int,
 	split_optimize_k: int,
+	split_optimize_target: str,
 ) -> dict[str, list[int]]:
 	if split_optimize_k < 2:
 		raise ValueError("--split_optimize_k must be >= 2")
+	if split_optimize_target not in {"both", "test"}:
+		raise ValueError("--split_optimize_target must be one of: both, test")
 
 	trials = max(1, int(split_optimize_trials))
 	if trials == 1:
@@ -857,6 +907,7 @@ def _build_splits(
 				candidate,
 				n_examples=len(examples),
 				target_test_fraction=test_fraction,
+				optimize_target=split_optimize_target,
 				per_example_subarrays=per_example_subarrays,
 			)
 			if best_stats is None or candidate_stats["objective"] < best_stats["objective"]:
@@ -869,10 +920,12 @@ def _build_splits(
 		splits = best_splits
 		print(
 			"[split optimize] "
-			f"trials={trials} k={split_optimize_k} selected_seed={best_seed} "
+			f"trials={trials} k={split_optimize_k} target={split_optimize_target} selected_seed={best_seed} "
 			f"objective={best_stats['objective']:.4f} "
+			f"worst_k{split_optimize_k}={best_stats['worst_query_leak']:.4f} "
 			f"test_k{split_optimize_k}={best_stats['test_leak_fraction']:.4f} "
 			f"val_k{split_optimize_k}={best_stats['val_leak_fraction']:.4f} "
+			f"balance={best_stats['leak_balance_penalty']:.4f} "
 			f"size_penalty={best_stats['size_penalty']:.4f}"
 		)
 
@@ -1091,6 +1144,12 @@ def main() -> int:
 		default=3,
 		help="k for contiguous spacer sub-array overlap objective used by --split_optimize_trials.",
 	)
+	parser.add_argument(
+		"--split_optimize_target",
+		choices=["both", "test"],
+		default="both",
+		help="Optimize split search for both val+test leakage balance (default) or test leakage only.",
+	)
 	parser.add_argument("--test_fraction", type=float, default=0.15)
 	parser.add_argument("--max_length", type=int, default=512)
 	parser.add_argument("--batch_size", type=int, default=2)
@@ -1196,6 +1255,7 @@ def main() -> int:
 		split_group=args.split_group,
 		split_optimize_trials=args.split_optimize_trials,
 		split_optimize_k=args.split_optimize_k,
+		split_optimize_target=args.split_optimize_target,
 	)
 	train_indices = _truncate_indices(splits["train"], args.max_train_examples)
 	val_indices = _truncate_indices(splits["val"], args.max_val_examples)
@@ -1233,6 +1293,13 @@ def main() -> int:
 	_print_split_summary("train", train_examples)
 	_print_split_summary("val", val_examples)
 	_print_split_summary("test", test_examples)
+	_print_split_group_names("train", dataset.records, train_indices)
+	_print_split_group_names("val", dataset.records, val_indices)
+	_print_split_group_names("test", dataset.records, test_indices)
+	_print_group_overlap_report(
+		dataset.records,
+		{"train": train_indices, "val": val_indices, "test": test_indices},
+	)
 
 	augment_spacer_deletion_count = max(0, int(args.augment_spacer_deletion_count))
 	if args.augment_spacer_deletion:

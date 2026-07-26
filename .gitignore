@@ -1,7 +1,9 @@
 # ignore data folders
 crispr_comparison_results/
 out-sp_style_clusters/
+out-sp_style_clusters-old/
 sp_style_clusters/
+sp_style_clusters-old/
 output_dataset_10k/
 test_out/
 
