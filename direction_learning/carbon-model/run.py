@@ -7,26 +7,26 @@ import random
 import sys
 import time
 import numpy as np
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import nullcontext
+from dataclasses import asdict, replace
 from pathlib import Path
 from importlib import import_module
 from typing import Any
-from dataclasses import replace
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     matthews_corrcoef, roc_auc_score, confusion_matrix,
 )
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+	sys.path.insert(0, str(ROOT))
 
 from direction_learning.augmentation import (
 	build_test_similarity_index,
 	example_signature,
 	materialize_subarray_augmentations,
 )
-
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-	sys.path.insert(0, str(ROOT))
 
 try:
 	import torch
@@ -48,6 +48,7 @@ prepare_model_for_kbit_training = None
 
 from direction_learning.data import print_split_overlap_report, split_dev_pool_by_mode, stratified_holdout_by_mode
 from direction_learning.dataset import DirectionExample, DirectionJsonlDataset
+from direction_learning.tokenization import reverse_complement
 
 DNA_SEPARATOR = "NNNNNN"
 DEFAULT_MODEL_ID = "HuggingFaceBio/Carbon-500M"
@@ -264,24 +265,481 @@ def _print_split_summary(name: str, examples: list[DirectionExample]) -> None:
 	)
 
 
+def _example_group_name(example: DirectionExample, fallback_index: int) -> str:
+	group_name = (example.group_name or "").strip()
+	if group_name:
+		return group_name
+	return f"ungrouped_{fallback_index}"
+
+
+def _build_group_components(examples: list[DirectionExample]) -> list[list[int]]:
+	"""Build connected components that keep identical groups and signatures together."""
+	n = len(examples)
+	parent = list(range(n))
+
+	def find(index: int) -> int:
+		while parent[index] != index:
+			parent[index] = parent[parent[index]]
+			index = parent[index]
+		return index
+
+	def union(left: int, right: int) -> None:
+		left_root = find(left)
+		right_root = find(right)
+		if left_root != right_root:
+			parent[right_root] = left_root
+
+	first_by_group: dict[str, int] = {}
+	first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
+	for index, example in enumerate(examples):
+		group_name = _example_group_name(example, index)
+		previous = first_by_group.get(group_name)
+		if previous is None:
+			first_by_group[group_name] = index
+		else:
+			union(index, previous)
+
+		signature = (tuple(example.spacers), tuple(example.repeats))
+		previous = first_by_signature.get(signature)
+		if previous is None:
+			first_by_signature[signature] = index
+		else:
+			union(index, previous)
+
+	components: dict[int, list[int]] = {}
+	for index in range(n):
+		components.setdefault(find(index), []).append(index)
+
+	return [sorted(indices) for indices in components.values()]
+
+
+def _component_stratum_key(example: DirectionExample, stratify_mode: str) -> Any:
+	subtype = (example.cas_subtype or "Unknown").strip() or "Unknown"
+	label = int(example.label)
+	if stratify_mode == "label":
+		return label
+	if stratify_mode == "cas_subtype":
+		return subtype
+	return (subtype, label)
+
+
+def _split_components_by_mode(
+	examples: list[DirectionExample],
+	components: list[list[int]],
+	seed: int,
+	right_fraction: float,
+	stratify_mode: str,
+) -> tuple[list[list[int]], list[list[int]]]:
+	"""Split connected components into left/right partitions while keeping each component intact."""
+	if not (0.0 <= right_fraction < 1.0):
+		raise ValueError("right_fraction must be in [0.0, 1.0)")
+
+	rng = random.Random(seed)
+	strata_groups: dict[Any, list[list[int]]] = {}
+	for component in components:
+		representative = examples[component[0]]
+		key = _component_stratum_key(representative, stratify_mode)
+		strata_groups.setdefault(key, []).append(component)
+
+	left_components: list[list[int]] = []
+	right_components: list[list[int]] = []
+	for key in sorted(strata_groups.keys(), key=str):
+		groups = list(strata_groups[key])
+		rng.shuffle(groups)
+		n_groups = len(groups)
+		if n_groups == 1:
+			n_right = 0 if right_fraction == 0.0 else 1
+		else:
+			n_right = min(n_groups - 1, max(1, round(n_groups * right_fraction)))
+		for component in groups[:n_right]:
+			right_components.append(component)
+		for component in groups[n_right:]:
+			left_components.append(component)
+
+	return left_components, right_components
+
+
+def _flatten_components(components: list[list[int]]) -> list[int]:
+	indices = [index for component in components for index in component]
+	return sorted(indices)
+
+
+def _build_reference_similarity_indexes(examples: list[DirectionExample]) -> dict[str, Any]:
+	full_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+	reference_spacer_tokens: set[str] = set()
+	reference_subarrays: dict[int, set[tuple[str, ...]]] = {k: set() for k in (2, 3, 4, 5)}
+	reference_kmers: set[str] = set()
+
+	for example in examples:
+		full_signatures.add(_canonical_array_signature(example))
+		for spacer in example.spacers:
+			if spacer:
+				reference_spacer_tokens.add(_canonical_dna_sequence(spacer))
+
+		spacers = tuple(_normalize_dna_sequence(sequence) for sequence in example.spacers if sequence)
+		for k, k_subarrays in reference_subarrays.items():
+			if len(spacers) < k:
+				continue
+			for start in range(len(spacers) - k + 1):
+				k_subarrays.add(_canonical_sequence_tuple(spacers[start:start + k]))
+
+		core_sequence = _array_core_sequence(example)
+		if len(core_sequence) >= 31:
+			for start in range(len(core_sequence) - 31 + 1):
+				reference_kmers.add(_canonical_dna_sequence(core_sequence[start:start + 31]))
+
+	return {
+		"raw_count": len(examples),
+		"full_signatures": full_signatures,
+		"spacer_tokens": reference_spacer_tokens,
+		"subarrays": reference_subarrays,
+		"kmers": reference_kmers,
+	}
+
+
+def _normalize_dna_sequence(sequence: str) -> str:
+	return _normalize_dna(sequence)
+
+
+def _canonical_dna_sequence(sequence: str) -> str:
+	normalized = _normalize_dna_sequence(sequence)
+	reverse_complemented = _normalize_dna_sequence(reverse_complement(normalized))
+	return min(normalized, reverse_complemented)
+
+
+def _canonical_sequence_tuple(sequences: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+	normalized = tuple(_normalize_dna_sequence(sequence) for sequence in sequences)
+	reverse_complemented = tuple(
+		_normalize_dna_sequence(reverse_complement(sequence)) for sequence in reversed(normalized)
+	)
+	return min(normalized, reverse_complemented)
+
+
+def _array_core_sequence(example: DirectionExample) -> str:
+	pieces: list[str] = []
+	max_length = max(len(example.repeats), len(example.spacers))
+	for index in range(max_length):
+		if index < len(example.repeats):
+			pieces.append(_normalize_dna_sequence(example.repeats[index]))
+		if index < len(example.spacers):
+			pieces.append(_normalize_dna_sequence(example.spacers[index]))
+	return "".join(piece for piece in pieces if piece)
+
+
+def _canonical_array_signature(example: DirectionExample) -> tuple[tuple[str, ...], tuple[str, ...]]:
+	spacers = tuple(_normalize_dna_sequence(sequence) for sequence in example.spacers)
+	repeats = tuple(_normalize_dna_sequence(sequence) for sequence in example.repeats)
+	reverse_complemented = (
+		tuple(_normalize_dna_sequence(reverse_complement(sequence)) for sequence in reversed(spacers)),
+		tuple(_normalize_dna_sequence(reverse_complement(sequence)) for sequence in reversed(repeats)),
+	)
+	return min((spacers, repeats), reverse_complemented)
+
+
+def _format_percent(value: float) -> str:
+	return f"{value * 100:.2f}%"
+
+
+def _format_ratio(numerator: int, denominator: int) -> str:
+	return f"{numerator} / {denominator}  ({_format_percent(numerator / denominator if denominator else 0.0)})"
+
+
+def _format_decimal_percentage(value: float) -> str:
+	return f"{value * 100:.1f}%"
+
+
+def _bucket_coverage_fraction(value: float) -> str:
+	if value == 0.0:
+		return "0"
+	if value < 0.25:
+		return "(0,0.25]"
+	if value < 0.5:
+		return "(0.25,0.5]"
+	if value < 0.75:
+		return "(0.5,0.75]"
+	if value < 1.0:
+		return "(0.75,1.0)"
+	return "1.0"
+
+
+def _sample_multi_repeat_records(examples: list[DirectionExample], sample_size: int, seed: int) -> list[DirectionExample]:
+	multi_repeat_examples = [example for example in examples if len(example.repeats) >= 2]
+	if not multi_repeat_examples:
+		return []
+	if sample_size <= 0 or len(multi_repeat_examples) <= sample_size:
+		return list(multi_repeat_examples)
+	rng = random.Random(seed)
+	return rng.sample(multi_repeat_examples, sample_size)
+
+
+def _analyze_parse_verification(examples: list[DirectionExample], sample_size: int, seed: int) -> dict[str, Any]:
+	sampled_examples = _sample_multi_repeat_records(examples, sample_size, seed)
+	repeat_modal_fractions: list[float] = []
+	spacer_distinct_ratios: list[float] = []
+	for example in sampled_examples:
+		repeats = [_normalize_dna_sequence(sequence) for sequence in example.repeats if sequence]
+		spacers = [_normalize_dna_sequence(sequence) for sequence in example.spacers if sequence]
+		if repeats:
+			repeat_counts = Counter(repeats)
+			repeat_modal_fractions.append(max(repeat_counts.values()) / len(repeats))
+		if spacers:
+			spacer_distinct_ratios.append(len(set(spacers)) / len(spacers))
+
+	records_with_consensus = sum(1 for fraction in repeat_modal_fractions if fraction >= 0.80)
+	records_with_identical_repeats = sum(1 for fraction in repeat_modal_fractions if math.isclose(fraction, 1.0, rel_tol=0.0, abs_tol=1e-12))
+	return {
+		"sampled_multi_repeat_records": len(sampled_examples),
+		"mean_repeat_modal_fraction": (sum(repeat_modal_fractions) / len(repeat_modal_fractions)) if repeat_modal_fractions else 0.0,
+		"records_with_ge_80_percent_repeats_on_single_consensus": _safe_divide(records_with_consensus, len(repeat_modal_fractions)),
+		"records_with_all_repeats_byte_identical": _safe_divide(records_with_identical_repeats, len(repeat_modal_fractions)),
+		"mean_spacer_distinct_ratio": (sum(spacer_distinct_ratios) / len(spacer_distinct_ratios)) if spacer_distinct_ratios else 0.0,
+	}
+
+
+def _analyze_query_against_reference(
+	reference_name: str,
+	reference_indexes: dict[str, Any],
+	query_name: str,
+	query_examples: list[DirectionExample],
+	seed: int,
+) -> dict[str, Any]:
+	reference_full_signatures = reference_indexes["full_signatures"]
+	reference_spacer_tokens = reference_indexes["spacer_tokens"]
+	reference_subarrays = reference_indexes["subarrays"]
+	reference_kmers = reference_indexes["kmers"]
+
+	full_matches = 0
+	coverage_fractions: list[float] = []
+	coverage_histogram = Counter()
+	k_subarray_counts = {k: 0 for k in (2, 3, 4, 5)}
+	kmer_matches = 0
+
+	for example in query_examples:
+		if _canonical_array_signature(example) in reference_full_signatures:
+			full_matches += 1
+
+		spacers = [_normalize_dna_sequence(sequence) for sequence in example.spacers if sequence]
+		if spacers:
+			covered = sum(1 for spacer in spacers if _canonical_dna_sequence(spacer) in reference_spacer_tokens)
+			coverage_fraction = covered / len(spacers)
+		else:
+			coverage_fraction = 0.0
+		coverage_fractions.append(coverage_fraction)
+		coverage_histogram[_bucket_coverage_fraction(coverage_fraction)] += 1
+
+		for k in (2, 3, 4, 5):
+			if len(spacers) < k:
+				continue
+			if any(_canonical_sequence_tuple(spacers[start:start + k]) in reference_subarrays[k] for start in range(len(spacers) - k + 1)):
+				k_subarray_counts[k] += 1
+
+		core_sequence = _array_core_sequence(example)
+		if len(core_sequence) >= 31:
+			if any(_canonical_dna_sequence(core_sequence[start:start + 31]) in reference_kmers for start in range(len(core_sequence) - 31 + 1)):
+				kmer_matches += 1
+
+	parse_stats = _analyze_parse_verification(query_examples, sample_size=1000, seed=seed)
+	return {
+		"reference_name": reference_name,
+		"reference_size": reference_indexes["raw_count"],
+		"query_name": query_name,
+		"query_size": len(query_examples),
+		"parse_stats": parse_stats,
+		"exact_full_array_matches": full_matches,
+		"coverage_histogram": dict(coverage_histogram),
+		"coverage_100_count": sum(1 for fraction in coverage_fractions if math.isclose(fraction, 1.0, rel_tol=0.0, abs_tol=1e-12)),
+		"k_subarray_counts": k_subarray_counts,
+		"kmer_matches": kmer_matches,
+	}
+
+
+def _write_split_artifacts(
+	output_dir: Path,
+	dataset_path: Path,
+	seed: int,
+	chunk_size: int,
+	examples: list[DirectionExample],
+	train_examples: list[DirectionExample],
+	val_examples: list[DirectionExample],
+	test_examples: list[DirectionExample],
+	train_indices: list[int],
+	val_indices: list[int],
+	test_indices: list[int],
+) -> Path:
+	split_dir = output_dir / "splits"
+	split_dir.mkdir(parents=True, exist_ok=True)
+
+	def _build_split_group_name_map(indices: list[int]) -> dict[int, str]:
+		groups: dict[str, list[int]] = defaultdict(list)
+		for index in indices:
+			groups[_example_group_name(examples[index], index)].append(index)
+
+		name_by_index: dict[int, str] = {}
+		for group_name, group_indices in groups.items():
+			ordered = sorted(group_indices)
+			if chunk_size <= 0 or len(ordered) <= chunk_size:
+				for index in ordered:
+					name_by_index[index] = group_name
+				continue
+
+			for part_index, start in enumerate(range(0, len(ordered), chunk_size)):
+				chunk_name = f"{group_name}__part{part_index:03d}"
+				for index in ordered[start:start + chunk_size]:
+					name_by_index[index] = chunk_name
+		return name_by_index
+
+	train_group_names = _build_split_group_name_map(train_indices)
+	val_group_names = _build_split_group_name_map(val_indices)
+	test_group_names = _build_split_group_name_map(test_indices)
+
+	def _write_split_jsonl(path: Path, indices: list[int], examples: list[DirectionExample]) -> None:
+		with path.open("w") as fh:
+			for index, example in zip(indices, examples):
+				fh.write(
+					json.dumps(
+						{
+							"index": index,
+							"group_name": example.group_name,
+							"split_group_name": train_group_names.get(index)
+							if path.name == "train.jsonl"
+							else val_group_names.get(index)
+							if path.name == "val.jsonl"
+							else test_group_names.get(index),
+							"example": asdict(example),
+						},
+						sort_keys=True,
+					)
+					+ "\n"
+				)
+
+	_write_split_jsonl(split_dir / "train.jsonl", train_indices, train_examples)
+	_write_split_jsonl(split_dir / "val.jsonl", val_indices, val_examples)
+	_write_split_jsonl(split_dir / "test.jsonl", test_indices, test_examples)
+
+	manifest = {
+		"dataset_path": str(dataset_path),
+		"seed": seed,
+		"split_group_chunk_size": chunk_size,
+		"split_dir": str(split_dir),
+		"splits": {
+			"train": {"count": len(train_examples), "indices": train_indices, "path": str(split_dir / "train.jsonl")},
+			"val": {"count": len(val_examples), "indices": val_indices, "path": str(split_dir / "val.jsonl")},
+			"test": {"count": len(test_examples), "indices": test_indices, "path": str(split_dir / "test.jsonl")},
+		},
+	}
+	manifest["split_groups"] = {
+		"train": sorted(set(train_group_names.values())),
+		"val": sorted(set(val_group_names.values())),
+		"test": sorted(set(test_group_names.values())),
+	}
+	manifest_path = split_dir / "split_manifest.json"
+	with manifest_path.open("w") as fh:
+		json.dump(manifest, fh, indent=2, sort_keys=True)
+	return manifest_path
+
+
+def _build_split_similarity_report(
+	dataset_path: Path,
+	seed: int,
+	train_examples: list[DirectionExample],
+	val_examples: list[DirectionExample],
+	test_examples: list[DirectionExample],
+) -> dict[str, Any]:
+	reference_indexes = _build_reference_similarity_indexes(train_examples)
+	sections = [
+		_analyze_query_against_reference("train", reference_indexes, "val", val_examples, seed),
+		_analyze_query_against_reference("train", reference_indexes, "test", test_examples, seed),
+	]
+	return {
+		"dataset_path": str(dataset_path),
+		"seed": seed,
+		"sections": sections,
+	}
+
+
+def _save_similarity_report(output_dir: Path, report: dict[str, Any]) -> None:
+	text_path = output_dir / "split_similarity_report.txt"
+	json_path = output_dir / "split_similarity_report.json"
+	with json_path.open("w") as fh:
+		json.dump(report, fh, indent=2, sort_keys=True)
+
+	lines: list[str] = []
+	for section in report["sections"]:
+		lines.append(f"{section['reference_name']} arrays (reference): {section['reference_size']}")
+		lines.append(f"{section['query_name']} arrays (queried):    {section['query_size']}")
+		parse_stats = section["parse_stats"]
+		lines.append("parse verification (even-index=repeats, odd-index=spacers):")
+		lines.append(f"    sampled multi-repeat records: {parse_stats['sampled_multi_repeat_records']}")
+		lines.append(f"    mean repeat modal-fraction (repeats matching the record's consensus): {_format_decimal_percentage(parse_stats['mean_repeat_modal_fraction'])}")
+		lines.append(f"    records with >=80% repeats on a single consensus: {_format_decimal_percentage(parse_stats['records_with_ge_80_percent_repeats_on_single_consensus'])}")
+		lines.append(f"    records with all repeats byte-identical: {_format_decimal_percentage(parse_stats['records_with_all_repeats_byte_identical'])}")
+		lines.append(f"    mean spacer distinct-ratio (unique spacers / spacers): {_format_decimal_percentage(parse_stats['mean_spacer_distinct_ratio'])}  (expected ~100%)")
+		lines.append("")
+		lines.append("Check 1 - Exact full-array leakage (fwd or RC identical to a reference array):")
+		lines.append(f"    {_format_ratio(section['exact_full_array_matches'], section['query_size'])}")
+		lines.append("")
+		lines.append("Check 2 - Single-spacer overlap (fraction of query spacers seen in reference, fwd/RC):")
+		lines.append("    coverage-fraction histogram:")
+		for bucket in ["0", "(0,0.25]", "(0.25,0.5]", "(0.5,0.75]", "(0.75,1.0)", "1.0"]:
+			count = section["coverage_histogram"].get(bucket, 0)
+			lines.append(f"        {bucket:<14} {count:>4}  ({_format_percent(count / section['query_size'] if section['query_size'] else 0.0)})")
+		lines.append(f"    {section['query_name']} arrays with 100% spacer coverage in reference: {_format_ratio(section['coverage_100_count'], section['query_size'])}")
+		lines.append("")
+		lines.append("Check 3 - Contiguous sub-array leakage (PRIMARY; fwd or RC):")
+		lines.append("    k    query arrays sharing a contiguous k-spacer sub-array with reference")
+		for k in (2, 3, 4, 5):
+			count = section["k_subarray_counts"][k]
+			lines.append(f"    {k:<4}{count:>6} / {section['query_size']:<4} ({_format_percent(count / section['query_size'] if section['query_size'] else 0.0)})")
+		lines.append("")
+		lines.append("Check 4 - Nucleotide k-mer leakage (>= 31 bp exact stretch, fwd or RC):")
+		lines.append(f"    {_format_ratio(section['kmer_matches'], section['query_size'])}")
+		lines.append("")
+
+	text = "\n".join(lines).rstrip() + "\n"
+	with text_path.open("w") as fh:
+		fh.write(text)
+	print(text)
+
+
 def _build_splits(
 	examples: list[DirectionExample],
 	seed: int,
 	test_fraction: float,
 	stratify_mode: str,
+	split_group: bool,
 ) -> dict[str, list[int]]:
-	dev_indices, test_indices = stratified_holdout_by_mode(
-		examples,
-		seed=seed,
-		holdout_fraction=test_fraction,
-		stratify_mode=stratify_mode,
-	)
-	train_indices, val_indices = split_dev_pool_by_mode(
-		examples,
-		pool_indices=dev_indices,
-		seed=seed,
-		stratify_mode=stratify_mode,
-	)
+	if split_group:
+		components = _build_group_components(examples)
+		dev_components, test_components = _split_components_by_mode(
+			examples,
+			components,
+			seed=seed,
+			right_fraction=test_fraction,
+			stratify_mode=stratify_mode,
+		)
+		train_components, val_components = _split_components_by_mode(
+			examples,
+			dev_components,
+			seed=seed,
+			right_fraction=0.20,
+			stratify_mode=stratify_mode,
+		)
+		train_indices = _flatten_components(train_components)
+		val_indices = _flatten_components(val_components)
+		test_indices = _flatten_components(test_components)
+	else:
+		dev_indices, test_indices = stratified_holdout_by_mode(
+			examples,
+			seed=seed,
+			holdout_fraction=test_fraction,
+			stratify_mode=stratify_mode,
+		)
+		train_indices, val_indices = split_dev_pool_by_mode(
+			examples,
+			pool_indices=dev_indices,
+			seed=seed,
+			stratify_mode=stratify_mode,
+		)
 	print_split_overlap_report(train_indices, val_indices, test_indices, examples)
 
 	# --- sanity check: verify splits don't leak indices into each other ---
@@ -477,6 +935,11 @@ def main() -> int:
 	parser.add_argument("--sequence_mode", choices=["interleaved", "spacers_only"], default="interleaved")
 	parser.add_argument("--include_flanks", action="store_true")
 	parser.add_argument("--stratify_mode", choices=["label", "cas_subtype", "cas_subtype_and_label"], default="cas_subtype_and_label")
+	parser.add_argument(
+		"--split_group",
+		action="store_true",
+		help="Use group-aware connected-component splitting to keep related arrays in the same split.",
+	)
 	parser.add_argument("--test_fraction", type=float, default=0.15)
 	parser.add_argument("--max_length", type=int, default=512)
 	parser.add_argument("--batch_size", type=int, default=2)
@@ -490,6 +953,12 @@ def main() -> int:
 	parser.add_argument("--max_train_examples", type=int, default=0)
 	parser.add_argument("--max_val_examples", type=int, default=0)
 	parser.add_argument("--max_test_examples", type=int, default=0)
+	parser.add_argument(
+		"--split_group_chunk_size",
+		type=int,
+		default=250,
+		help="Optional subgroup size for split artifact naming; chunks stay in the same split and are written as group__partNNN.",
+	)
 	parser.add_argument(
 		"--augment_spacer_deletion",
 		action="store_true",
@@ -568,7 +1037,13 @@ def main() -> int:
 
 	
 
-	splits = _build_splits(dataset.records, seed=args.seed, test_fraction=args.test_fraction, stratify_mode=args.stratify_mode)
+	splits = _build_splits(
+		dataset.records,
+		seed=args.seed,
+		test_fraction=args.test_fraction,
+		stratify_mode=args.stratify_mode,
+		split_group=args.split_group,
+	)
 	train_indices = _truncate_indices(splits["train"], args.max_train_examples)
 	val_indices = _truncate_indices(splits["val"], args.max_val_examples)
 	test_indices = _truncate_indices(splits["test"], args.max_test_examples)
@@ -576,6 +1051,30 @@ def main() -> int:
 	train_examples = [dataset.records[index] for index in train_indices]
 	val_examples = [dataset.records[index] for index in val_indices]
 	test_examples = [dataset.records[index] for index in test_indices]
+
+	manifest_path = _write_split_artifacts(
+		output_dir=output_dir,
+		dataset_path=dataset_path,
+		seed=args.seed,
+		chunk_size=args.split_group_chunk_size,
+		examples=dataset.records,
+		train_examples=train_examples,
+		val_examples=val_examples,
+		test_examples=test_examples,
+		train_indices=train_indices,
+		val_indices=val_indices,
+		test_indices=test_indices,
+	)
+	print(f"Saved split artifacts to {manifest_path.parent}")
+
+	similarity_report = _build_split_similarity_report(
+		dataset_path=dataset_path,
+		seed=args.seed,
+		train_examples=train_examples,
+		val_examples=val_examples,
+		test_examples=test_examples,
+	)
+	_save_similarity_report(output_dir, similarity_report)
 
 	print("Split summary:")
 	_print_split_summary("train", train_examples)

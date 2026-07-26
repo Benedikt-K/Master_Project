@@ -62,6 +62,10 @@ PREPARE_REQUIRE_AGREE = True
 PREPARE_ALLOW_NOT_COMPARABLE = False
 PREPARE_COLLAPSE_DUPLICATES = True
 
+# training is done on gpu normally, but can be specified to cpu if you want to,
+# but will be very slow
+TRAINING_DEVICE = "gpu"
+#TRAINING_DEVICE == "cpu"
 
 # These are the parameters I used for my final performances, if you want to try others change them here
 # in my "normal" code they are passed as CLI arguments, but for less code, i hardcoded them here
@@ -946,7 +950,12 @@ def train_carbon() -> None:
 	if torch.cuda.is_available():
 		torch.cuda.manual_seed_all(TRAIN_SEED)
 
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	# its possible to change the device to CPU if you want to test the code without a GPU,
+	#  but it will be very slow -> training should be done on GPU inference can be done on CPU
+	if TRAINING_DEVICE == "cpu":
+		device = torch.device("cpu")
+	else:
+		device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	use_bfloat16 = bool(TRAIN_BF16 and device.type == "cuda")
 	output_dir = OUTPUT_DIR
 	output_dir.mkdir(parents=True, exist_ok=True)
