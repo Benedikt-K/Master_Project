@@ -66,6 +66,7 @@ import argparse
 import time
 import sys
 import shutil
+import hashlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from collections import defaultdict
@@ -680,7 +681,16 @@ def assign_local_ids(cluster: list[str],
     return result
 
 
-def write_clusters(all_clusters: list[list[str]],
+def _cluster_origin_tag(origin_group: str, max_slug_len: int = 36) -> str:
+    """Return a filesystem-safe, compact tag for the original (repeat) group key."""
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(origin_group).strip())
+    normalized = normalized.strip("-._") or "group"
+    digest = hashlib.sha1(str(origin_group).encode("utf-8")).hexdigest()[:8]
+    slug = normalized[:max_slug_len].rstrip("-._") or "group"
+    return f"{slug}-{digest}"
+
+
+def write_clusters(all_clusters: list[dict],
                    spacer_map: dict[str, list[int]],
                    flip_map: dict[str, bool],
                    cas_type_map: dict[str, str],
@@ -697,8 +707,12 @@ def write_clusters(all_clusters: list[list[str]],
     n_single = 0
     metadata = {}
 
-    for idx, cluster in enumerate(all_clusters):
-        cluster_id = f"g_{idx}"
+    for idx, cluster_info in enumerate(all_clusters):
+        cluster = cluster_info["arrays"]
+        origin_group = cluster_info["origin_group"]
+        subgroup_index = int(cluster_info["subgroup_index"])
+        origin_tag = _cluster_origin_tag(origin_group)
+        cluster_id = f"orig_{origin_tag}__sub_{subgroup_index:04d}__g_{idx:06d}"
         local_ids = assign_local_ids(cluster, spacer_map)
 
         if len(cluster) == 1:
@@ -716,6 +730,8 @@ def write_clusters(all_clusters: list[list[str]],
 
         metadata[cluster_id] = {
             "size": len(cluster),
+            "origin_group": origin_group,
+            "subgroup_index": subgroup_index,
             "arrays": {
                 aid: {
                     "was_flipped": flip_map.get(aid, False),
@@ -781,7 +797,7 @@ def run(input_dir: Path, output_dir: Path,
 
     # ── Steps 3-6: Per repeat group ───────────────────────────────────────
     print("\n[3-6] Clustering within each repeat group ...")
-    all_clusters: list[list[str]] = []
+    all_clusters: list[dict] = []
     global_spacer_map: dict[str, list[int]] = {}
     repeat_items = list(repeat_groups.items())
     repeat_start = time.time()
@@ -844,7 +860,14 @@ def run(input_dir: Path, output_dir: Path,
                 print("    Rescued singletons in this group: "
                       f"{rescued_here} (iterations: {rescue_iterations})")
 
-        all_clusters.extend(clusters)
+        for local_idx, cluster in enumerate(clusters):
+            all_clusters.append(
+                {
+                    "origin_group": repeat,
+                    "subgroup_index": local_idx,
+                    "arrays": cluster,
+                }
+            )
 
         _print_progress_line(
             prefix="  Repeat groups",
@@ -861,7 +884,7 @@ def run(input_dir: Path, output_dir: Path,
     if singleton_rescue:
         print(f"  Total rescued singletons: {total_rescued_singletons}")
         print(f"  Total rescue iterations: {total_rescue_iterations}")
-    sizes = [len(c) for c in all_clusters]
+    sizes = [len(c["arrays"]) for c in all_clusters]
     print(f"  Sizes — min: {min(sizes)}, max: {max(sizes)}, "
           f"mean: {sum(sizes)/len(sizes):.1f}, "
           f"median: {sorted(sizes)[len(sizes)//2]}")
