@@ -364,6 +364,123 @@ def _flatten_components(components: list[list[int]]) -> list[int]:
 	return sorted(indices)
 
 
+def _build_splits_once(
+	examples: list[DirectionExample],
+	seed: int,
+	test_fraction: float,
+	stratify_mode: str,
+	split_group: bool,
+) -> dict[str, list[int]]:
+	if split_group:
+		components = _build_group_components(examples)
+		dev_components, test_components = _split_components_by_mode(
+			examples,
+			components,
+			seed=seed,
+			right_fraction=test_fraction,
+			stratify_mode=stratify_mode,
+		)
+		train_components, val_components = _split_components_by_mode(
+			examples,
+			dev_components,
+			seed=seed,
+			right_fraction=0.20,
+			stratify_mode=stratify_mode,
+		)
+		train_indices = _flatten_components(train_components)
+		val_indices = _flatten_components(val_components)
+		test_indices = _flatten_components(test_components)
+	else:
+		dev_indices, test_indices = stratified_holdout_by_mode(
+			examples,
+			seed=seed,
+			holdout_fraction=test_fraction,
+			stratify_mode=stratify_mode,
+		)
+		train_indices, val_indices = split_dev_pool_by_mode(
+			examples,
+			pool_indices=dev_indices,
+			seed=seed,
+			stratify_mode=stratify_mode,
+		)
+
+	return {"train": train_indices, "val": val_indices, "test": test_indices}
+
+
+def _build_example_k_subarray_index(
+	examples: list[DirectionExample],
+	k: int,
+) -> list[set[tuple[str, ...]]]:
+	per_example: list[set[tuple[str, ...]]] = []
+	for example in examples:
+		spacers = tuple(_normalize_dna_sequence(sequence) for sequence in example.spacers if sequence)
+		current: set[tuple[str, ...]] = set()
+		if len(spacers) >= k:
+			for start in range(len(spacers) - k + 1):
+				current.add(_canonical_sequence_tuple(spacers[start:start + k]))
+		per_example.append(current)
+	return per_example
+
+
+def _subarray_leakage_fraction_from_index(
+	reference_indices: list[int],
+	query_indices: list[int],
+	per_example_subarrays: list[set[tuple[str, ...]]],
+) -> tuple[float, int]:
+	if not query_indices:
+		return 0.0, 0
+
+	reference_subarrays: set[tuple[str, ...]] = set()
+	for index in reference_indices:
+		reference_subarrays.update(per_example_subarrays[index])
+
+	leak_count = 0
+	for index in query_indices:
+		query_subarrays = per_example_subarrays[index]
+		if query_subarrays and any(subarray in reference_subarrays for subarray in query_subarrays):
+			leak_count += 1
+
+	return leak_count / len(query_indices), leak_count
+
+
+def _split_candidate_objective(
+	candidate: dict[str, list[int]],
+	*,
+	n_examples: int,
+	target_test_fraction: float,
+	per_example_subarrays: list[set[tuple[str, ...]]],
+) -> dict[str, float]:
+	train_indices = candidate["train"]
+	val_indices = candidate["val"]
+	test_indices = candidate["test"]
+
+	test_leak_fraction, test_leak_count = _subarray_leakage_fraction_from_index(
+		train_indices,
+		test_indices,
+		per_example_subarrays,
+	)
+	val_leak_fraction, val_leak_count = _subarray_leakage_fraction_from_index(
+		train_indices,
+		val_indices,
+		per_example_subarrays,
+	)
+
+	observed_test_fraction = _safe_divide(len(test_indices), n_examples)
+	target_val_fraction = (1.0 - target_test_fraction) * 0.20
+	observed_val_fraction = _safe_divide(len(val_indices), n_examples)
+	size_penalty = abs(observed_test_fraction - target_test_fraction) + abs(observed_val_fraction - target_val_fraction)
+
+	objective = test_leak_fraction + (0.35 * val_leak_fraction) + (0.05 * size_penalty)
+	return {
+		"objective": objective,
+		"test_leak_fraction": test_leak_fraction,
+		"test_leak_count": float(test_leak_count),
+		"val_leak_fraction": val_leak_fraction,
+		"val_leak_count": float(val_leak_count),
+		"size_penalty": size_penalty,
+	}
+
+
 def _build_reference_similarity_indexes(examples: list[DirectionExample]) -> dict[str, Any]:
 	full_signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
 	reference_spacer_tokens: set[str] = set()
@@ -707,39 +824,61 @@ def _build_splits(
 	test_fraction: float,
 	stratify_mode: str,
 	split_group: bool,
+	split_optimize_trials: int,
+	split_optimize_k: int,
 ) -> dict[str, list[int]]:
-	if split_group:
-		components = _build_group_components(examples)
-		dev_components, test_components = _split_components_by_mode(
+	if split_optimize_k < 2:
+		raise ValueError("--split_optimize_k must be >= 2")
+
+	trials = max(1, int(split_optimize_trials))
+	if trials == 1:
+		splits = _build_splits_once(
 			examples,
-			components,
 			seed=seed,
-			right_fraction=test_fraction,
+			test_fraction=test_fraction,
 			stratify_mode=stratify_mode,
+			split_group=split_group,
 		)
-		train_components, val_components = _split_components_by_mode(
-			examples,
-			dev_components,
-			seed=seed,
-			right_fraction=0.20,
-			stratify_mode=stratify_mode,
-		)
-		train_indices = _flatten_components(train_components)
-		val_indices = _flatten_components(val_components)
-		test_indices = _flatten_components(test_components)
 	else:
-		dev_indices, test_indices = stratified_holdout_by_mode(
-			examples,
-			seed=seed,
-			holdout_fraction=test_fraction,
-			stratify_mode=stratify_mode,
+		per_example_subarrays = _build_example_k_subarray_index(examples, k=split_optimize_k)
+		best_splits: dict[str, list[int]] | None = None
+		best_stats: dict[str, float] | None = None
+		best_seed = seed
+		for offset in range(trials):
+			trial_seed = seed + offset
+			candidate = _build_splits_once(
+				examples,
+				seed=trial_seed,
+				test_fraction=test_fraction,
+				stratify_mode=stratify_mode,
+				split_group=split_group,
+			)
+			candidate_stats = _split_candidate_objective(
+				candidate,
+				n_examples=len(examples),
+				target_test_fraction=test_fraction,
+				per_example_subarrays=per_example_subarrays,
+			)
+			if best_stats is None or candidate_stats["objective"] < best_stats["objective"]:
+				best_splits = candidate
+				best_stats = candidate_stats
+				best_seed = trial_seed
+
+		if best_splits is None or best_stats is None:
+			raise RuntimeError("split optimization failed to produce a candidate split")
+		splits = best_splits
+		print(
+			"[split optimize] "
+			f"trials={trials} k={split_optimize_k} selected_seed={best_seed} "
+			f"objective={best_stats['objective']:.4f} "
+			f"test_k{split_optimize_k}={best_stats['test_leak_fraction']:.4f} "
+			f"val_k{split_optimize_k}={best_stats['val_leak_fraction']:.4f} "
+			f"size_penalty={best_stats['size_penalty']:.4f}"
 		)
-		train_indices, val_indices = split_dev_pool_by_mode(
-			examples,
-			pool_indices=dev_indices,
-			seed=seed,
-			stratify_mode=stratify_mode,
-		)
+
+	train_indices = splits["train"]
+	val_indices = splits["val"]
+	test_indices = splits["test"]
 	print_split_overlap_report(train_indices, val_indices, test_indices, examples)
 
 	# --- sanity check: verify splits don't leak indices into each other ---
@@ -940,6 +1079,18 @@ def main() -> int:
 		action="store_true",
 		help="Use group-aware connected-component splitting to keep related arrays in the same split.",
 	)
+	parser.add_argument(
+		"--split_optimize_trials",
+		type=int,
+		default=1,
+		help="Try multiple candidate split seeds and keep the one with minimal train->query contiguous k-spacer overlap.",
+	)
+	parser.add_argument(
+		"--split_optimize_k",
+		type=int,
+		default=3,
+		help="k for contiguous spacer sub-array overlap objective used by --split_optimize_trials.",
+	)
 	parser.add_argument("--test_fraction", type=float, default=0.15)
 	parser.add_argument("--max_length", type=int, default=512)
 	parser.add_argument("--batch_size", type=int, default=2)
@@ -1043,6 +1194,8 @@ def main() -> int:
 		test_fraction=args.test_fraction,
 		stratify_mode=args.stratify_mode,
 		split_group=args.split_group,
+		split_optimize_trials=args.split_optimize_trials,
+		split_optimize_k=args.split_optimize_k,
 	)
 	train_indices = _truncate_indices(splits["train"], args.max_train_examples)
 	val_indices = _truncate_indices(splits["val"], args.max_val_examples)
