@@ -307,6 +307,22 @@ def _example_group_name(example: DirectionExample, fallback_index: int) -> str:
 	return f"ungrouped_{fallback_index}"
 
 
+def _split_group_anchor_name(example: DirectionExample, fallback_index: int) -> str:
+	"""
+	Return the group anchor used by --split_group.
+
+	For cluster-style names like:
+	  orig_<parent>__sub_0002__g_000325
+	we collapse to the shared parent key:
+	  orig_<parent>
+	so all sub-clusters from the same original large group are kept together.
+	"""
+	group_name = _example_group_name(example, fallback_index)
+	if group_name.startswith("orig_") and "__sub_" in group_name:
+		return group_name.split("__sub_", 1)[0]
+	return group_name
+
+
 def _build_group_components(examples: list[DirectionExample]) -> list[list[int]]:
 	"""Build connected components that keep identical groups and signatures together."""
 	n = len(examples)
@@ -327,7 +343,7 @@ def _build_group_components(examples: list[DirectionExample]) -> list[list[int]]
 	first_by_group: dict[str, int] = {}
 	first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
 	for index, example in enumerate(examples):
-		group_name = _example_group_name(example, index)
+		group_name = _split_group_anchor_name(example, index)
 		previous = first_by_group.get(group_name)
 		if previous is None:
 			first_by_group[group_name] = index
@@ -755,8 +771,10 @@ def _write_split_artifacts(
 	train_group_names = _build_split_group_name_map(train_indices)
 	val_group_names = _build_split_group_name_map(val_indices)
 	test_group_names = _build_split_group_name_map(test_indices)
+	train_all_group_names = dict(train_group_names)
+	train_all_group_names.update(val_group_names)
 
-	def _write_split_jsonl(path: Path, indices: list[int], examples: list[DirectionExample]) -> None:
+	def _write_split_jsonl(path: Path, indices: list[int], examples: list[DirectionExample], group_name_map: dict[int, str]) -> None:
 		with path.open("w") as fh:
 			for index, example in zip(indices, examples):
 				fh.write(
@@ -764,11 +782,7 @@ def _write_split_artifacts(
 						{
 							"index": index,
 							"group_name": example.group_name,
-							"split_group_name": train_group_names.get(index)
-							if path.name == "train.jsonl"
-							else val_group_names.get(index)
-							if path.name == "val.jsonl"
-							else test_group_names.get(index),
+							"split_group_name": group_name_map.get(index),
 							"example": asdict(example),
 						},
 						sort_keys=True,
@@ -776,9 +790,10 @@ def _write_split_artifacts(
 					+ "\n"
 				)
 
-	_write_split_jsonl(split_dir / "train.jsonl", train_indices, train_examples)
-	_write_split_jsonl(split_dir / "val.jsonl", val_indices, val_examples)
-	_write_split_jsonl(split_dir / "test.jsonl", test_indices, test_examples)
+	_write_split_jsonl(split_dir / "train.jsonl", train_indices, train_examples, train_group_names)
+	_write_split_jsonl(split_dir / "val.jsonl", val_indices, val_examples, val_group_names)
+	_write_split_jsonl(split_dir / "train_all.jsonl", train_indices + val_indices, train_examples + val_examples, train_all_group_names)
+	_write_split_jsonl(split_dir / "test.jsonl", test_indices, test_examples, test_group_names)
 
 	manifest = {
 		"dataset_path": str(dataset_path),
@@ -788,12 +803,14 @@ def _write_split_artifacts(
 		"splits": {
 			"train": {"count": len(train_examples), "indices": train_indices, "path": str(split_dir / "train.jsonl")},
 			"val": {"count": len(val_examples), "indices": val_indices, "path": str(split_dir / "val.jsonl")},
+			"train_all": {"count": len(train_examples) + len(val_examples), "indices": train_indices + val_indices, "path": str(split_dir / "train_all.jsonl")},
 			"test": {"count": len(test_examples), "indices": test_indices, "path": str(split_dir / "test.jsonl")},
 		},
 	}
 	manifest["split_groups"] = {
 		"train": sorted(set(train_group_names.values())),
 		"val": sorted(set(val_group_names.values())),
+		"train_all": sorted(set(train_all_group_names.values())),
 		"test": sorted(set(test_group_names.values())),
 	}
 	manifest_path = split_dir / "split_manifest.json"
@@ -809,10 +826,13 @@ def _build_split_similarity_report(
 	val_examples: list[DirectionExample],
 	test_examples: list[DirectionExample],
 ) -> dict[str, Any]:
-	reference_indexes = _build_reference_similarity_indexes(train_examples)
+	train_all_examples = train_examples + val_examples
+	train_reference_indexes = _build_reference_similarity_indexes(train_examples)
+	train_all_reference_indexes = _build_reference_similarity_indexes(train_all_examples)
 	sections = [
-		_analyze_query_against_reference("train", reference_indexes, "val", val_examples, seed),
-		_analyze_query_against_reference("train", reference_indexes, "test", test_examples, seed),
+		_analyze_query_against_reference("train", train_reference_indexes, "val", val_examples, seed),
+		_analyze_query_against_reference("train", train_reference_indexes, "test", test_examples, seed),
+		_analyze_query_against_reference("train_all", train_all_reference_indexes, "test", test_examples, seed),
 	]
 	return {
 		"dataset_path": str(dataset_path),

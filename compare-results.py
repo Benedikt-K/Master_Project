@@ -37,10 +37,6 @@ EVOL_TOOL_DIRS = [
 ]
 
 SINGLETON_DIRS = {
-    "out-cluster-size-50":       "cluster-size-50",
-    "out-cluster-size-150":      "cluster-size-150",
-    "out-cluster-size-300":      "cluster-size-300",
-    "out-SP-cluster-smaller200": "SP-cluster-smaller200",
     "out-sp_style_clusters":     "sp_style_clusters",
 }
 
@@ -301,7 +297,7 @@ def load_evor_predictions(base_dir: Path, tool_dir_name: str,
                           flip_map: dict[str, bool] | None = None) -> pd.DataFrame:
     """
     Load CRISPR-evOr predictions for one clustering configuration.
-    Includes singleton arrays (orientation = 'Singleton – no prediction').
+    Includes singleton arrays (orientation = 'Singleton -> no prediction').
 
     flip_map (optional): array_id -> was_flipped
       When provided (SP-style clustering), the evOr direction is treated as
@@ -1090,7 +1086,11 @@ def run_comparisons(base_dir: Path, out_dir: Path,
         "macro_avg_pct_agree_no_sp_singletons",
         "macro_avg_pct_agree_effective_no_sp_singletons",
     ]
-    macro_df = summary_df[macro_cols].dropna(subset=["n_subtypes_macro"], how="all")
+    macro_cols_present = [col for col in macro_cols if col in summary_df.columns]
+    if "n_subtypes_macro" in macro_cols_present:
+        macro_df = summary_df[macro_cols_present].dropna(subset=["n_subtypes_macro"], how="all")
+    else:
+        macro_df = pd.DataFrame()
     if not macro_df.empty:
         print("\n=== Summary (macro-average over subtypes) ===")
         print(macro_df.to_string(index=False))
@@ -1155,8 +1155,7 @@ def main():
     )
     parser.add_argument(
         "--base-dir", default=".",
-        help="Root directory containing test_out/, out-cluster-size-50/, "
-             "cluster-size-50/, etc. (default: current directory)",
+        help="Root directory containing test_out/ (default: current directory)",
     )
     parser.add_argument(
         "--out-dir", default="./crispr_comparison_results",
