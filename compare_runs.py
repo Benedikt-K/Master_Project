@@ -397,20 +397,24 @@ new Chart(document.getElementById('accBar'), {{
 # ENTRY POINT  —  edit INPUT_FILES below
 # ═════════════════════════════════════════════════════════════════════════════
 
-"""INPUT_FILES = [
-    "sample-0.txt",   # ← replace with your actual filenames
-    "sample-10.txt",
-    "sample-20.txt", 
-    "sample-50.txt", 
-    "sample-100.txt", 
-    "sample-150.txt", 
-    # "run3.txt",  # add / remove as needed (up to 6)
-]"""
 INPUT_FILES = [
-    "without_sub-_superset_del.txt",
-    "with_sub-_superset_del.txt",
+    "0.txt",   # ← replace with your actual filenames
+    #"10.txt",
+    "20.txt", 
+    "50.txt", 
+    "100.txt", 
+    "200.txt", 
+    "300.txt",
     # "run3.txt",  # add / remove as needed (up to 6)
 ]
+"""
+INPUT_FILES = [
+    #"without_sub-_superset_del.txt",
+    #"with_sub-_superset_del.txt",
+    "pos_absolute.txt",
+    "pos_alibi.txt",
+    "pos_rope.txt",
+]"""
 
 OUTPUT_FILE = "comparison_report.html"
 

@@ -505,6 +505,7 @@ def _split_candidate_objective(
 	train_indices = candidate["train"]
 	val_indices = candidate["val"]
 	test_indices = candidate["test"]
+	train_all_indices = train_indices + val_indices
 
 	test_leak_fraction, test_leak_count = _subarray_leakage_fraction_from_index(
 		train_indices,
@@ -514,6 +515,16 @@ def _split_candidate_objective(
 	val_leak_fraction, val_leak_count = _subarray_leakage_fraction_from_index(
 		train_indices,
 		val_indices,
+		per_example_subarrays,
+	)
+	val_test_leak_fraction, val_test_leak_count = _subarray_leakage_fraction_from_index(
+		val_indices,
+		test_indices,
+		per_example_subarrays,
+	)
+	train_all_test_leak_fraction, train_all_test_leak_count = _subarray_leakage_fraction_from_index(
+		train_all_indices,
+		test_indices,
 		per_example_subarrays,
 	)
 
@@ -527,6 +538,13 @@ def _split_candidate_objective(
 
 	if optimize_target == "test":
 		objective = test_leak_fraction + (0.05 * size_penalty)
+	elif optimize_target == "train_all_test":
+		objective = train_all_test_leak_fraction + (0.05 * size_penalty)
+	elif optimize_target in {"all_pairs", "all_pais", "all-pairs"}:
+		pair_max = max(test_leak_fraction, val_leak_fraction, val_test_leak_fraction)
+		pair_min = min(test_leak_fraction, val_leak_fraction, val_test_leak_fraction)
+		pair_balance_penalty = pair_max - pair_min
+		objective = pair_max + (0.5 * pair_balance_penalty) + (0.05 * size_penalty)
 	elif optimize_target == "both":
 		objective = worst_query_leak + (0.5 * leak_balance_penalty) + (0.05 * size_penalty)
 	else:
@@ -538,6 +556,10 @@ def _split_candidate_objective(
 		"test_leak_count": float(test_leak_count),
 		"val_leak_fraction": val_leak_fraction,
 		"val_leak_count": float(val_leak_count),
+		"val_test_leak_fraction": val_test_leak_fraction,
+		"val_test_leak_count": float(val_test_leak_count),
+		"train_all_test_leak_fraction": train_all_test_leak_fraction,
+		"train_all_test_leak_count": float(train_all_test_leak_count),
 		"worst_query_leak": worst_query_leak,
 		"leak_balance_penalty": leak_balance_penalty,
 		"size_penalty": size_penalty,
@@ -897,8 +919,8 @@ def _build_splits(
 ) -> dict[str, list[int]]:
 	if split_optimize_k < 2:
 		raise ValueError("--split_optimize_k must be >= 2")
-	if split_optimize_target not in {"both", "test"}:
-		raise ValueError("--split_optimize_target must be one of: both, test")
+	if split_optimize_target not in {"both", "test", "train_all_test", "all_pairs", "all_pais", "all-pairs"}:
+		raise ValueError("--split_optimize_target must be one of: both, test, train_all_test, all_pairs, all-pais, all_pais")
 
 	trials = max(1, int(split_optimize_trials))
 	if trials == 1:
@@ -944,7 +966,9 @@ def _build_splits(
 			f"objective={best_stats['objective']:.4f} "
 			f"worst_k{split_optimize_k}={best_stats['worst_query_leak']:.4f} "
 			f"test_k{split_optimize_k}={best_stats['test_leak_fraction']:.4f} "
+			f"train_all->test_k{split_optimize_k}={best_stats['train_all_test_leak_fraction']:.4f} "
 			f"val_k{split_optimize_k}={best_stats['val_leak_fraction']:.4f} "
+			f"val->test_k{split_optimize_k}={best_stats['val_test_leak_fraction']:.4f} "
 			f"balance={best_stats['leak_balance_penalty']:.4f} "
 			f"size_penalty={best_stats['size_penalty']:.4f}"
 		)
@@ -1166,9 +1190,9 @@ def main() -> int:
 	)
 	parser.add_argument(
 		"--split_optimize_target",
-		choices=["both", "test"],
+		choices=["both", "test", "train_all_test", "all_pairs", "all-pairs", "all_pais"],
 		default="both",
-		help="Optimize split search for both val+test leakage balance (default) or test leakage only.",
+		help="Optimize split search for both val+test leakage balance (default), test leakage only, train_all->test leakage (train+val as reference), or all split pairs (all_pairs / all-pairs / all_pais).",
 	)
 	parser.add_argument("--test_fraction", type=float, default=0.15)
 	parser.add_argument("--max_length", type=int, default=512)

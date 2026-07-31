@@ -2,9 +2,12 @@
 crispr_comparison_results/
 out-sp_style_clusters/
 out-sp_style_clusters-old/
+out-sp_style_clusters-old-names/
 sp_style_clusters/
 sp_style_clusters-old/
+sp_style_clusters-old-names/
 output_dataset_10k/
+output_dataset_fixed_10k/
 test_out/
 
 # ignore logs
