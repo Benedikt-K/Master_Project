@@ -31,3 +31,4 @@ extraced_arrays.txt
 
 # ignore model checkpoints
 *.pt
+Standalone/model_params/model.safetensors
