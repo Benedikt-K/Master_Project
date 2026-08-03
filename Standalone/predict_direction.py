@@ -404,12 +404,86 @@ def _full_model_exists(model_dir: Path) -> bool:
     return config_exists and weights_exist
 
 
-def load_model_and_tokenizer(model_dir: Path, device: torch.device, local_files_only: bool):
-    if not _full_model_exists(model_dir):
+def _adapter_exists(model_dir: Path) -> bool:
+    adapter_config_exists = (model_dir / "adapter_config.json").exists()
+    adapter_weights_exist = (
+        (model_dir / "adapter_model.safetensors").exists()
+        or (model_dir / "adapter_model.bin").exists()
+    )
+    return adapter_config_exists and adapter_weights_exist
+
+
+def _read_adapter_base_model(model_dir: Path) -> str | None:
+    adapter_config_path = model_dir / "adapter_config.json"
+    if not adapter_config_path.exists():
+        return None
+
+    try:
+        payload = json.loads(adapter_config_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {adapter_config_path}: {exc}") from exc
+
+    base_model_name = payload.get("base_model_name_or_path")
+    if isinstance(base_model_name, str) and base_model_name.strip():
+        return base_model_name.strip()
+    return None
+
+
+def _ensure_base_model_cached(
+    model_dir: Path,
+    *,
+    allow_downloads: bool,
+    local_files_only: bool,
+) -> str:
+    if _full_model_exists(model_dir):
+        return str(model_dir)
+
+    base_model_name = _read_adapter_base_model(model_dir)
+    if not base_model_name:
         raise FileNotFoundError(
-            f"Standalone full model files are missing in {model_dir}. "
-            "Expected config.json and model weights (model.safetensors or pytorch_model.bin)."
+            f"No full model weights found in {model_dir}, and adapter_config.json is missing or "
+            "does not define base_model_name_or_path."
         )
+
+    if not allow_downloads:
+        raise FileNotFoundError(
+            f"No full model weights found in {model_dir}. To fetch the base model ({base_model_name}) "
+            "on first run, pass --allow_downloads."
+        )
+
+    print(f"No full model cache found in {model_dir}. Downloading base model '{base_model_name}'...")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
+    )
+    model = AutoModelForSequenceClassification.from_pretrained(
+        base_model_name,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
+    )
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_pretrained(str(model_dir))
+    model.save_pretrained(str(model_dir))
+
+    print(f"Saved base model cache to: {model_dir}")
+    return base_model_name
+
+
+def load_model_and_tokenizer(
+    model_dir: Path,
+    device: torch.device,
+    *,
+    allow_downloads: bool,
+    local_files_only: bool,
+):
+    base_model_source = _ensure_base_model_cached(
+        model_dir,
+        allow_downloads=allow_downloads,
+        local_files_only=local_files_only,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_dir),
@@ -429,10 +503,32 @@ def load_model_and_tokenizer(model_dir: Path, device: torch.device, local_files_
         trust_remote_code=True,
         local_files_only=local_files_only,
     )
+
+    lora_applied = False
+    if _adapter_exists(model_dir):
+        try:
+            from peft import PeftModel
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "LoRA adapter files were found in model_dir, but the 'peft' package is not installed. "
+                "Install it with `pip install peft`."
+            ) from exc
+
+        model = PeftModel.from_pretrained(
+            model,
+            str(model_dir),
+            local_files_only=local_files_only,
+        )
+        lora_applied = True
+        print(f"Applied LoRA adapter from: {model_dir}")
+
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
     model.eval()
-    return model, tokenizer, str(model_dir)
+    model_id = str(model_dir)
+    if lora_applied:
+        model_id = f"{base_model_source} + LoRA({model_dir})"
+    return model, tokenizer, model_id
 
 
 def predict(
@@ -635,6 +731,7 @@ def main() -> int:
     model, tokenizer, base_model_id = load_model_and_tokenizer(
         model_dir,
         device,
+        allow_downloads=args.allow_downloads,
         local_files_only=local_files_only,
     )
 

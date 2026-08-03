@@ -7,9 +7,16 @@ It is intended for inference only.
 ## Included Assets
 
 - Predictor script: [predict_direction.py](predict_direction.py)
-- Bundled full model: [model_params](model_params)
+- LoRA adapter + tokenizer assets: [model_params](model_params)
 
-The bundled model already contains config, tokenizer assets, and full weights.
+The standalone loader now supports this workflow:
+
+- If full base weights are already cached in `Standalone/model_params`, they are reused.
+- If full weights are missing, the script reads `adapter_config.json` to discover the base model
+  (for example `HuggingFaceBio/Carbon-500M`), downloads it from Hugging Face on first run,
+  and stores the weights in `Standalone/model_params`.
+- If adapter files are present (`adapter_config.json` + `adapter_model.safetensors`), LoRA is
+  applied automatically on top of the cached base model.
 
 ## Quick Start
 
@@ -35,7 +42,13 @@ Overrides:
 
 - `--cpu` forces CPU.
 - `--gpu` forces GPU and errors if CUDA is unavailable.
-- `--allow_downloads` allows Hugging Face fallback if local files are missing.
+- `--allow_downloads` allows first-run download of base model weights when local full weights are
+  missing.
+
+Important first run:
+
+- Run once with `--allow_downloads` if `model_params` does not already contain full base weights.
+- Later runs can be offline and reuse cached files.
 
 ## Supported Input Types
 
@@ -160,6 +173,16 @@ Options:
 - `--gpu`: Force GPU (fails if CUDA is unavailable).
 - `--result_file PATH`: Custom output JSON path.
 - `--allow_downloads`: Allow online fallback if local assets are missing.
+
+LoRA runtime notes:
+
+- If `adapter_config.json` and `adapter_model.safetensors` exist in `model_params`, the adapter is
+  loaded automatically.
+- If adapter files are present but `peft` is not installed, install it with:
+
+```bash
+pip install peft
+```
 
 ## Practical Examples
 
