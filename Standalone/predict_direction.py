@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -404,6 +405,32 @@ def _full_model_exists(model_dir: Path) -> bool:
     return config_exists and weights_exist
 
 
+def _base_cache_dir(model_dir: Path) -> Path:
+    return model_dir / "base_model_cache"
+
+
+def _copy_base_model_files(source_dir: Path, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    names_to_copy = {
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    }
+
+    for path in source_dir.iterdir():
+        if path.is_file() and (
+            path.name in names_to_copy
+            or path.name.startswith("model-")
+            or path.name.startswith("pytorch_model-")
+        ):
+            destination = target_dir / path.name
+            shutil.copy2(path, destination)
+
+
 def _adapter_exists(model_dir: Path) -> bool:
     adapter_config_exists = (model_dir / "adapter_config.json").exists()
     adapter_weights_exist = (
@@ -435,8 +462,16 @@ def _ensure_base_model_cached(
     allow_downloads: bool,
     local_files_only: bool,
 ) -> str:
+    cache_dir = _base_cache_dir(model_dir)
+    if _full_model_exists(cache_dir):
+        return str(cache_dir)
+
+    # Backward compatibility: previous versions stored base weights directly in model_dir.
+    # If adapter files are also present there, move/copy base-only files to cache_dir so
+    # we can load base and adapter separately and avoid duplicate adapter application.
     if _full_model_exists(model_dir):
-        return str(model_dir)
+        _copy_base_model_files(model_dir, cache_dir)
+        return str(cache_dir)
 
     base_model_name = _read_adapter_base_model(model_dir)
     if not base_model_name:
@@ -451,7 +486,7 @@ def _ensure_base_model_cached(
             "on first run, pass --allow_downloads."
         )
 
-    print(f"No full model cache found in {model_dir}. Downloading base model '{base_model_name}'...")
+    print(f"No full model cache found in {cache_dir}. Downloading base model '{base_model_name}'...")
 
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name,
@@ -464,12 +499,13 @@ def _ensure_base_model_cached(
         local_files_only=local_files_only,
     )
 
-    model_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Tokenizer stays in model_dir; base model weights/config are stored in cache_dir.
     tokenizer.save_pretrained(str(model_dir))
-    model.save_pretrained(str(model_dir))
+    model.save_pretrained(str(cache_dir))
 
-    print(f"Saved base model cache to: {model_dir}")
-    return base_model_name
+    print(f"Saved base model cache to: {cache_dir}")
+    return str(cache_dir)
 
 
 def load_model_and_tokenizer(
@@ -499,7 +535,7 @@ def load_model_and_tokenizer(
             raise ValueError("Tokenizer has no pad/eos/unk token.")
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        str(model_dir),
+        str(base_model_source),
         trust_remote_code=True,
         local_files_only=local_files_only,
     )
@@ -525,7 +561,7 @@ def load_model_and_tokenizer(
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
     model.eval()
-    model_id = str(model_dir)
+    model_id = str(base_model_source)
     if lora_applied:
         model_id = f"{base_model_source} + LoRA({model_dir})"
     return model, tokenizer, model_id

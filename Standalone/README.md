@@ -1,31 +1,30 @@
 # Standalone Direction Prediction Tool
 
-This folder contains an offline-first CLI for predicting CRISPR array direction.
+This folder contains a CLI for predicting CRISPR array direction. It is based on a finetuned version of the Carbon-500m model.
 
 It is intended for inference only.
 
-## Included Assets
-
-- Predictor script: [predict_direction.py](predict_direction.py)
-- LoRA adapter + tokenizer assets: [model_params](model_params)
-
-The standalone loader now supports this workflow:
-
-- If full base weights are already cached in `Standalone/model_params`, they are reused.
-- If full weights are missing, the script reads `adapter_config.json` to discover the base model
-  (for example `HuggingFaceBio/Carbon-500M`), downloads it from Hugging Face on first run,
-  and stores the weights in `Standalone/model_params`.
-- If adapter files are present (`adapter_config.json` + `adapter_model.safetensors`), LoRA is
-  applied automatically on top of the cached base model.
-
 ## Quick Start
 
-Run from project root (`<project-root>`):
+Recommended: create a dedicated Python environment first.
+
+Conda:
+
+```bash
+conda create -n crispr-standalone python=3.12 -y
+conda activate crispr-standalone
+pip install -r Standalone/requirements.txt
+```
+
+First run: 
 
 ```bash
 python Standalone/predict_direction.py \
-  --input_file Standalone/test.jsonl
+  --input_file Standalone/test.jsonl \
+  --allow_downloads
 ```
+
+After the first run it can be run without the --allow_downloads flag, as it downloads base model weights to `Standalone/model_params/base_model_cache` and resuses them from there.
 
 The tool will:
 
@@ -45,9 +44,9 @@ Overrides:
 - `--allow_downloads` allows first-run download of base model weights when local full weights are
   missing.
 
-Important first run:
+Important for first run:
 
-- Run once with `--allow_downloads` if `model_params` does not already contain full base weights.
+- Run once with `--allow_downloads` if `model_params/base_model_cache` does not already contain full base weights.
 - Later runs can be offline and reuse cached files.
 
 ## Supported Input Types
@@ -201,6 +200,17 @@ python Standalone/predict_direction.py \
   --cpu \
   --result_file Standalone/my_array_prediction.json
 ```
+
+## Included Assets
+
+- Predictor script: [predict_direction.py](predict_direction.py)
+- LoRA adapter + tokenizer assets: [model_params](model_params)
+
+- If full base weights are already cached in `Standalone/model_params/base_model_cache`, they are reused.
+- If full weights are missing, the script downloads it from Hugging Face on first run,
+  and stores the weights in `Standalone/model_params/base_model_cache`.
+- If adapter files are present (`adapter_config.json` + `adapter_model.safetensors`), LoRA is
+  applied automatically on top of the cached base model.
 
 ## Troubleshooting
 
