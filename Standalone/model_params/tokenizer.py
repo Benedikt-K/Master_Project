@@ -20,7 +20,7 @@ import warnings
 import itertools
 from typing import List, Optional, Tuple, Dict, Union, Any
 
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, AutoTokenizer, BatchEncoding
+from transformers import PreTrainedTokenizer, AutoTokenizer, BatchEncoding
 
 
 class HybridDNATokenizer(PreTrainedTokenizer):
@@ -47,35 +47,9 @@ class HybridDNATokenizer(PreTrainedTokenizer):
         **kwargs
     ):
         self.k = k
-        local_files_only = bool(kwargs.pop("local_files_only", False))
 
-        # Load base tokenizer from local files when available.
-        # This keeps the standalone package offline-friendly.
-        local_tok_json = None
-        local_tok_cfg = {}
-        if base_tokenizer_path:
-            candidate = os.path.join(base_tokenizer_path, "tokenizer.json")
-            if os.path.exists(candidate):
-                local_tok_json = candidate
-                cfg_path = os.path.join(base_tokenizer_path, "tokenizer_config.json")
-                if os.path.exists(cfg_path):
-                    with open(cfg_path, "r", encoding="utf-8") as fh:
-                        local_tok_cfg = json.load(fh)
-
-        if local_tok_json is not None:
-            self._base_tokenizer = PreTrainedTokenizerFast(
-                tokenizer_file=local_tok_json,
-                eos_token=local_tok_cfg.get("eos_token", "<|endoftext|>"),
-                pad_token=local_tok_cfg.get("pad_token", "<|endoftext|>"),
-                unk_token=local_tok_cfg.get("unk_token", None),
-                bos_token=local_tok_cfg.get("bos_token", None),
-                clean_up_tokenization_spaces=local_tok_cfg.get("clean_up_tokenization_spaces", False),
-            )
-        else:
-            self._base_tokenizer = AutoTokenizer.from_pretrained(
-                "Qwen/Qwen3-4B-Base",
-                local_files_only=local_files_only,
-            )
+        # Load base tokenizer (Qwen3-4B-Base)
+        self._base_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Base")
 
         # Get base vocabulary
         self._base_vocab = self._base_tokenizer.get_vocab()
@@ -307,8 +281,8 @@ class HybridDNATokenizer(PreTrainedTokenizer):
         return self._id_to_token.get(index, "<oov>")
 
     def convert_tokens_to_string(self, tokens: List[str]) -> str:
-        return "".join(tokens)
-
+        ids = [self._convert_token_to_id(t) for t in tokens]
+        return self.decode(ids, skip_special_tokens=False)
     def encode(
         self,
         text: str,
@@ -606,22 +580,61 @@ class HybridDNATokenizer(PreTrainedTokenizer):
         return (save_directory,)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        k = 6
-        auto_dna_tags = False
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path,
+        *args,
+        cache_dir=None,
+        local_files_only=False,
+        token=None,
+        revision="main",
+        trust_remote_code=False,
+        **kwargs,
+    ):
+        # Custom loader: PreTrainedTokenizer.from_pretrained is incompatible with this
+        # tokenizer's __init__ (it re-passes bos_token etc.), so construct directly from
+        # bio_config/dna_config. That bypasses standard metadata loading, so also read
+        # chat_template from tokenizer_config.json (vLLM / apply_chat_template need it).
+        from transformers.utils.hub import cached_file
 
-        dna_config_path = os.path.join(pretrained_model_name_or_path, "dna_config.json")
-        tok_config_path = os.path.join(pretrained_model_name_or_path, "tokenizer_config.json")
+        proxies = kwargs.pop("proxies", None)
+        subfolder = kwargs.pop("subfolder", None)
+        commit_hash = kwargs.pop("_commit_hash", None)
+        hub_kwargs = {
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+            "proxies": proxies,
+            "revision": revision,
+            "subfolder": subfolder,
+            "token": token,
+            "_commit_hash": commit_hash,
+            "_raise_exceptions_for_missing_entries": False,
+        }
 
-        if os.path.exists(dna_config_path):
-            with open(dna_config_path, "r") as f:
-                dna_config = json.load(f)
-            k = dna_config.get("k", 6)
-            auto_dna_tags = dna_config.get("auto_dna_tags", False)
-        elif os.path.exists(tok_config_path):
-            with open(tok_config_path, "r") as f:
-                tok_config = json.load(f)
-            k = tok_config.get("k", 6)
-            auto_dna_tags = tok_config.get("auto_dna_tags", False)
+        cfg = {}
+        for _name in ("bio_config.json", "dna_config.json"):
+            _p = cached_file(pretrained_model_name_or_path, _name, **hub_kwargs)
+            if _p is not None:
+                with open(_p, encoding="utf-8") as _f:
+                    cfg = json.load(_f)
+                break
 
-        return cls(base_tokenizer_path=pretrained_model_name_or_path, k=k, auto_dna_tags=auto_dna_tags, **kwargs)
+        _init = {"base_tokenizer_path": pretrained_model_name_or_path}
+        for _key in ("k", "tail", "auto_dna_tags"):
+            if _key in cfg:
+                _init[_key] = cfg[_key]
+
+        tokenizer_config_path = cached_file(pretrained_model_name_or_path, "tokenizer_config.json", **hub_kwargs)
+        if tokenizer_config_path is not None:
+            with open(tokenizer_config_path, encoding="utf-8") as _f:
+                tokenizer_config = json.load(_f)
+            if tokenizer_config.get("chat_template"):
+                _init["chat_template"] = tokenizer_config["chat_template"]
+
+        chat_template_path = cached_file(pretrained_model_name_or_path, "chat_template.jinja", **hub_kwargs)
+        if chat_template_path is not None:
+            with open(chat_template_path, encoding="utf-8") as _f:
+                _init["chat_template"] = _f.read()
+
+        _init.update(kwargs)
+        return cls(**_init)

@@ -28,6 +28,7 @@ extraced_arrays.txt
 
 # ignore run notes
 *.txt
+!Standalone/requirements.txt
 
 # ignore model checkpoints
 *.pt
