@@ -1,6 +1,7 @@
 # Standalone Direction Prediction Tool
 
-This folder contains a CLI for predicting CRISPR array direction. It is based on a finetuned version of the Carbon-500m model.
+This folder contains a CLI for predicting CRISPR array direction. It is based on a finetuned version of the Carbon-500m model, 
+which was finetuned on the predictions of 
 
 It is intended for inference only.
 
@@ -16,11 +17,11 @@ conda activate crispr-standalone
 pip install -r Standalone/requirements.txt
 ```
 
-First run: 
+For the first run you can test, if everything works on your end with this example array:
 
 ```bash
 python Standalone/predict_direction.py \
-  --input_file Standalone/test.jsonl \
+  --input_file Standalone/example_array.json \
   --allow_downloads
 ```
 
@@ -30,6 +31,25 @@ The tool will:
 
 - Print a summary to stdout.
 - Write a JSON file named `prediction_result.json` next to the input file.
+
+## Train/Val Lookup (Trust Signal)
+
+Lookup is optional and runs only when you pass `--lookup`.
+When enabled, the standalone CLI looks up your query array in the bundled train/val DB and reports:
+
+- exact presence in train/val (if the same array is present)
+- similarity to nearest train/val arrays (if not present)
+
+The lookup uses spacers + repeats for exact match and spacer similarity for nearest-neighbor reporting.
+The lookup DB path is fixed to `Standalone/lookup/array_lookup_db.json`.
+
+Enable lookup explicitly:
+
+```bash
+python Standalone/predict_direction.py \
+  --input_file Standalone/example_array.json \
+  --lookup
+```
 
 ## Device Behavior
 
@@ -51,32 +71,20 @@ Important for first run:
 
 ## Supported Input Types
 
-## 1) Standard JSON / JSONL
+## 1) Standard JSON
 
-Accepted formats:
-
-1. Direct example object:
+Example object:
 
 ```json
 {
-  "array_name": "my_array",
-  "group_name": "my_group",
-  "cas_subtype": "I-E",
-  "repeats": ["CGGTTTATCCCCGCTGGCGCGGGGAACTC", "CGGTTTATCCCCGCTGGCGCGGGGAACTC"],
-  "spacers": ["CAGCGTCAGGCGTGAAATCTCACCGTCGTTGC"]
+  "array_name":"my_array",
+  "repeats": ["..."],
+  "spacers": ["..."]
 }
 ```
 
-2. Wrapped example object:
-
-```json
-{
-  "example": {
-    "repeats": ["..."],
-    "spacers": ["..."]
-  }
-}
-```
+Here spacers and repeats have to be in order and there have to be multiple repeats. If only one repeat occurs, still provide that #spacers+1 times,
+like in the provided example_array.json. If any are missing, that degrades the quality of the prediction.
 
 Notes:
 
@@ -91,7 +99,7 @@ Example:
 
 ```bash
 python Standalone/predict_direction.py \
-  --input_file test_out/Result_XXX/result.json \
+  --input_file Result_XXX/result.json \
   --ccf
 ```
 
@@ -99,7 +107,7 @@ If multiple entries exist, select which one to predict:
 
 ```bash
 python Standalone/predict_direction.py \
-  --input_file test_out/Result_XXX/result.json \
+  --input_file Result_XXX/result.json \
   --ccf \
   --ccf_sequence_index 0 \
   --ccf_crispr_index 0
@@ -119,9 +127,9 @@ CCF extraction mapping used by the script:
 Always text summary, for example:
 
 ```text
-Predicted direction is "Forward" with probability 0.998 (99.8%).
-Alternative direction "Reverse" has probability 0.002 (0.2%).
-Input summary: repeats=31, spacers=30, tokens=367, sequence_mode=interleaved, include_flanks=False.
+Predicted direction is "Forward" with probability 0.991 (99.1%).
+Alternative direction "Reverse" has probability 0.009 (0.9%).
+Input summary: repeats=31, spacers=30, tokens=367.
 Array name: NZ_CP123870_1
 Input file: <project-root>/test_out/Result_XXX/result.json
 Saved result JSON to: <project-root>/test_out/Result_XXX/prediction_result.json
@@ -141,10 +149,11 @@ Core fields in output JSON:
 - `model_dir`
 - `base_model`
 - `device`
-- `array_name`, `group_name`, `cas_subtype`
+- `array_name`, `cas_subtype` (if provided in input)
 - `predicted_label_id`, `predicted_label`
 - `prob_reverse`, `prob_forward`
 - `token_count`
+- `lookup` block (only when `--lookup` is used), containing exact train/val presence or nearest similarities
 - `ccf` metadata block (present only with `--ccf`)
 
 Label mapping:
@@ -165,13 +174,12 @@ Options:
 - `--ccf_sequence_index N`: CCF `Sequences` index (default `0`).
 - `--ccf_crispr_index M`: CCF `Crisprs` index within the selected sequence (default `0`).
 - `--model_dir PATH`: Model directory (default: `Standalone/model_params`).
-- `--sequence_mode interleaved|spacers_only`: Sequence construction mode (default `interleaved`).
-- `--include_flanks`: Include left/right flanks in constructed sequence.
 - `--max_length N`: Tokenizer truncation length (default `256`).
 - `--cpu`: Force CPU.
 - `--gpu`: Force GPU (fails if CUDA is unavailable).
 - `--result_file PATH`: Custom output JSON path.
 - `--allow_downloads`: Allow online fallback if local assets are missing.
+- `--lookup`: Enable lookup against bundled train/val DB (off by default for faster inference).
 
 LoRA runtime notes:
 
@@ -205,6 +213,7 @@ python Standalone/predict_direction.py \
 
 - Predictor script: [predict_direction.py](predict_direction.py)
 - LoRA adapter + tokenizer assets: [model_params](model_params)
+- Bundled train/val lookup DB: [lookup/array_lookup_db.json](lookup/array_lookup_db.json)
 
 - If full base weights are already cached in `Standalone/model_params/base_model_cache`, they are reused.
 - If full weights are missing, the script downloads it from Hugging Face on first run,
@@ -218,9 +227,13 @@ python Standalone/predict_direction.py \
 
 - Retry with `--cpu`.
 
+FileNotFoundError: No full model weights found:
+
+- You dont have the base model saved in your directory, run again with --allow_downloads.
+
 Input validation errors:
 
-- Standard mode: verify `repeats` and `spacers` are lists of strings.
+- Standard mode: verify `repeats` and `spacers` are lists of strings and the file has enough repeats in the list.
 - CCF mode: verify file contains `Sequences -> Crisprs -> Regions`.
 
 Unexpected downloads:

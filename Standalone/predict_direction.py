@@ -14,8 +14,10 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 DNA_SEPARATOR = "NNNNNN"
 FASTA_SUFFIXES = {".fa", ".fna", ".fasta"}
+LOOKUP_DB_PATH = (Path(__file__).resolve().parent / "lookup" / "array_lookup_db.json").resolve()
+LOOKUP_TOP_K = 5
 
-# TODO add fasta support
+# TODO add fasta support, when inputing array as one sequence.
 
 def normalize_dna(sequence: str) -> str:
     sequence = sequence.upper().replace("U", "T")
@@ -41,23 +43,10 @@ def interleave_segments(repeats: list[str], spacers: list[str]) -> list[str]:
 def build_carbon_sequence(
     repeats: list[str],
     spacers: list[str],
-    left_flank: str,
-    right_flank: str,
-    include_flanks: bool,
-    sequence_mode: str,
 ) -> str:
     pieces: list[str] = []
 
-    if include_flanks and left_flank:
-        pieces.append(normalize_dna(left_flank))
-
-    if sequence_mode == "spacers_only":
-        pieces.extend(normalize_dna(spacer) for spacer in spacers if spacer)
-    else:
-        pieces.extend(interleave_segments(repeats, spacers))
-
-    if include_flanks and right_flank:
-        pieces.append(normalize_dna(right_flank))
+    pieces.extend(interleave_segments(repeats, spacers))
 
     core = DNA_SEPARATOR.join(piece for piece in pieces if piece)
     return f"<dna>{core}</dna>"
@@ -394,6 +383,316 @@ def _build_batch_summary(
     }
 
 
+def _reverse_complement(sequence: str) -> str:
+    trans = str.maketrans("ACGTN", "TGCAN")
+    return normalize_dna(sequence).translate(trans)[::-1]
+
+
+def _canonical_spacer_token(sequence: str) -> str:
+    normalized = normalize_dna(sequence)
+    rc = _reverse_complement(normalized)
+    return min(normalized, rc)
+
+
+def _canonical_sequence_tuple(sequences: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    normalized = tuple(normalize_dna(sequence) for sequence in sequences if sequence)
+    reverse_complemented = tuple(_reverse_complement(sequence) for sequence in reversed(normalized))
+    return min(normalized, reverse_complemented)
+
+
+def _array_core_sequence_from_lists(repeats: list[str], spacers: list[str]) -> str:
+    pieces: list[str] = []
+    max_length = max(len(repeats), len(spacers))
+    for index in range(max_length):
+        if index < len(repeats):
+            pieces.append(normalize_dna(repeats[index]))
+        if index < len(spacers):
+            pieces.append(normalize_dna(spacers[index]))
+    return "".join(piece for piece in pieces if piece)
+
+
+def _canonical_31mers(sequence: str) -> set[str]:
+    if len(sequence) < 31:
+        return set()
+    return {
+        _canonical_spacer_token(sequence[start:start + 31])
+        for start in range(len(sequence) - 31 + 1)
+    }
+
+
+def _bucket_coverage_fraction(value: float) -> str:
+    if value == 0.0:
+        return "0"
+    if value < 0.25:
+        return "(0,0.25]"
+    if value < 0.5:
+        return "(0.25,0.5]"
+    if value < 0.75:
+        return "(0.5,0.75]"
+    if value < 1.0:
+        return "(0.75,1.0)"
+    return "1.0"
+
+
+def _canonical_array_signature(repeats: list[str], spacers: list[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    repeats_norm = tuple(normalize_dna(sequence) for sequence in repeats if sequence)
+    spacers_norm = tuple(normalize_dna(sequence) for sequence in spacers if sequence)
+    forward = (repeats_norm, spacers_norm)
+
+    repeats_rc = tuple(_reverse_complement(sequence) for sequence in reversed(repeats_norm))
+    spacers_rc = tuple(_reverse_complement(sequence) for sequence in reversed(spacers_norm))
+    reverse = (repeats_rc, spacers_rc)
+    return min(forward, reverse)
+
+
+def _extract_lookup_examples_from_jsonl(path: Path, split: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        payload = json.loads(line)
+        if isinstance(payload.get("example"), dict):
+            payload = payload["example"]
+
+        repeats = payload.get("repeats")
+        spacers = payload.get("spacers")
+        if not isinstance(repeats, list) or not all(isinstance(x, str) for x in repeats):
+            continue
+        if not isinstance(spacers, list) or not all(isinstance(x, str) for x in spacers):
+            continue
+
+        rows.append(
+            {
+                "split": split,
+                "array_name": str(payload.get("array_name", f"{split}_{line_number}")),
+                "repeats": [normalize_dna(x) for x in repeats if x],
+                "spacers": [normalize_dna(x) for x in spacers if x],
+            }
+        )
+    return rows
+
+
+def _build_lookup_db(
+    *,
+    train_jsonl: Path | None,
+    val_jsonl: Path | None,
+    output_path: Path,
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    if train_jsonl is not None:
+        entries.extend(_extract_lookup_examples_from_jsonl(train_jsonl, split="train"))
+    if val_jsonl is not None:
+        entries.extend(_extract_lookup_examples_from_jsonl(val_jsonl, split="val"))
+
+    db = {
+        "version": 1,
+        "sources": {
+            "train_jsonl": str(train_jsonl) if train_jsonl is not None else "",
+            "val_jsonl": str(val_jsonl) if val_jsonl is not None else "",
+        },
+        "entries": entries,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(db, indent=2, sort_keys=True))
+    return db
+
+
+def _load_lookup_db(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    entries = payload.get("entries", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"Lookup DB has invalid 'entries' format: {path}")
+
+    signature_map: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    spacer_sets: list[set[str]] = []
+    cleaned_entries: list[dict[str, Any]] = []
+
+    for raw_entry in entries:
+        if not isinstance(raw_entry, dict):
+            continue
+        repeats = raw_entry.get("repeats")
+        spacers = raw_entry.get("spacers")
+        split = str(raw_entry.get("split", "unknown"))
+        if not isinstance(repeats, list) or not all(isinstance(x, str) for x in repeats):
+            continue
+        if not isinstance(spacers, list) or not all(isinstance(x, str) for x in spacers):
+            continue
+
+        entry = {
+            "split": split,
+            "array_name": str(raw_entry.get("array_name", "")),
+            "repeats": [normalize_dna(x) for x in repeats if x],
+            "spacers": [normalize_dna(x) for x in spacers if x],
+        }
+        cleaned_entries.append(entry)
+
+        index = len(cleaned_entries) - 1
+        signature = _canonical_array_signature(entry["repeats"], entry["spacers"])
+        signature_map.setdefault(signature, []).append(index)
+        spacer_sets.append({_canonical_spacer_token(x) for x in entry["spacers"] if x})
+
+    return {
+        "path": str(path),
+        "entries": cleaned_entries,
+        "signature_map": signature_map,
+        "spacer_sets": spacer_sets,
+    }
+
+
+def _lookup_array_against_db(
+    ex: dict[str, Any],
+    lookup_state: dict[str, Any],
+    *,
+    top_k: int,
+) -> dict[str, Any]:
+    query_signature = _canonical_array_signature(ex["repeats"], ex["spacers"])
+    matches = lookup_state["signature_map"].get(query_signature, [])
+    entries = lookup_state["entries"]
+
+    query_spacers = {_canonical_spacer_token(x) for x in ex["spacers"] if x}
+    query_spacer_list = [normalize_dna(x) for x in ex["spacers"] if x]
+    query_k_subarrays: dict[int, set[tuple[str, ...]]] = {}
+    for k in (2, 3, 4, 5):
+        if len(query_spacer_list) < k:
+            query_k_subarrays[k] = set()
+            continue
+        query_k_subarrays[k] = {
+            _canonical_sequence_tuple(query_spacer_list[start:start + k])
+            for start in range(len(query_spacer_list) - k + 1)
+        }
+    query_core_sequence = _array_core_sequence_from_lists(ex["repeats"], ex["spacers"])
+    query_31mers = _canonical_31mers(query_core_sequence)
+
+    scored: list[tuple[float, float, int, int]] = []
+    split_stats: dict[str, dict[str, Any]] = {}
+    for index, candidate_spacers in enumerate(lookup_state["spacer_sets"]):
+        union = query_spacers | candidate_spacers
+        if not union:
+            jaccard = 0.0
+        else:
+            jaccard = len(query_spacers & candidate_spacers) / len(union)
+        shared = len(query_spacers & candidate_spacers)
+        containment = (shared / len(query_spacers)) if query_spacers else 0.0
+        scored.append((jaccard, containment, shared, index))
+
+        split_name = entries[index].get("split", "unknown")
+        current = split_stats.get(split_name)
+        if current is None:
+            split_stats[split_name] = {
+                "count": 1,
+                "sum_jaccard": jaccard,
+                "sum_containment": containment,
+                "best_jaccard": jaccard,
+                "best_containment": containment,
+                "best_shared_spacers": shared,
+                "best_array_name": entries[index].get("array_name", ""),
+                "coverage_histogram": Counter({_bucket_coverage_fraction(containment): 1}),
+                "coverage_100_count": 1 if containment == 1.0 else 0,
+                "k_overlap_counts": {2: 0, 3: 0, 4: 0, 5: 0},
+                "kmer31_overlap_count": 0,
+            }
+        else:
+            current["count"] += 1
+            current["sum_jaccard"] += jaccard
+            current["sum_containment"] += containment
+            current["coverage_histogram"][_bucket_coverage_fraction(containment)] += 1
+            if containment == 1.0:
+                current["coverage_100_count"] += 1
+            is_better = (
+                jaccard > current["best_jaccard"]
+                or (jaccard == current["best_jaccard"] and containment > current["best_containment"])
+                or (
+                    jaccard == current["best_jaccard"]
+                    and containment == current["best_containment"]
+                    and shared > current["best_shared_spacers"]
+                )
+            )
+            if is_better:
+                current["best_jaccard"] = jaccard
+                current["best_containment"] = containment
+                current["best_shared_spacers"] = shared
+                current["best_array_name"] = entries[index].get("array_name", "")
+
+        candidate_spacer_list = entries[index].get("spacers", [])
+        for k in (2, 3, 4, 5):
+            if not query_k_subarrays[k] or len(candidate_spacer_list) < k:
+                continue
+            has_k_overlap = any(
+                _canonical_sequence_tuple(candidate_spacer_list[start:start + k]) in query_k_subarrays[k]
+                for start in range(len(candidate_spacer_list) - k + 1)
+            )
+            if has_k_overlap:
+                split_stats[split_name]["k_overlap_counts"][k] += 1
+
+        if query_31mers:
+            candidate_core = _array_core_sequence_from_lists(entries[index].get("repeats", []), candidate_spacer_list)
+            candidate_31mers = _canonical_31mers(candidate_core)
+            if query_31mers & candidate_31mers:
+                split_stats[split_name]["kmer31_overlap_count"] += 1
+
+    split_similarity = {
+        split_name: {
+            "count": int(values["count"]),
+            "best_jaccard": float(values["best_jaccard"]),
+            "best_containment": float(values["best_containment"]),
+            "best_shared_spacers": int(values["best_shared_spacers"]),
+            "best_array_name": str(values["best_array_name"]),
+            "mean_jaccard": float(values["sum_jaccard"] / values["count"]),
+            "mean_containment": float(values["sum_containment"] / values["count"]),
+            "coverage_histogram": {
+                bucket: int(values["coverage_histogram"].get(bucket, 0))
+                for bucket in ["0", "(0,0.25]", "(0.25,0.5]", "(0.5,0.75]", "(0.75,1.0)", "1.0"]
+            },
+            "coverage_100_count": int(values["coverage_100_count"]),
+            "k_overlap_counts": {str(k): int(values["k_overlap_counts"][k]) for k in (2, 3, 4, 5)},
+            "k_overlap_flags": {str(k): bool(values["k_overlap_counts"][k] > 0) for k in (2, 3, 4, 5)},
+            "kmer31_overlap_count": int(values["kmer31_overlap_count"]),
+            "kmer31_overlap_flag": bool(values["kmer31_overlap_count"] > 0),
+        }
+        for split_name, values in split_stats.items()
+    }
+
+    if matches:
+        split_counts = Counter(entries[index]["split"] for index in matches)
+        return {
+            "db_path": lookup_state["path"],
+            "exact_match": True,
+            "match_count": len(matches),
+            "split_counts": dict(split_counts),
+            "split_similarity": split_similarity,
+            "matched_arrays": [
+                {
+                    "array_name": entries[index]["array_name"],
+                    "split": entries[index]["split"],
+                }
+                for index in matches[: min(len(matches), 10)]
+            ],
+        }
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    top_hits = []
+    for jaccard, containment, shared, index in scored[: max(1, top_k)]:
+        entry = entries[index]
+        top_hits.append(
+            {
+                "array_name": entry["array_name"],
+                "split": entry["split"],
+                "spacer_jaccard": jaccard,
+                "query_spacer_containment": containment,
+                "shared_spacers": shared,
+                "candidate_spacer_count": len(entry["spacers"]),
+            }
+        )
+
+    return {
+        "db_path": lookup_state["path"],
+        "exact_match": False,
+        "split_similarity": split_similarity,
+        "top_similar": top_hits,
+    }
+
+
 def _full_model_exists(model_dir: Path) -> bool:
     config_exists = (model_dir / "config.json").exists()
     weights_exist = (
@@ -643,17 +942,6 @@ def parse_args() -> argparse.Namespace:
         help="Path to standalone full model folder (default: Standalone/model_params).",
     )
     parser.add_argument(
-        "--sequence_mode",
-        choices=["interleaved", "spacers_only"],
-        default="interleaved",
-        help="Sequence construction mode used before tokenization.",
-    )
-    parser.add_argument(
-        "--include_flanks",
-        action="store_true",
-        help="Include left_flank and right_flank if present in input JSON.",
-    )
-    parser.add_argument(
         "--max_length",
         type=int,
         default=256,
@@ -688,6 +976,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow online downloads from Hugging Face Hub if local files are missing.",
     )
+    parser.add_argument(
+        "--lookup",
+        action="store_true",
+        help="Enable lookup against the bundled train/val DB (disabled by default for faster inference).",
+    )
     return parser.parse_args()
 
 
@@ -700,24 +993,79 @@ def _print_text_summary(
     input_path: Path,
     ex: dict[str, Any],
     result: dict[str, Any],
-    sequence_mode: str,
-    include_flanks: bool,
+    lookup: dict[str, Any] | None,
 ) -> None:
     predicted = result["predicted_label"]
     confidence = result["prob_reverse"] if predicted == "Reverse" else result["prob_forward"]
     opposite = "Forward" if predicted == "Reverse" else "Reverse"
     opposite_prob = result["prob_forward"] if predicted == "Reverse" else result["prob_reverse"]
 
+    print(f"=============================================================")
     print(f"Predicted direction is \"{predicted}\" with probability {_format_probability(confidence)}.")
     print(f"Alternative direction \"{opposite}\" has probability {_format_probability(opposite_prob)}.")
     print(
         f"Input summary: repeats={len(ex['repeats'])}, spacers={len(ex['spacers'])}, "
-        f"tokens={result['token_count']}, sequence_mode={sequence_mode}, include_flanks={include_flanks}."
+        f"tokens={result['token_count']}"
     )
     if ex.get("array_name"):
         print(f"Array name: {ex['array_name']}")
     if ex.get("cas_subtype"):
         print(f"CAS subtype: {ex['cas_subtype']}")
+    if lookup is not None:
+        split_similarity = lookup.get("split_similarity", {})
+        if isinstance(split_similarity, dict) and split_similarity:
+            print("Lookup similarity by split:")
+            for split_name in sorted(split_similarity.keys()):
+                stats = split_similarity.get(split_name, {})
+                if not isinstance(stats, dict):
+                    continue
+                count = max(1, int(stats.get("count", 0)))
+                print(
+                    f"  - {split_name}: n={int(stats.get('count', 0))}, "
+                    f"best_jaccard={float(stats.get('best_jaccard', 0.0)):.3f}, "
+                    f"best_containment={float(stats.get('best_containment', 0.0)):.3f}, "
+                    f"mean_jaccard={float(stats.get('mean_jaccard', 0.0)):.3f}, "
+                    f"best_array={str(stats.get('best_array_name', ''))}"
+                )
+                histogram = stats.get("coverage_histogram", {})
+                if isinstance(histogram, dict):
+                    buckets = ["0", "(0,0.25]", "(0.25,0.5]", "(0.5,0.75]", "(0.75,1.0)", "1.0"]
+                    parts = [
+                        f"{bucket}:{int(histogram.get(bucket, 0))}/{count}"
+                        for bucket in buckets
+                    ]
+                    print(f"    spacer coverage histogram: {' | '.join(parts)}")
+                k_counts = stats.get("k_overlap_counts", {})
+                k_flags = stats.get("k_overlap_flags", {})
+                if isinstance(k_counts, dict) and isinstance(k_flags, dict):
+                    k_parts = [
+                        f"k={k}:{int(k_counts.get(str(k), 0))}/{count} ({'yes' if k_flags.get(str(k), False) else 'no'})"
+                        for k in (2, 3, 4, 5)
+                    ]
+                    print(f"    contiguous k-spacer overlap: {' | '.join(k_parts)}")
+                kmer_count = int(stats.get("kmer31_overlap_count", 0))
+                kmer_flag = bool(stats.get("kmer31_overlap_flag", False))
+                print(
+                    f"    31-mer overlap: {kmer_count}/{count} candidate arrays "
+                    f"(flag={'yes' if kmer_flag else 'no'})"
+                )
+        if lookup.get("exact_match"):
+            split_counts = lookup.get("split_counts", {})
+            train_count = int(split_counts.get("train", 0))
+            val_count = int(split_counts.get("val", 0))
+            print(
+                "Lookup: exact match found in train/val database "
+                f"(train={train_count}, val={val_count})."
+            )
+        else:
+            top_hits = lookup.get("top_similar", [])
+            if top_hits:
+                best = top_hits[0]
+                print(
+                    "Lookup: no exact train/val match found. "
+                    f"Most similar: {best.get('array_name', '')} "
+                    f"[{best.get('split', 'unknown')}] with spacer_jaccard={float(best.get('spacer_jaccard', 0.0)):.3f}."
+                )
     print(f"Input file: {input_path}")
 
 
@@ -729,6 +1077,16 @@ def _resolve_result_path(input_path: Path, user_value: str) -> Path:
 
 def main() -> int:
     args = parse_args()
+
+    lookup_state: dict[str, Any] | None = None
+    if args.lookup:
+        lookup_db_path = LOOKUP_DB_PATH
+        if not lookup_db_path.exists():
+            raise FileNotFoundError(
+                f"Bundled lookup DB not found: {lookup_db_path}. Reinstall the Standalone bundle with lookup assets."
+            )
+        lookup_state = _load_lookup_db(lookup_db_path)
+        print(f"Loaded lookup DB with {len(lookup_state['entries'])} arrays: {lookup_db_path}")
 
     local_files_only = not args.allow_downloads
     if local_files_only:
@@ -810,12 +1168,15 @@ def main() -> int:
                     sequence = build_carbon_sequence(
                         repeats=ex["repeats"],
                         spacers=ex["spacers"],
-                        left_flank=ex["left_flank"],
-                        right_flank=ex["right_flank"],
-                        include_flanks=args.include_flanks,
-                        sequence_mode=args.sequence_mode,
                     )
                     result = predict(model, tokenizer, sequence, args.max_length, device)
+                    lookup_report = None
+                    if lookup_state is not None:
+                        lookup_report = _lookup_array_against_db(
+                            ex,
+                            lookup_state,
+                            top_k=LOOKUP_TOP_K,
+                        )
 
                     row: dict[str, Any] = {
                         "status": "ok",
@@ -834,6 +1195,8 @@ def main() -> int:
                         "prob_forward": result["prob_forward"],
                         "token_count": result["token_count"],
                     }
+                    if lookup_report is not None:
+                        row["lookup"] = lookup_report
                     if ex["label"] is not None:
                         row["input_label"] = ex["label"]
                     if source_meta:
@@ -845,8 +1208,7 @@ def main() -> int:
                             input_path=current_file,
                             ex=ex,
                             result=result,
-                            sequence_mode=args.sequence_mode,
-                            include_flanks=args.include_flanks,
+                            lookup=lookup_report,
                         )
                 except Exception as exc:  # noqa: BLE001
                     records.append(
