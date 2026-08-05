@@ -10,6 +10,8 @@ from collections import Counter
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from .tokenization import normalize_dna, reverse_complement
+
 try:
     import torch
 except ModuleNotFoundError:
@@ -55,9 +57,10 @@ def summarize_cas_subtypes(
 
 
 def _build_signature_components(examples: list[DirectionExample]) -> dict[int, list[int]]:
-    """Group indices into connected components by exact spacer/repeat signature.
+    """Group indices into components by canonical spacer/repeat signature.
     
-    Uses union-find to group examples with identical (spacers, repeats) tuples.
+    Uses union-find to group examples with identical arrays after DNA normalization,
+    treating reverse-complement-equivalent arrays as the same signature.
     Useful for ensuring signature cohesion in train/val/test splits.
     
     Args:
@@ -81,9 +84,18 @@ def _build_signature_components(examples: list[DirectionExample]) -> dict[int, l
         if ra != rb:
             parent[rb] = ra
 
+    def canonical_array_signature(example: DirectionExample) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        spacers = tuple(normalize_dna(sequence) for sequence in example.spacers)
+        repeats = tuple(normalize_dna(sequence) for sequence in example.repeats)
+        reverse_complemented = (
+            tuple(normalize_dna(reverse_complement(sequence)) for sequence in reversed(spacers)),
+            tuple(normalize_dna(reverse_complement(sequence)) for sequence in reversed(repeats)),
+        )
+        return min((spacers, repeats), reverse_complemented)
+
     first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
     for idx, example in enumerate(examples):
-        signature = (tuple(example.spacers), tuple(example.repeats))
+        signature = canonical_array_signature(example)
         if signature in first_by_signature:
             union(idx, first_by_signature[signature])
         else:

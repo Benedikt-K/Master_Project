@@ -10,6 +10,7 @@ import random
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from ..tokenization import normalize_dna, reverse_complement
 from ..utils import _build_signature_components
 
 if TYPE_CHECKING:
@@ -96,13 +97,10 @@ def stratified_holdout_by_mode(
 
     rng = random.Random(seed)
 
-    signature_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
-    for idx, example in enumerate(examples):
-        signature = (tuple(example.spacers), tuple(example.repeats))
-        signature_groups.setdefault(signature, []).append(idx)
+    components = _build_signature_components(examples)
 
     strata_groups: dict[Any, list[list[int]]] = {}
-    for group in signature_groups.values():
+    for group in components.values():
         rep = examples[group[0]]
         subtype = (rep.cas_subtype or "Unknown").strip() or "Unknown"
         label = int(rep.label)
@@ -352,7 +350,8 @@ def stratified_train_test_and_val_by_cas_subtype(
     rng = random.Random(seed)
 
     # Build connected components so examples sharing a group_name OR identical
-    # spacer/repeat signature stay in the same split, reducing leakage.
+    # spacer/repeat signature (including reverse-complement equivalents) stay
+    # in the same split, reducing leakage.
     n = len(examples)
     parent = list(range(n))
 
@@ -368,6 +367,15 @@ def stratified_train_test_and_val_by_cas_subtype(
         if ra != rb:
             parent[rb] = ra
 
+    def canonical_array_signature(example: DirectionExample) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        spacers = tuple(normalize_dna(sequence) for sequence in example.spacers)
+        repeats = tuple(normalize_dna(sequence) for sequence in example.repeats)
+        reverse_complemented = (
+            tuple(normalize_dna(reverse_complement(sequence)) for sequence in reversed(spacers)),
+            tuple(normalize_dna(reverse_complement(sequence)) for sequence in reversed(repeats)),
+        )
+        return min((spacers, repeats), reverse_complemented)
+
     first_by_group: dict[str, int] = {}
     first_by_signature: dict[tuple[tuple[str, ...], tuple[str, ...]], int] = {}
     for idx, example in enumerate(examples):
@@ -378,7 +386,7 @@ def stratified_train_test_and_val_by_cas_subtype(
             else:
                 first_by_group[group] = idx
 
-        signature = (tuple(example.spacers), tuple(example.repeats))
+        signature = canonical_array_signature(example)
         if signature in first_by_signature:
             union(idx, first_by_signature[signature])
         else:
@@ -482,25 +490,30 @@ def stratified_train_test_and_val_by_cas_subtype_and_label(
 
     rng = random.Random(seed)
 
-    strata_indices: dict[tuple[str, int], list[int]] = {}
-    for idx, example in enumerate(examples):
-        subtype = (example.cas_subtype or "Unknown").strip() or "Unknown"
-        label = int(example.label)
+    components = _build_signature_components(examples)
+
+    strata_components: dict[tuple[str, int], list[list[int]]] = {}
+    for component in components.values():
+        representative = examples[component[0]]
+        subtype = (representative.cas_subtype or "Unknown").strip() or "Unknown"
+        label = int(representative.label)
         key = (subtype, label)
-        strata_indices.setdefault(key, []).append(idx)
+        strata_components.setdefault(key, []).append(component)
 
     train_test_indices: list[int] = []
     val_indices: list[int] = []
-    for key in sorted(strata_indices.keys()):
-        indices = list(strata_indices[key])
-        rng.shuffle(indices)
-        n = len(indices)
+    for key in sorted(strata_components.keys()):
+        groups = list(strata_components[key])
+        rng.shuffle(groups)
+        n = len(groups)
         if n == 1:
             n_train_test = 1
         else:
             n_train_test = min(n - 1, max(1, round(n * train_test_fraction)))
-        train_test_indices.extend(indices[:n_train_test])
-        val_indices.extend(indices[n_train_test:])
+        for group in groups[:n_train_test]:
+            train_test_indices.extend(group)
+        for group in groups[n_train_test:]:
+            val_indices.extend(group)
 
     return {"train_test": train_test_indices, "val": val_indices}
 
@@ -530,14 +543,15 @@ def build_cv_folds_by_signature(
     rng = random.Random(seed)
     pool_set = set(pool_indices)
 
-    signature_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
-    for idx in pool_indices:
-        ex = examples[idx]
-        sig = (tuple(ex.spacers), tuple(ex.repeats))
-        signature_groups.setdefault(sig, []).append(idx)
+    components = _build_signature_components(examples)
+    signature_groups: list[list[int]] = []
+    for component in components.values():
+        group = [idx for idx in component if idx in pool_set]
+        if group:
+            signature_groups.append(group)
 
     strata_groups: dict[Any, list[list[int]]] = {}
-    for group in signature_groups.values():
+    for group in signature_groups:
         rep = examples[group[0]]
         subtype = (rep.cas_subtype or "Unknown").strip() or "Unknown"
         label = int(rep.label)

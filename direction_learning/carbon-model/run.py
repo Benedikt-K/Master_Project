@@ -350,7 +350,7 @@ def _build_group_components(examples: list[DirectionExample]) -> list[list[int]]
 		else:
 			union(index, previous)
 
-		signature = (tuple(example.spacers), tuple(example.repeats))
+		signature = _canonical_array_signature(example)
 		previous = first_by_signature.get(signature)
 		if previous is None:
 			first_by_signature[signature] = index
@@ -1048,6 +1048,17 @@ def _evaluate_model(
 	loss_fn: Any,
 	use_bfloat16: bool,
 ) -> dict[str, float]:
+	metrics, _, _ = _evaluate_model_with_outputs(model, loader, device, loss_fn, use_bfloat16)
+	return metrics
+
+
+def _evaluate_model_with_outputs(
+	model: Any,
+	loader: Any,
+	device: Any,
+	loss_fn: Any,
+	use_bfloat16: bool,
+) -> tuple[dict[str, float], list[int], list[int]]:
 	model.eval()
 	all_labels: list[int] = []
 	all_scores: list[float] = []
@@ -1071,7 +1082,79 @@ def _evaluate_model(
 
 	metrics = _classification_metrics(all_labels, all_scores)
 	metrics["loss"] = _safe_divide(total_loss, total_examples)
-	return metrics
+	predictions = [1 if score >= 0.5 else 0 for score in all_scores]
+	return metrics, all_labels, predictions
+
+
+def _build_subtype_accuracy_report(
+	examples: list[DirectionExample],
+	labels: list[int],
+	predictions: list[int],
+) -> dict[str, dict[str, float | int]]:
+	if len(examples) != len(labels) or len(labels) != len(predictions):
+		raise ValueError(
+			"Subtype analysis expects equal lengths for examples, labels, and predictions "
+			f"(got {len(examples)}, {len(labels)}, {len(predictions)})."
+		)
+
+	stats: dict[str, dict[str, int]] = defaultdict(lambda: {
+		"n": 0,
+		"correct": 0,
+		"forward_total": 0,
+		"reverse_total": 0,
+	})
+
+	for example, label, prediction in zip(examples, labels, predictions):
+		subtype = (example.cas_subtype or "Unknown").strip() or "Unknown"
+		entry = stats[subtype]
+		entry["n"] += 1
+		entry["correct"] += int(label == prediction)
+		if int(label) == 1:
+			entry["forward_total"] += 1
+		else:
+			entry["reverse_total"] += 1
+
+	report: dict[str, dict[str, float | int]] = {}
+	for subtype in sorted(stats):
+		entry = stats[subtype]
+		n = int(entry["n"])
+		correct = int(entry["correct"])
+		report[subtype] = {
+			"n": n,
+			"correct": correct,
+			"accuracy": _safe_divide(correct, n),
+			"forward_total": int(entry["forward_total"]),
+			"reverse_total": int(entry["reverse_total"]),
+		}
+
+	return report
+
+
+def _print_subtype_accuracy_report(
+	title: str,
+	report: dict[str, dict[str, float | int]],
+) -> None:
+	print(title)
+	if not report:
+		print("  No subtype rows available.")
+		return
+
+	# Show larger subtypes first for more stable per-subtype estimates.
+	sorted_rows = sorted(
+		report.items(),
+		key=lambda item: (int(item[1]["n"]), float(item[1]["accuracy"])),
+		reverse=True,
+	)
+	for subtype, row in sorted_rows:
+		n = int(row["n"])
+		correct = int(row["correct"])
+		accuracy = float(row["accuracy"])
+		forward_total = int(row["forward_total"])
+		reverse_total = int(row["reverse_total"])
+		print(
+			f"  {subtype}: acc={accuracy:.4f} ({correct}/{n}) "
+			f"| Forward={forward_total} Reverse={reverse_total}"
+		)
 
 
 def _format_metrics(metrics: dict[str, float]) -> str:
@@ -1174,7 +1257,7 @@ def main() -> int:
 	parser.add_argument(
 		"--split_group",
 		action="store_true",
-		help="Use group-aware connected-component splitting to keep related arrays in the same split.",
+		help="Use group-aware connected-component splitting to keep related arrays, including reverse complements, in the same split.",
 	)
 	parser.add_argument(
 		"--split_optimize_trials",
@@ -1596,9 +1679,17 @@ def main() -> int:
 	if best_val_metrics is None:
 		best_val_metrics = _evaluate_model(model, val_loader, device, loss_fn, use_bfloat16)
 
-	test_metrics = _evaluate_model(model, test_loader, device, loss_fn, use_bfloat16)
+	test_metrics, test_labels, test_predictions = _evaluate_model_with_outputs(
+		model,
+		test_loader,
+		device,
+		loss_fn,
+		use_bfloat16,
+	)
+	test_subtype_accuracy = _build_subtype_accuracy_report(test_examples, test_labels, test_predictions)
 	print(f"Best epoch: {best_epoch} | best_val={_format_metrics(best_val_metrics)}")
 	print(f"Test: {_format_metrics(test_metrics)}")
+	_print_subtype_accuracy_report("Test subtype accuracy:", test_subtype_accuracy)
 
 	with (output_dir / "training_summary.json").open("w") as fh:
 		json.dump(
@@ -1607,6 +1698,7 @@ def main() -> int:
 				"best_epoch": best_epoch,
 				"best_validation": best_val_metrics,
 				"test": test_metrics,
+				"test_subtype_accuracy": test_subtype_accuracy,
 				"train_examples": len(train_examples),
 				"val_examples": len(val_examples),
 				"test_examples": len(test_examples),
