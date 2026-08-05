@@ -18,7 +18,7 @@
   "loftq_config": {},
   "lora_alpha": 8,
   "lora_bias": false,
-  "lora_dropout": 0.15,
+  "lora_dropout": 0.05,
   "lora_ga_config": null,
   "megatron_config": null,
   "megatron_core": "megatron.core",
@@ -33,8 +33,8 @@
   "rank_pattern": {},
   "revision": null,
   "target_modules": [
-    "q_proj",
-    "v_proj"
+    "v_proj",
+    "q_proj"
   ],
   "target_parameters": null,
   "task_type": "SEQ_CLS",

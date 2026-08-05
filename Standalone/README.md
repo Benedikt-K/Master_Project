@@ -41,7 +41,7 @@ When enabled, the standalone CLI looks up your query array in the bundled train/
 - similarity to nearest train/val arrays (if not present)
 
 The lookup uses spacers + repeats for exact match and spacer similarity for nearest-neighbor reporting.
-The lookup DB path is fixed to `Standalone/lookup/array_lookup_db.json`.
+The lookup DB path is `Standalone/lookup/array_lookup_db.json`.
 
 Enable lookup explicitly:
 
@@ -239,3 +239,11 @@ Input validation errors:
 Unexpected downloads:
 
 - Do not pass `--allow_downloads` when offline-only behavior is required.
+
+Tranformers warning:
+
+Key          | Status  | 
+-------------+---------+-
+score.weight | MISSING | 
+
+- You can safely ignore these, as we are applying a LoRa adapter, we fill them in.
