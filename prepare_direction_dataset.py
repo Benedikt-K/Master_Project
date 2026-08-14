@@ -325,10 +325,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--require_agree",
+        dest="require_agree",
         action="store_true",
-        default=True,
-        help="Keep only rows where agreement == agree (default: enabled)",
+        help="Keep only rows where agreement == agree.",
     )
+    parser.add_argument(
+        "--no_require_agree",
+        dest="require_agree",
+        action="store_false",
+        help="Disable agreement filtering and keep any row where evOr has Forward/Reverse prediction.",
+    )
+    parser.set_defaults(require_agree=True)
     parser.add_argument(
         "--allow_not_comparable",
         action="store_true",

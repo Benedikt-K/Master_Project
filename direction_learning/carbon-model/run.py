@@ -258,10 +258,11 @@ def _classification_metrics(labels, scores, threshold: float = 0.5) -> dict[str,
 def _print_split_summary(name: str, examples: list[DirectionExample]) -> None:
 	label_counts = Counter(example.label for example in examples)
 	subtype_counts = Counter((example.cas_subtype or "Unknown") for example in examples)
+	subtype_counts_sorted = dict(sorted(subtype_counts.items(), key=lambda item: (-item[1], item[0])))
 	print(
 		f"{name}: {len(examples)} examples | "
 		f"Forward={label_counts.get(1, 0)} Reverse={label_counts.get(0, 0)} | "
-		f"Top subtypes={dict(subtype_counts.most_common(5))}"
+		f"Subtypes={subtype_counts_sorted}"
 	)
 
 
@@ -1246,6 +1247,21 @@ def _apply_lora(
 	return model
 
 
+def _update_early_stopping_state(
+	current_metric: float,
+	best_metric: float,
+	patience_counter: int,
+	patience: int,
+	min_delta: float,
+) -> tuple[float, int, bool]:
+	"""Return the updated best metric, patience counter, and whether training should stop early."""
+	if current_metric > best_metric + min_delta:
+		return current_metric, 0, False
+	updated_patience = patience_counter + 1
+	should_stop = patience > 0 and updated_patience >= patience
+	return best_metric, updated_patience, should_stop
+
+
 def main() -> int:
 	parser = argparse.ArgumentParser(description="Finetune Carbon-500M for CRISPR array direction prediction.")
 	parser.add_argument("--jsonl", default="/tmp/direction_no_aug.jsonl")
@@ -1282,6 +1298,8 @@ def main() -> int:
 	parser.add_argument("--batch_size", type=int, default=2)
 	parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
 	parser.add_argument("--epochs", type=int, default=3)
+	parser.add_argument("--early_stopping_patience", type=int, default=0, help="Stop training if validation does not improve for this many epochs. 0 disables early stopping.")
+	parser.add_argument("--early_stopping_min_delta", type=float, default=0.0, help="Minimum validation improvement required to count as an improvement for early stopping.")
 	parser.add_argument("--learning_rate", type=float, default=2e-5)
 	parser.add_argument("--weight_decay", type=float, default=0.05)
 	parser.add_argument("--warmup_ratio", type=float, default=0.06)
@@ -1611,6 +1629,9 @@ def main() -> int:
 	best_val_metric = float("-inf")
 	best_val_metrics: dict[str, float] | None = None
 	best_epoch = 0
+	early_stopping_patience = max(0, int(args.early_stopping_patience))
+	early_stopping_min_delta = float(args.early_stopping_min_delta)
+	patience_counter = 0
 	autocast_context = torch.autocast("cuda", dtype=torch.bfloat16) if use_bfloat16 else nullcontext()
 
 	for epoch in range(1, args.epochs + 1):
@@ -1656,7 +1677,7 @@ def main() -> int:
 
 		print(f"Epoch {epoch:02d} | time={epoch_duration_minutes:.2f}min:{epoch_duration_seconds:.2f}s | train_loss={train_loss:.4f} | val={_format_metrics(val_metrics)}")
 
-		if current_metric > best_val_metric:
+		if current_metric > best_val_metric + early_stopping_min_delta:
 			best_val_metric = current_metric
 			best_val_metrics = dict(val_metrics)
 			best_epoch = epoch
@@ -1675,6 +1696,14 @@ def main() -> int:
 					indent=2,
 					sort_keys=True,
 				)
+			patience_counter = 0
+		else:
+			patience_counter += 1
+			if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+				print(
+					f"Early stopping triggered after epoch {epoch}: validation metric {current_metric:.6f} did not improve by at least {early_stopping_min_delta:.6f} for {early_stopping_patience} consecutive epochs."
+				)
+				break
 
 	if best_val_metrics is None:
 		best_val_metrics = _evaluate_model(model, val_loader, device, loss_fn, use_bfloat16)
