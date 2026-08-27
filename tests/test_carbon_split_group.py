@@ -37,6 +37,34 @@ def test_early_stopping_updates_patience_and_trigger():
 	assert should_stop is True
 
 
+def test_split_size_aware_flag_changes_objective():
+	per_example_subarrays = [{"shared"} for _ in range(100)]
+	candidate = {
+		"train": list(range(95)),
+		"val": [],
+		"test": list(range(95, 100)),
+	}
+	default_objective = carbon_run._split_candidate_objective(
+		candidate,
+		n_examples=100,
+		target_test_fraction=0.10,
+		optimize_target="test",
+		per_example_subarrays=per_example_subarrays,
+		size_aware=False,
+	)
+	size_aware_objective = carbon_run._split_candidate_objective(
+		candidate,
+		n_examples=100,
+		target_test_fraction=0.10,
+		optimize_target="test",
+		per_example_subarrays=per_example_subarrays,
+		size_aware=True,
+	)
+
+	assert default_objective["objective"] != size_aware_objective["objective"]
+	assert size_aware_objective["objective"] > default_objective["objective"]
+
+
 def test_split_group_keeps_reverse_complements_together():
 	spacers = ["ACGT", "TTAA", "GGCC"]
 	repeats = ["GTTT", "GTTT", "GTTT", "GTTT"]

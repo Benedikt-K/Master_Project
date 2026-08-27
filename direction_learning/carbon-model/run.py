@@ -381,6 +381,7 @@ def _split_components_by_mode(
 	seed: int,
 	right_fraction: float,
 	stratify_mode: str,
+	size_aware: bool = False,
 ) -> tuple[list[list[int]], list[list[int]]]:
 	"""Split connected components into left/right partitions while keeping each component intact."""
 	if not (0.0 <= right_fraction < 1.0):
@@ -401,6 +402,21 @@ def _split_components_by_mode(
 		n_groups = len(groups)
 		if n_groups == 1:
 			n_right = 0 if right_fraction == 0.0 else 1
+		elif size_aware:
+			total_examples = sum(len(component) for component in groups)
+			target_examples = total_examples * right_fraction
+			best_cutoff = 1 if right_fraction > 0.0 else 0
+			best_distance = float("inf")
+			best_right_examples = float("inf")
+			cumulative_examples = 0
+			for cutoff in range(1, n_groups):
+				cumulative_examples += len(groups[cutoff - 1])
+				distance = abs(cumulative_examples - target_examples)
+				if distance < best_distance or (distance == best_distance and cumulative_examples < best_right_examples):
+					best_distance = distance
+					best_right_examples = cumulative_examples
+					best_cutoff = cutoff
+			n_right = best_cutoff if right_fraction > 0.0 else 0
 		else:
 			n_right = min(n_groups - 1, max(1, round(n_groups * right_fraction)))
 		for component in groups[:n_right]:
@@ -422,6 +438,7 @@ def _build_splits_once(
 	test_fraction: float,
 	stratify_mode: str,
 	split_group: bool,
+	size_aware: bool = False,
 ) -> dict[str, list[int]]:
 	if split_group:
 		components = _build_group_components(examples)
@@ -431,6 +448,7 @@ def _build_splits_once(
 			seed=seed,
 			right_fraction=test_fraction,
 			stratify_mode=stratify_mode,
+			size_aware=size_aware,
 		)
 		train_components, val_components = _split_components_by_mode(
 			examples,
@@ -438,6 +456,7 @@ def _build_splits_once(
 			seed=seed,
 			right_fraction=0.20,
 			stratify_mode=stratify_mode,
+			size_aware=size_aware,
 		)
 		train_indices = _flatten_components(train_components)
 		val_indices = _flatten_components(val_components)
@@ -502,6 +521,8 @@ def _split_candidate_objective(
 	target_test_fraction: float,
 	optimize_target: str,
 	per_example_subarrays: list[set[tuple[str, ...]]],
+	size_aware: bool = False,
+	size_weight: float = 25.0,
 ) -> dict[str, float]:
 	train_indices = candidate["train"]
 	val_indices = candidate["val"]
@@ -532,22 +553,25 @@ def _split_candidate_objective(
 	observed_test_fraction = _safe_divide(len(test_indices), n_examples)
 	target_val_fraction = (1.0 - target_test_fraction) * 0.20
 	observed_val_fraction = _safe_divide(len(val_indices), n_examples)
-	size_penalty = abs(observed_test_fraction - target_test_fraction) + abs(observed_val_fraction - target_val_fraction)
+	test_size_penalty = abs(observed_test_fraction - target_test_fraction)
+	val_size_penalty = abs(observed_val_fraction - target_val_fraction)
+	size_penalty = test_size_penalty + val_size_penalty
 
 	worst_query_leak = max(test_leak_fraction, val_leak_fraction)
 	leak_balance_penalty = abs(test_leak_fraction - val_leak_fraction)
+	effective_size_weight = size_weight if size_aware else 0.05
 
 	if optimize_target == "test":
-		objective = test_leak_fraction + (0.05 * size_penalty)
+		objective = test_leak_fraction + (effective_size_weight * (test_size_penalty if size_aware else size_penalty))
 	elif optimize_target == "train_all_test":
-		objective = train_all_test_leak_fraction + (0.05 * size_penalty)
+		objective = train_all_test_leak_fraction + (effective_size_weight * (test_size_penalty if size_aware else size_penalty))
 	elif optimize_target in {"all_pairs", "all_pais", "all-pairs"}:
 		pair_max = max(test_leak_fraction, val_leak_fraction, val_test_leak_fraction)
 		pair_min = min(test_leak_fraction, val_leak_fraction, val_test_leak_fraction)
 		pair_balance_penalty = pair_max - pair_min
-		objective = pair_max + (0.5 * pair_balance_penalty) + (0.05 * size_penalty)
+		objective = pair_max + (0.5 * pair_balance_penalty) + (effective_size_weight * (test_size_penalty if size_aware else size_penalty))
 	elif optimize_target == "both":
-		objective = worst_query_leak + (0.5 * leak_balance_penalty) + (0.05 * size_penalty)
+		objective = worst_query_leak + (0.5 * leak_balance_penalty) + (effective_size_weight * (test_size_penalty if size_aware else size_penalty))
 	else:
 		raise ValueError(f"Unknown split optimization target: {optimize_target}")
 
@@ -563,6 +587,8 @@ def _split_candidate_objective(
 		"train_all_test_leak_count": float(train_all_test_leak_count),
 		"worst_query_leak": worst_query_leak,
 		"leak_balance_penalty": leak_balance_penalty,
+		"test_size_penalty": test_size_penalty,
+		"val_size_penalty": val_size_penalty,
 		"size_penalty": size_penalty,
 	}
 
@@ -917,6 +943,8 @@ def _build_splits(
 	split_optimize_trials: int,
 	split_optimize_k: int,
 	split_optimize_target: str,
+	split_size_aware: bool = False,
+	split_size_weight: float = 25.0,
 ) -> dict[str, list[int]]:
 	if split_optimize_k < 2:
 		raise ValueError("--split_optimize_k must be >= 2")
@@ -931,6 +959,7 @@ def _build_splits(
 			test_fraction=test_fraction,
 			stratify_mode=stratify_mode,
 			split_group=split_group,
+			size_aware=split_size_aware,
 		)
 	else:
 		per_example_subarrays = _build_example_k_subarray_index(examples, k=split_optimize_k)
@@ -945,6 +974,7 @@ def _build_splits(
 				test_fraction=test_fraction,
 				stratify_mode=stratify_mode,
 				split_group=split_group,
+				size_aware=split_size_aware,
 			)
 			candidate_stats = _split_candidate_objective(
 				candidate,
@@ -952,6 +982,8 @@ def _build_splits(
 				target_test_fraction=test_fraction,
 				optimize_target=split_optimize_target,
 				per_example_subarrays=per_example_subarrays,
+				size_aware=split_size_aware,
+				size_weight=split_size_weight,
 			)
 			if best_stats is None or candidate_stats["objective"] < best_stats["objective"]:
 				best_splits = candidate
@@ -1276,6 +1308,17 @@ def main() -> int:
 		help="Use group-aware connected-component splitting to keep related arrays, including reverse complements, in the same split.",
 	)
 	parser.add_argument(
+		"--split_size_aware",
+		action="store_true",
+		help="Use example-count-aware group splitting and stronger size penalties to keep the test fraction closer to --test_fraction.",
+	)
+	parser.add_argument(
+		"--split_size_weight",
+		type=float,
+		default=25.0,
+		help="Size penalty weight used when --split_size_aware is enabled. Lower values let overlap matter more.",
+	)
+	parser.add_argument(
 		"--split_optimize_trials",
 		type=int,
 		default=1,
@@ -1401,6 +1444,8 @@ def main() -> int:
 		split_optimize_trials=args.split_optimize_trials,
 		split_optimize_k=args.split_optimize_k,
 		split_optimize_target=args.split_optimize_target,
+		split_size_aware=args.split_size_aware,
+		split_size_weight=args.split_size_weight,
 	)
 	train_indices = _truncate_indices(splits["train"], args.max_train_examples)
 	val_indices = _truncate_indices(splits["val"], args.max_val_examples)
@@ -1486,18 +1531,51 @@ def main() -> int:
 				use_diversity=True,
 				similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
 				min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
-				target_additions=augment_spacer_deletion_count,
+				target_additions=augment_spacer_deletion_count * len(train_indices),
 				balance_per_array=True,
 			)
 			train_indices = list(train_indices) + train_new_indices
 			train_examples = [dataset.records[index] for index in train_indices]
 			print(
 				"Spacer deletion augmentation summary: "
-				f"requested={augment_spacer_deletion_count} added={train_aug_stats['added']} "
+				f"requested={augment_spacer_deletion_count} per array added={train_aug_stats['added']} "
 				f"blocked_overlap={train_aug_stats['blocked_overlap']} "
 				f"blocked_similarity={train_aug_stats['blocked_similarity']} "
 				f"skipped_short={train_aug_stats['skipped_short']}"
 			)
+
+	# Augment validation set with same augmentation count
+	if args.augment_spacer_deletion and augment_spacer_deletion_count > 0 and val_indices:
+		seen_signatures = {example_signature(example) for example in dataset.records}
+		val_new_indices, val_aug_stats = materialize_subarray_augmentations(
+			base_dataset=dataset,
+			source_indices=list(val_indices),
+			seen_signatures=seen_signatures,
+			test_signatures=test_signatures,
+			test_signatures_by_idx=test_signatures_by_idx,
+			test_token_sets=test_token_sets,
+			inverted_index=inverted_index,
+			seed=args.seed,
+			mode="enumerate",
+			prob=1.0,
+			min_spacers=2,
+			max_per_array=augment_spacer_deletion_count,
+			split_name="val",
+			use_diversity=True,
+			similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
+			min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
+			target_additions=augment_spacer_deletion_count * len(val_indices),
+			balance_per_array=True,
+		)
+		val_indices = list(val_indices) + val_new_indices
+		val_examples = [dataset.records[index] for index in val_indices]
+		print(
+			"Spacer deletion augmentation (validation) summary: "
+			f"requested={augment_spacer_deletion_count} per array added={val_aug_stats['added']} "
+			f"blocked_overlap={val_aug_stats['blocked_overlap']} "
+			f"blocked_similarity={val_aug_stats['blocked_similarity']} "
+			f"skipped_short={val_aug_stats['skipped_short']}"
+		)
 
 	tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
 	if tokenizer.pad_token is None:

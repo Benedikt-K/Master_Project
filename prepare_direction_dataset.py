@@ -324,22 +324,13 @@ def main() -> int:
         help="Emit only the native-orientation example per array",
     )
     parser.add_argument(
-        "--require_agree",
-        dest="require_agree",
-        action="store_true",
-        help="Keep only rows where agreement == agree.",
-    )
-    parser.add_argument(
-        "--no_require_agree",
-        dest="require_agree",
-        action="store_false",
-        help="Disable agreement filtering and keep any row where evOr has Forward/Reverse prediction.",
-    )
-    parser.set_defaults(require_agree=True)
-    parser.add_argument(
-        "--allow_not_comparable",
-        action="store_true",
-        help="Also keep rows whose agreement is not comparable",
+        "--agreement_statuses",
+        nargs="+",
+        choices=["agree", "disagree", "not_comparable"],
+        default=["agree"],
+        help="Agreement status values to include in the dataset. "
+             "Can specify multiple (e.g., --agreement_statuses agree not_comparable). "
+             "Default: agree only.",
     )
     parser.add_argument(
         "--collapse_duplicates",
@@ -367,10 +358,9 @@ def main() -> int:
     filtered_rows: list[dict[str, str]] = []
     for row in rows:
         agreement = str(row.get("agreement", "")).strip().lower()
+        if agreement not in args.agreement_statuses:
+            continue
         evor_direction = str(row.get("evor_direction", "")).strip()
-        if args.require_agree and agreement != "agree":
-            if not (args.allow_not_comparable and agreement == "not_comparable"):
-                continue
         if evor_direction not in {"Forward", "Reverse"}:
             continue
         if not row.get("source_json"):
@@ -440,6 +430,7 @@ def main() -> int:
     print(f"Label counts (post-collapse): {dict(final_label_counts)}")
     print(f"Wrote {written} JSONL records to {out_jsonl}")
     print(f"Skipped arrays: {skipped}")
+    print(f"Agreement statuses included: {args.agreement_statuses}")
     print(f"Include flanks: {parse_bool(args.include_flanks)}")
     print(f"Augmentation enabled: {not args.no_augmentation}")
     print(f"Collapse duplicates: {args.collapse_duplicates}")

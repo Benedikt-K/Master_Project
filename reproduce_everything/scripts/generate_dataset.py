@@ -8,7 +8,7 @@ Pipeline:
   1. Walk all Result_*/ subdirectories, parse each result.json
   2. For every CRISPR array, find the nearest Cas cassette by genomic distance
   3. Assign Cas type from that cassette → intermediate annotated file
-  4. Join with the evOr cluster CSV (agreement filter: keep only "agree")
+    4. Join with the evOr cluster CSV (optional agreement filter)
   5. Write final dataset
 
 Usage:
@@ -363,10 +363,12 @@ def main():
              "Evidence-level-4 arrays already tend to have ≥3.",
     )
     parser.add_argument(
-        "--require_ccf_agreement", action="store_true",
-        help="Keep only arrays where evOr agrees with the CCF direction. "
-             "Useful for a high-confidence subset, but usually not ideal "
-             "if you want to train on all evOr outputs.",
+        "--agreement_filter",
+        choices=["all", "agree", "not_agree"],
+        default="all",
+        help="Filter rows by evOr/CCF agreement status: 'agree' keeps only agreement, "
+             "'not_agree' keeps only non-agree rows, 'all' keeps everything "
+             "(default: all).",
     )
     parser.add_argument(
         "--analyze_other_evidence_levels", action="store_true",
@@ -507,8 +509,11 @@ def main():
             dropped_nocsv += 1
             continue
 
-        # Filter 6: optionally require evOr / CCF direction agreement
-        if args.require_ccf_agreement and clu["agreement"] != "agree":
+        # Filter 6: optionally filter by evOr / CCF direction agreement
+        if args.agreement_filter == "agree" and clu["agreement"] != "agree":
+            dropped_agree += 1
+            continue
+        if args.agreement_filter == "not_agree" and clu["agreement"] == "agree":
             dropped_agree += 1
             continue
 
@@ -527,11 +532,8 @@ def main():
     print(f"  Dropped no Cas cassette    : {dropped_nocas}")
     print(f"  Dropped distance > {args.max_distance_bp} bp : {dropped_dist}")
     print(f"  Dropped not in cluster CSV : {dropped_nocsv}")
-    print(f"  Dropped direction disagree : {dropped_agree}")
-    if args.require_ccf_agreement:
-        print(f"  CCF agreement filter      : enabled")
-    else:
-        print(f"  CCF agreement filter      : disabled")
+    print(f"  Dropped by agreement filter : {dropped_agree}")
+    print(f"  CCF agreement filter        : {args.agreement_filter}")
     print(f"  ──────────────────────────────")
     print(f"  KEPT for ML dataset        : {len(ml_rows)}")
 
@@ -656,7 +658,8 @@ def main():
         fh.write(f"  no Cas cassette dropped          : {dropped_nocas}\n")
         fh.write(f"  distance > {args.max_distance_bp} bp dropped      : {dropped_dist}\n")
         fh.write(f"  not in cluster CSV dropped       : {dropped_nocsv}\n")
-        fh.write(f"  direction disagree dropped       : {dropped_agree}\n")
+        fh.write(f"  agreement filter dropped         : {dropped_agree}\n")
+        fh.write(f"  agreement filter mode            : {args.agreement_filter}\n")
         fh.write(f"  FINAL ML DATASET ROWS            : {len(ml_rows)}\n\n")
 
         fh.write("Class distribution:\n")
