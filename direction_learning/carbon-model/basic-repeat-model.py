@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Naive repeat-based classifier for direction prediction.
+Naive repeat/spacer-based classifier for direction prediction.
 Tests if the model is just a glorified lookup table by classifying based on:
-1. Exact repeat matches
+1. Exact repeat matches (edit distance 0)
 2. Edit distance 1, 2, 3 matches (configurable)
+3. Position-aware spacer matches (same spacer at the same array position is a
+   strong signal, since spacer order encodes the array's evolutionary direction)
 """
 
 import json
@@ -70,18 +72,45 @@ class RepeatBasedClassifier:
     3. Aggregate predictions across spacers
     """
     
-    def __init__(self, max_edit_distance: int = 3):
+    def __init__(
+        self,
+        max_edit_distance: int = 3,
+        use_repeats: bool = True,
+        use_spacers: bool = False,
+        repeat_weight: float = 1.0,
+        spacer_weight: float = 1.0,
+        spacer_max_edit_distance: int = None,
+    ):
         """
         Initialize the classifier.
         
         Args:
-            max_edit_distance: Maximum edit distance to consider (1, 2, 3, etc.)
+            max_edit_distance: Maximum edit distance to consider for repeats (1, 2, 3, etc.)
+            use_repeats: Whether to use repeat-based matching
+            use_spacers: Whether to use position-aware spacer-based matching
+            repeat_weight: Multiplier applied to votes coming from repeat matches
+            spacer_weight: Multiplier applied to votes coming from spacer matches
+            spacer_max_edit_distance: Max edit distance for spacer matching
+                (defaults to max_edit_distance if not given)
         """
+        if not use_repeats and not use_spacers:
+            raise ValueError("At least one of use_repeats/use_spacers must be enabled")
         self.max_edit_distance = max_edit_distance
+        self.spacer_max_edit_distance = (
+            spacer_max_edit_distance if spacer_max_edit_distance is not None else max_edit_distance
+        )
+        self.use_repeats = use_repeats
+        self.use_spacers = use_spacers
+        self.repeat_weight = repeat_weight
+        self.spacer_weight = spacer_weight
         # Map: repeat -> {label: count}
         self.repeat_to_labels: Dict[str, Counter] = defaultdict(Counter)
         # Store all training repeats for matching
         self.all_repeats: Set[str] = set()
+        # Map: (position, spacer) -> {label: count}; position makes order matter
+        self.spacer_pos_to_labels: Dict[Tuple[int, str], Counter] = defaultdict(Counter)
+        # Map: position -> set of spacers seen at that position (for edit-distance candidates)
+        self.spacers_by_position: Dict[int, Set[str]] = defaultdict(set)
         self.label_distribution: Counter = Counter()
         self.is_trained = False
     
@@ -102,17 +131,27 @@ class RepeatBasedClassifier:
             example = data['example']
             label = example['label']
             repeats = example['repeats']
+            spacers = example.get('spacers', [])
             
-            # Record all repeats with their labels
-            for repeat in repeats:
-                self.repeat_to_labels[repeat][label] += 1
-                self.all_repeats.add(repeat)
+            if self.use_repeats:
+                for repeat in repeats:
+                    self.repeat_to_labels[repeat][label] += 1
+                    self.all_repeats.add(repeat)
+            
+            if self.use_spacers:
+                for position, spacer in enumerate(spacers):
+                    self.spacer_pos_to_labels[(position, spacer)][label] += 1
+                    self.spacers_by_position[position].add(spacer)
             
             self.label_distribution[label] += 1
         
         self.is_trained = True
         print(f"✓ Trained on {len(lines)} examples")
-        print(f"✓ Found {len(self.all_repeats)} unique repeats")
+        if self.use_repeats:
+            print(f"✓ Found {len(self.all_repeats)} unique repeats")
+        if self.use_spacers:
+            print(f"✓ Found {len(self.spacer_pos_to_labels)} unique (position, spacer) pairs "
+                  f"across {len(self.spacers_by_position)} positions")
         print(f"✓ Label distribution: {dict(self.label_distribution)}")
         print()
     
@@ -169,43 +208,106 @@ class RepeatBasedClassifier:
         
         return None, None, Counter()
     
-    def predict_single(self, repeats: List[str]) -> PredictionResult:
+    def _find_best_spacer_match(self, position: int, query: str) -> Tuple[str, int, Dict]:
         """
-        Predict direction for a single example based on its repeats only.
+        Find the best matching spacer at a specific array position using edit distance.
+        Candidates are restricted to the same position, since spacer order/position
+        is the signal we want to exploit (not just spacer identity anywhere in the array).
         
-        Uses majority voting across repeat->label matches.
+        Returns:
+            (matched_spacer, edit_distance, label_counts)
+        """
+        exact_key = (position, query)
+        if exact_key in self.spacer_pos_to_labels:
+            return query, 0, self.spacer_pos_to_labels[exact_key]
+        
+        if self.spacer_max_edit_distance == 0:
+            return None, None, Counter()
+        
+        candidates_at_position = self.spacers_by_position.get(position)
+        if not candidates_at_position:
+            return None, None, Counter()
+        
+        query_len = len(query)
+        query_kmers = self._extract_kmers(query, k=3)
+        candidates_by_distance = defaultdict(list)
+        
+        for spacer in candidates_at_position:
+            if abs(query_len - len(spacer)) > self.spacer_max_edit_distance:
+                continue
+            
+            spacer_kmers = self._extract_kmers(spacer, k=3)
+            if not (query_kmers & spacer_kmers):
+                continue
+            
+            dist = levenshtein_distance(query, spacer)
+            if dist <= self.spacer_max_edit_distance:
+                candidates_by_distance[dist].append(spacer)
+        
+        for distance in range(self.spacer_max_edit_distance + 1):
+            candidates = candidates_by_distance.get(distance)
+            if candidates:
+                best_spacer = max(candidates,
+                                key=lambda s: max(self.spacer_pos_to_labels[(position, s)].values()))
+                return best_spacer, distance, self.spacer_pos_to_labels[(position, best_spacer)]
+        
+        return None, None, Counter()
+    
+    def predict_single(self, repeats: List[str], spacers: List[str] = None) -> PredictionResult:
+        """
+        Predict direction for a single example based on its repeats and/or spacers.
+        
+        Uses weighted majority voting across repeat->label and (position, spacer)->label
+        matches. Each match contributes its normalized label confidence (in [0, 1]), not
+        the raw occurrence count, since raw counts for common repeats (seen in thousands
+        of training examples) can dwarf spacer counts (rare position/sequence combos) by
+        orders of magnitude and would otherwise make repeat_weight/spacer_weight meaningless.
+        Repeat and spacer contributions are scaled by self.repeat_weight and
+        self.spacer_weight respectively, so their relative influence can be tuned.
         """
         if not self.is_trained:
             raise RuntimeError("Model must be trained before prediction")
         
-        if not repeats:
-            # Default to most common label
+        spacers = spacers or []
+        
+        if not repeats and not spacers:
             most_common_label = self.label_distribution.most_common(1)[0][0]
             return PredictionResult(
                 predicted_label=most_common_label,
-                methods_used=["no_repeats_default"],
+                methods_used=["no_input_default"],
                 confidence=0.0
             )
         
         label_votes = Counter()
-        matches = 0
+        repeat_matches = 0
+        spacer_matches = 0
         
-        for repeat in repeats:
-            # For exact match only mode (max_edit_distance=0), this is just a dict lookup
-            if repeat in self.repeat_to_labels:
-                repeat_labels = self.repeat_to_labels[repeat]
-                best_label = repeat_labels.most_common(1)[0][0]
-                weight = repeat_labels[best_label]
-                label_votes[best_label] += weight
-                matches += 1
-            elif self.max_edit_distance > 0:
-                # Only do expensive edit distance matching if needed
-                matched_repeat, distance, repeat_labels = self._find_best_match(repeat)
-                if matched_repeat is not None:
+        if self.use_repeats:
+            for repeat in repeats:
+                # For exact match only mode (max_edit_distance=0), this is just a dict lookup
+                if repeat in self.repeat_to_labels:
+                    repeat_labels = self.repeat_to_labels[repeat]
                     best_label = repeat_labels.most_common(1)[0][0]
-                    weight = repeat_labels[best_label]
-                    label_votes[best_label] += weight
-                    matches += 1
+                    confidence = repeat_labels[best_label] / sum(repeat_labels.values())
+                    label_votes[best_label] += confidence * self.repeat_weight
+                    repeat_matches += 1
+                elif self.max_edit_distance > 0:
+                    # Only do expensive edit distance matching if needed
+                    matched_repeat, distance, repeat_labels = self._find_best_match(repeat)
+                    if matched_repeat is not None:
+                        best_label = repeat_labels.most_common(1)[0][0]
+                        confidence = repeat_labels[best_label] / sum(repeat_labels.values())
+                        label_votes[best_label] += confidence * self.repeat_weight
+                        repeat_matches += 1
+        
+        if self.use_spacers:
+            for position, spacer in enumerate(spacers):
+                matched_spacer, distance, spacer_labels = self._find_best_spacer_match(position, spacer)
+                if matched_spacer is not None:
+                    best_label = spacer_labels.most_common(1)[0][0]
+                    confidence = spacer_labels[best_label] / sum(spacer_labels.values())
+                    label_votes[best_label] += confidence * self.spacer_weight
+                    spacer_matches += 1
         
         # Make final prediction
         if not label_votes:
@@ -216,9 +318,15 @@ class RepeatBasedClassifier:
             total_votes = sum(label_votes.values())
             confidence = label_votes[predicted_label] / total_votes if total_votes > 0 else 0.0
         
+        methods_used = []
+        if self.use_repeats:
+            methods_used.append(f"matched_{repeat_matches}/{len(repeats)}_repeats")
+        if self.use_spacers:
+            methods_used.append(f"matched_{spacer_matches}/{len(spacers)}_spacers")
+        
         return PredictionResult(
             predicted_label=predicted_label,
-            methods_used=[f"matched_{matches}/{len(repeats)}_repeats"],
+            methods_used=methods_used,
             confidence=confidence
         )
     
@@ -256,6 +364,7 @@ class RepeatBasedClassifier:
             
             label = example.get('label')
             repeats = example.get('repeats')
+            spacers = example.get('spacers', [])
             group_name = example.get('group_name', 'unknown')
             array_name = example.get('array_name', 'unknown')
             cas_subtype = example.get('cas_subtype', 'unknown')
@@ -264,7 +373,7 @@ class RepeatBasedClassifier:
             if label is None or repeats is None:
                 continue
             
-            prediction = self.predict_single(repeats)
+            prediction = self.predict_single(repeats, spacers)
             predicted_label = prediction.predicted_label
             
             total += 1
@@ -288,6 +397,7 @@ class RepeatBasedClassifier:
                 'correct': is_correct,
                 'confidence': prediction.confidence,
                 'num_repeats': len(repeats),
+                'num_spacers': len(spacers),
                 'methods': prediction.methods_used
             })
             
@@ -372,7 +482,7 @@ def save_results_json(results: Dict, output_file: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Naive repeat-based classifier for direction prediction"
+        description="Naive repeat/spacer-based classifier for direction prediction"
     )
     parser.add_argument(
         '--splits_dir',
@@ -385,6 +495,39 @@ def main():
         type=int,
         default=3,
         help='Maximum edit distance to consider for repeat matching (0=exact only, 1-3 recommended)'
+    )
+    parser.add_argument(
+        '--spacer_max_edit_distance',
+        type=int,
+        default=None,
+        help='Maximum edit distance to consider for spacer matching (defaults to --max_edit_distance)'
+    )
+    parser.add_argument(
+        '--use_spacers',
+        action='store_true',
+        help='Enable position-aware spacer lookup (spacer at the same array index as a signal)'
+    )
+    parser.add_argument(
+        '--no_repeats',
+        action='store_true',
+        help='Disable repeat-based matching entirely'
+    )
+    parser.add_argument(
+        '--spacers_only',
+        action='store_true',
+        help='Shorthand for --use_spacers --no_repeats (spacer-comparison-only mode)'
+    )
+    parser.add_argument(
+        '--repeat_weight',
+        type=float,
+        default=1.0,
+        help='Weight multiplier applied to votes from repeat matches (tune repeat vs. spacer influence)'
+    )
+    parser.add_argument(
+        '--spacer_weight',
+        type=float,
+        default=1.0,
+        help='Weight multiplier applied to votes from spacer matches (tune repeat vs. spacer influence)'
     )
     parser.add_argument(
         '--evaluate_on',
@@ -407,13 +550,20 @@ def main():
     parser.add_argument(
         '--exact_only',
         action='store_true',
-        help='Only use exact repeat matches (much faster, baseline comparison)'
+        help='Only use exact matches (much faster, baseline comparison)'
     )
     
     args = parser.parse_args()
     
     # Override edit distance if exact_only is set
     max_ed = 0 if args.exact_only else args.max_edit_distance
+    spacer_max_ed = 0 if args.exact_only else args.spacer_max_edit_distance
+    
+    use_spacers = args.use_spacers or args.spacers_only
+    use_repeats = not (args.no_repeats or args.spacers_only)
+    if not use_repeats and not use_spacers:
+        print("Error: at least one of repeats/spacers must be enabled (check --no_repeats/--spacers_only)")
+        sys.exit(1)
     
     # Ensure splits exist
     splits_dir = args.splits_dir
@@ -431,16 +581,10 @@ def main():
     
     print(f"Configuration:")
     print(f"  Splits dir: {splits_dir}")
-    print(f"  Max edit distance: {max_ed}")
+    print(f"  Use repeats: {use_repeats} (weight={args.repeat_weight}, max_edit_distance={max_ed})")
+    print(f"  Use spacers: {use_spacers} (weight={args.spacer_weight}, "
+          f"max_edit_distance={spacer_max_ed if spacer_max_ed is not None else max_ed})")
     print(f"  Mode: {'Exact match only' if args.exact_only else 'Edit distance matching'}")
-    print(f"  Optimizations:")
-    print(f"    - K-mer filtering: ✓ (pre-filter candidates by shared 3-mers)")
-    print(f"    - Length pruning: ✓ (skip repeats too different in length)")
-    if RAPIDFUZZ_AVAILABLE:
-        print(f"    - Rapidfuzz: ✓ (10-100x faster edit distance)")
-    else:
-        print(f"    - Rapidfuzz: ✗ (install 'rapidfuzz' for 10-100x speedup)")
-    print()
     
     # Create output directory if it doesn't exist
     output_dir = Path(splits_dir).parent / 'lookup-outputs'
@@ -448,7 +592,14 @@ def main():
     print(f"Output directory: {output_dir}\n")
     
     # Create and train model
-    model = RepeatBasedClassifier(max_edit_distance=max_ed)
+    model = RepeatBasedClassifier(
+        max_edit_distance=max_ed,
+        use_repeats=use_repeats,
+        use_spacers=use_spacers,
+        repeat_weight=args.repeat_weight,
+        spacer_weight=args.spacer_weight,
+        spacer_max_edit_distance=spacer_max_ed,
+    )
     model.train(train_file)
     
     # Evaluate on validation set
