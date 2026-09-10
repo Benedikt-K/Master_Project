@@ -18,6 +18,19 @@ from sklearn.metrics import (
     matthews_corrcoef, roc_auc_score, confusion_matrix,
 )
 
+# Try to import tqdm and rapidfuzz for better performance
+try:
+	from tqdm import tqdm
+except ImportError:
+	tqdm = lambda x, **kwargs: x  # Fallback: no progress bar
+
+try:
+	from rapidfuzz.distance import Levenshtein as RapidFuzzLevenshtein
+	from rapidfuzz import process as rf_process
+	RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+	RAPIDFUZZ_AVAILABLE = False
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
 	sys.path.insert(0, str(ROOT))
@@ -47,7 +60,7 @@ get_peft_model = None
 prepare_model_for_kbit_training = None
 
 from direction_learning.data import print_split_overlap_report, split_dev_pool_by_mode, stratified_holdout_by_mode
-from direction_learning.dataset import DirectionExample, DirectionJsonlDataset
+from direction_learning.dataset import DirectionExample, DirectionJsonlDataset, LABEL_TO_ID
 from direction_learning.tokenization import reverse_complement
 
 DNA_SEPARATOR = "NNNNNN"
@@ -109,6 +122,212 @@ def _interleave_segments(repeats: list[str], spacers: list[str]) -> list[str]:
 	return [segment for segment in segments if segment]
 
 
+def _edit_distance(seq1: str, seq2: str) -> int:
+	"""
+	Compute Levenshtein distance between two sequences.
+	Uses rapidfuzz if available (10-100x faster), falls back to dynamic programming.
+	"""
+	if RAPIDFUZZ_AVAILABLE:
+		return RapidFuzzLevenshtein.distance(seq1, seq2)
+	
+	# Fallback implementation
+	m, n = len(seq1), len(seq2)
+	if m < n:
+		return _edit_distance(seq2, seq1)
+	if n == 0:
+		return m
+	
+	previous_row = list(range(n + 1))
+	for i, c1 in enumerate(seq1):
+		current_row = [i + 1]
+		for j, c2 in enumerate(seq2):
+			insertions = previous_row[j + 1] + 1
+			deletions = current_row[j] + 1
+			substitutions = previous_row[j] + (c1 != c2)
+			current_row.append(min(insertions, deletions, substitutions))
+		previous_row = current_row
+	
+	return previous_row[-1]
+
+
+def _compute_repeat_diversity(repeats: list[str]) -> float:
+	"""
+	Compute the average pairwise edit distance between repeats in an example.
+	Returns 0 if fewer than 2 repeats.
+	"""
+	normalized_repeats = [_normalize_dna(r) for r in repeats if r]
+	if len(normalized_repeats) < 2:
+		return 0.0
+	
+	total_distance = 0
+	count = 0
+	for i in range(len(normalized_repeats)):
+		for j in range(i + 1, len(normalized_repeats)):
+			total_distance += _edit_distance(normalized_repeats[i], normalized_repeats[j])
+			count += 1
+	
+	return total_distance / count if count > 0 else 0.0
+
+
+def _canonical_repeat_sequence(repeats: list[str]) -> str:
+	"""Get a canonical representation of the repeat set (sorted normalized repeats)."""
+	normalized = sorted([_normalize_dna(r) for r in repeats if r])
+	return "|".join(normalized)
+
+
+def _compute_repeat_distance_to_reference(
+	repeats: list[str],
+	reference_repeats: set[str],
+) -> float:
+	"""
+	Compute the minimum edit distance from any repeat in this example to any reference repeat.
+	If no reference repeats exist, returns infinity (highly novel).
+	Returns the minimum distance across all pairwise comparisons (closest match to training).
+	"""
+	normalized_repeats = [_normalize_dna(r) for r in repeats if r]
+	if not normalized_repeats or not reference_repeats:
+		return float('inf') if not reference_repeats else 0.0
+	
+	min_distance = float('inf')
+	for test_repeat in normalized_repeats:
+		for ref_repeat in reference_repeats:
+			distance = _edit_distance(test_repeat, ref_repeat)
+			min_distance = min(min_distance, distance)
+	
+	return min_distance
+
+
+def _split_by_repeat_diversity(
+	examples: list[DirectionExample],
+	seed: int,
+	test_fraction: float,
+	stratify_mode: str,
+	size_aware: bool = False,
+) -> dict[str, list[int]]:
+	"""
+	Split dataset by repeat novelty. The test set contains examples whose repeats are
+	significantly different (high edit distance) from any repeats in the training set.
+
+	Approach (vectorized, O(U^2) instead of O(n^2 * repeat_set_size)):
+	1. Build connected components (same group_name / identical array signature, incl.
+	   reverse complements) via `_build_group_components` so a group is always moved
+	   as a single unit and can never span train/val/test.
+	2. Represent each component by its modal (consensus) repeat sequence across all
+	   of its member examples.
+	3. Compute a full pairwise edit-distance matrix over the *unique* representative
+	   repeats using rapidfuzz's vectorized cdist (fast, multi-threaded).
+	4. For each unique repeat, compute its nearest-neighbor distance (min distance to
+	   any other unique repeat in the whole dataset). A repeat with a large
+	   nearest-neighbor distance is far from *everything*, including whatever ends up
+	   in train, so this is a valid lower bound on its distance to the training set.
+	5. Greedily assign the most isolated repeat groups (components) to the test set
+	   until the target test size is reached, then stratify the remaining components
+	   into train/val (again keeping each component intact).
+	"""
+	rng = random.Random(seed)
+	target_test_count = max(1, int(len(examples) * test_fraction))
+
+	components = _build_group_components(examples)
+
+	def _component_representative_repeat(component: list[int]) -> str:
+		counts: Counter[str] = Counter()
+		for idx in component:
+			counts.update(_normalize_dna(r) for r in examples[idx].repeats if r)
+		return counts.most_common(1)[0][0] if counts else ""
+
+	# Group components by their representative (modal) repeat.
+	repeat_to_components: dict[str, list[list[int]]] = defaultdict(list)
+	for component in components:
+		repeat_to_components[_component_representative_repeat(component)].append(component)
+
+	no_repeat_components = repeat_to_components.pop("", [])
+	unique_repeats = sorted(repeat_to_components.keys())
+
+	if len(unique_repeats) < 2:
+		print("[split_by_repeats] WARNING: fewer than 2 unique repeat groups found; falling back to a random split.")
+		all_components = list(components)
+		rng.shuffle(all_components)
+		test_components: list[list[int]] = []
+		remaining_components: list[list[int]] = []
+		selected_example_count = 0
+		for component in all_components:
+			if selected_example_count < target_test_count:
+				test_components.append(component)
+				selected_example_count += len(component)
+			else:
+				remaining_components.append(component)
+	else:
+		print(f"[split_by_repeats] computing distance matrix for {len(unique_repeats)} unique repeats "
+			  f"(from {len(components)} groups / {len(examples)} examples)...")
+		if RAPIDFUZZ_AVAILABLE:
+			distance_matrix = rf_process.cdist(
+				unique_repeats, unique_repeats,
+				scorer=RapidFuzzLevenshtein.distance,
+				workers=-1,
+			).astype(np.float64)
+		else:
+			n = len(unique_repeats)
+			distance_matrix = np.zeros((n, n), dtype=np.float64)
+			for i in tqdm(range(n), desc="[split_by_repeats] distance matrix", unit="repeat"):
+				for j in range(i + 1, n):
+					d = _edit_distance(unique_repeats[i], unique_repeats[j])
+					distance_matrix[i, j] = d
+					distance_matrix[j, i] = d
+
+		np.fill_diagonal(distance_matrix, np.inf)
+		nearest_neighbor_distance = distance_matrix.min(axis=1)
+		np.fill_diagonal(distance_matrix, 0.0)
+
+		# Most isolated (novel) repeats first.
+		order = np.argsort(-nearest_neighbor_distance)
+
+		test_position_set: set[int] = set()
+		selected_example_count = 0
+		for position in tqdm(order, desc="[split_by_repeats] selecting novel repeat groups", unit="group"):
+			if selected_example_count >= target_test_count:
+				break
+			test_position_set.add(int(position))
+			selected_example_count += sum(len(component) for component in repeat_to_components[unique_repeats[position]])
+
+		test_components = [
+			component for position in test_position_set for component in repeat_to_components[unique_repeats[position]]
+		]
+		remaining_components = [
+			component
+			for position, repeat in enumerate(unique_repeats)
+			if position not in test_position_set
+			for component in repeat_to_components[repeat]
+		]
+		remaining_components.extend(no_repeat_components)
+
+	test_indices_list = sorted(_flatten_components(test_components))
+
+	rng.shuffle(remaining_components)
+
+	# Stratify remaining components into train/val without ever splitting a component.
+	strata_groups: dict[Any, list[list[int]]] = defaultdict(list)
+	for component in remaining_components:
+		stratum_key = _component_stratum_key(examples[component[0]], stratify_mode)
+		strata_groups[stratum_key].append(component)
+
+	train_indices = []
+	val_indices = []
+	for stratum_key in sorted(strata_groups.keys(), key=str):
+		component_list = strata_groups[stratum_key]
+		rng.shuffle(component_list)
+		target_val_examples = max(1, int(sum(len(component) for component in component_list) * 0.20))
+		val_example_count = 0
+		for component in component_list:
+			if val_example_count < target_val_examples:
+				val_indices.extend(component)
+				val_example_count += len(component)
+			else:
+				train_indices.extend(component)
+
+	return {"train": train_indices, "val": val_indices, "test": test_indices_list}
+
+
+
 def build_carbon_sequence(example: DirectionExample, include_flanks: bool, sequence_mode: str) -> str:
 	pieces: list[str] = []
 
@@ -117,6 +336,8 @@ def build_carbon_sequence(example: DirectionExample, include_flanks: bool, seque
 
 	if sequence_mode == "spacers_only":
 		pieces.extend(_normalize_dna(spacer) for spacer in example.spacers if spacer)
+	elif sequence_mode == "repeats_only":
+		pieces.extend(_normalize_dna(repeat) for repeat in example.repeats if repeat)
 	else:
 		pieces.extend(_interleave_segments(example.repeats, example.spacers))
 
@@ -207,6 +428,56 @@ def _resolve_jsonl_path(value: str) -> Path:
 	)
 
 
+def _direction_example_from_raw(raw: dict[str, Any]) -> DirectionExample:
+	"""Build a DirectionExample from a raw dict, matching DirectionJsonlDataset's parsing."""
+	return DirectionExample(
+		array_name=str(raw.get("array_name", "")),
+		group_name=str(raw.get("group_name", "")),
+		agreement=str(raw.get("agreement", "")),
+		evor_direction=str(raw.get("evor_direction", "")),
+		label=int(raw.get("label", LABEL_TO_ID.get(str(raw.get("evor_direction", "")), -1))),
+		orientation_variant=str(raw.get("orientation_variant", "native")),
+		source_variant=str(raw.get("source_variant", "native")),
+		spacers=list(raw.get("spacers", [])),
+		repeats=list(raw.get("repeats", [])),
+		cas_subtype=str(raw.get("cas_subtype", "")),
+		left_flank=str(raw.get("left_flank", "")),
+		right_flank=str(raw.get("right_flank", "")),
+		source_json=str(raw.get("source_json", "")),
+		source_spacer_count=int(raw.get("source_spacer_count", 0)),
+		deleted_spacers=int(raw.get("deleted_spacers", 0)),
+		spacer_deletion_fraction=float(raw.get("spacer_deletion_fraction", 0.0)),
+	)
+
+
+def _load_split_jsonl(path: Path) -> list[DirectionExample]:
+	"""Load a train/val/test.jsonl split file written by _write_split_artifacts."""
+	examples: list[DirectionExample] = []
+	with path.open() as fh:
+		for line in fh:
+			line = line.strip()
+			if not line:
+				continue
+			raw = json.loads(line)
+			# Split files wrap the record as {"example": {...}}; support flat records too.
+			examples.append(_direction_example_from_raw(raw.get("example", raw)))
+	return examples
+
+
+def _load_prebuilt_splits(splits_dir: Path) -> dict[str, list[DirectionExample]]:
+	"""Load an existing train/val/test split from a splits directory."""
+	if not splits_dir.exists():
+		raise FileNotFoundError(f"--load_splits_dir directory not found: {splits_dir}")
+
+	result: dict[str, list[DirectionExample]] = {}
+	for split_name in ("train", "val", "test"):
+		split_path = splits_dir / f"{split_name}.jsonl"
+		if not split_path.exists():
+			raise FileNotFoundError(f"Expected split file not found: {split_path}")
+		result[split_name] = _load_split_jsonl(split_path)
+	return result
+
+
 def _safe_divide(numerator: float, denominator: float) -> float:
 	return numerator / denominator if denominator else 0.0
 
@@ -253,6 +524,70 @@ def _classification_metrics(labels, scores, threshold: float = 0.5) -> dict[str,
         "auroc": auroc,
         "tp": float(tp), "tn": float(tn), "fp": float(fp), "fn": float(fn),
     }
+
+
+def _print_repeat_diversity_stats(
+	name: str, 
+	examples: list[DirectionExample],
+	reference_examples: list[DirectionExample] | None = None,
+) -> None:
+	"""
+	Print repeat statistics for a set of examples.
+	If reference_examples is provided, shows distance to reference repeats (useful for test set vs train).
+	Otherwise shows internal diversity of the examples.
+	"""
+	if not examples:
+		print(f"{name} repeat diversity: no examples")
+		return
+	
+	if reference_examples is not None:
+		# Compute distance from examples to reference repeats
+		reference_repeats = set()
+		for ref_example in reference_examples:
+			normalized = [_normalize_dna(r) for r in ref_example.repeats if r]
+			reference_repeats.update(normalized)
+		
+		if not reference_repeats:
+			print(f"{name} vs reference: reference has no repeats")
+			return
+		
+		distances = []
+		for example in examples:
+			dist = _compute_repeat_distance_to_reference(example.repeats, reference_repeats)
+			if dist != float('inf') and dist != 0.0:
+				distances.append(dist)
+		
+		if not distances:
+			print(f"{name} vs reference: examples have no repeats or all are novel (distance=inf)")
+			return
+		
+		avg_distance = sum(distances) / len(distances)
+		min_distance = min(distances)
+		max_distance = max(distances)
+		
+		print(
+			f"{name} -> train distance: "
+			f"avg={avg_distance:.2f} min={min_distance:.2f} max={max_distance:.2f} "
+			f"(examples_with_repeats={len(distances)}/{len(examples)})"
+		)
+	else:
+		# Show internal diversity
+		diversities = [_compute_repeat_diversity(example.repeats) for example in examples]
+		valid_diversities = [d for d in diversities if d > 0]
+		
+		if not valid_diversities:
+			print(f"{name} internal diversity: all examples have <2 repeats")
+			return
+		
+		avg_diversity = sum(valid_diversities) / len(valid_diversities)
+		min_diversity = min(valid_diversities)
+		max_diversity = max(valid_diversities)
+		
+		print(
+			f"{name} internal diversity: "
+			f"avg={avg_diversity:.2f} min={min_diversity:.2f} max={max_diversity:.2f} "
+			f"(multi_repeat_examples={len(valid_diversities)}/{len(examples)})"
+		)
 
 
 def _print_split_summary(name: str, examples: list[DirectionExample]) -> None:
@@ -945,66 +1280,78 @@ def _build_splits(
 	split_optimize_target: str,
 	split_size_aware: bool = False,
 	split_size_weight: float = 25.0,
+	split_by_repeats: bool = False,
 ) -> dict[str, list[int]]:
 	if split_optimize_k < 2:
 		raise ValueError("--split_optimize_k must be >= 2")
 	if split_optimize_target not in {"both", "test", "train_all_test", "all_pairs", "all_pais", "all-pairs"}:
 		raise ValueError("--split_optimize_target must be one of: both, test, train_all_test, all_pairs, all-pais, all_pais")
 
-	trials = max(1, int(split_optimize_trials))
-	if trials == 1:
-		splits = _build_splits_once(
+	# Use repeat-based splitting if enabled
+	if split_by_repeats:
+		splits = _split_by_repeat_diversity(
 			examples,
 			seed=seed,
 			test_fraction=test_fraction,
 			stratify_mode=stratify_mode,
-			split_group=split_group,
 			size_aware=split_size_aware,
 		)
+		print(f"[split by repeats] Created test set focused on repeat diversity")
 	else:
-		per_example_subarrays = _build_example_k_subarray_index(examples, k=split_optimize_k)
-		best_splits: dict[str, list[int]] | None = None
-		best_stats: dict[str, float] | None = None
-		best_seed = seed
-		for offset in range(trials):
-			trial_seed = seed + offset
-			candidate = _build_splits_once(
+		trials = max(1, int(split_optimize_trials))
+		if trials == 1:
+			splits = _build_splits_once(
 				examples,
-				seed=trial_seed,
+				seed=seed,
 				test_fraction=test_fraction,
 				stratify_mode=stratify_mode,
 				split_group=split_group,
 				size_aware=split_size_aware,
 			)
-			candidate_stats = _split_candidate_objective(
-				candidate,
-				n_examples=len(examples),
-				target_test_fraction=test_fraction,
-				optimize_target=split_optimize_target,
-				per_example_subarrays=per_example_subarrays,
-				size_aware=split_size_aware,
-				size_weight=split_size_weight,
-			)
-			if best_stats is None or candidate_stats["objective"] < best_stats["objective"]:
-				best_splits = candidate
-				best_stats = candidate_stats
-				best_seed = trial_seed
+		else:
+			per_example_subarrays = _build_example_k_subarray_index(examples, k=split_optimize_k)
+			best_splits: dict[str, list[int]] | None = None
+			best_stats: dict[str, float] | None = None
+			best_seed = seed
+			for offset in range(trials):
+				trial_seed = seed + offset
+				candidate = _build_splits_once(
+					examples,
+					seed=trial_seed,
+					test_fraction=test_fraction,
+					stratify_mode=stratify_mode,
+					split_group=split_group,
+					size_aware=split_size_aware,
+				)
+				candidate_stats = _split_candidate_objective(
+					candidate,
+					n_examples=len(examples),
+					target_test_fraction=test_fraction,
+					optimize_target=split_optimize_target,
+					per_example_subarrays=per_example_subarrays,
+					size_aware=split_size_aware,
+					size_weight=split_size_weight,
+				)
+				if best_stats is None or candidate_stats["objective"] < best_stats["objective"]:
+					best_splits = candidate
+					best_stats = candidate_stats
+					best_seed = trial_seed
 
-		if best_splits is None or best_stats is None:
-			raise RuntimeError("split optimization failed to produce a candidate split")
-		splits = best_splits
-		print(
-			"[split optimize] "
-			f"trials={trials} k={split_optimize_k} target={split_optimize_target} selected_seed={best_seed} "
-			f"objective={best_stats['objective']:.4f} "
-			f"worst_k{split_optimize_k}={best_stats['worst_query_leak']:.4f} "
-			f"test_k{split_optimize_k}={best_stats['test_leak_fraction']:.4f} "
-			f"train_all->test_k{split_optimize_k}={best_stats['train_all_test_leak_fraction']:.4f} "
-			f"val_k{split_optimize_k}={best_stats['val_leak_fraction']:.4f} "
-			f"val->test_k{split_optimize_k}={best_stats['val_test_leak_fraction']:.4f} "
-			f"balance={best_stats['leak_balance_penalty']:.4f} "
-			f"size_penalty={best_stats['size_penalty']:.4f}"
-		)
+			if best_splits is None or best_stats is None:
+				raise RuntimeError("split optimization failed to produce a candidate split")
+			splits = best_splits
+			print(
+				"[split optimize] "
+				f"trials={trials} k={split_optimize_k} target={split_optimize_target} selected_seed={best_seed} "
+				f"objective={best_stats['objective']:.4f} "
+				f"worst_k{split_optimize_k}={best_stats['worst_query_leak']:.4f} "
+				f"test_k{split_optimize_k}={best_stats['test_leak_fraction']:.4f} "
+				f"train_all->test_k{split_optimize_k}={best_stats['train_all_test_leak_fraction']:.4f} "
+				f"val_k{split_optimize_k}={best_stats['val_leak_fraction']:.4f} "
+				f"val->test_k{split_optimize_k}={best_stats['val_test_leak_fraction']:.4f} "
+				f"balance={best_stats['leak_balance_penalty']:.4f} "
+				f"size_penalty={best_stats['size_penalty']:.4f}"
+			)
 
 	train_indices = splits["train"]
 	val_indices = splits["val"]
@@ -1041,6 +1388,489 @@ def _build_splits(
 	# --- end sanity check ---
 
 	return {"train": train_indices, "val": val_indices, "test": test_indices}
+
+
+def _build_cross_validation_splits(
+	examples: list[DirectionExample],
+	*,
+	seed: int,
+	k_folds: int,
+	stratify_mode: str,
+	split_group: bool,
+	size_aware: bool = False,
+) -> list[dict[str, list[int]]]:
+	"""Build k-fold splits with optional group-aware assignment and subtype-aware stratification."""
+	if k_folds < 2:
+		raise ValueError("--cross_validation must be >= 2 when enabled")
+
+	rng = random.Random(seed)
+	folds_components: list[list[list[int]]] = [[] for _ in range(k_folds)]
+
+	if split_group:
+		components = _build_group_components(examples)
+		strata_to_components: dict[Any, list[list[int]]] = defaultdict(list)
+		for component in components:
+			representative = examples[component[0]]
+			key = _component_stratum_key(representative, stratify_mode)
+			strata_to_components[key].append(component)
+
+		for key in sorted(strata_to_components.keys(), key=str):
+			bucket = list(strata_to_components[key])
+			rng.shuffle(bucket)
+			for idx, component in enumerate(bucket):
+				folds_components[idx % k_folds].append(component)
+	else:
+		strata_to_components: dict[Any, list[list[int]]] = defaultdict(list)
+		for index, example in enumerate(examples):
+			key = _component_stratum_key(example, stratify_mode)
+			strata_to_components[key].append([index])
+
+		for key in sorted(strata_to_components.keys(), key=str):
+			bucket = list(strata_to_components[key])
+			rng.shuffle(bucket)
+			for idx, component in enumerate(bucket):
+				folds_components[idx % k_folds].append(component)
+
+	splits_per_fold: list[dict[str, list[int]]] = []
+	for fold_idx in range(k_folds):
+		test_components = folds_components[fold_idx]
+		dev_components = [component for i, fold in enumerate(folds_components) if i != fold_idx for component in fold]
+
+		test_indices = _flatten_components(test_components)
+		if split_group:
+			train_components, val_components = _split_components_by_mode(
+				examples,
+				dev_components,
+				seed=seed + fold_idx,
+				right_fraction=0.20,
+				stratify_mode=stratify_mode,
+				size_aware=size_aware,
+			)
+			train_indices = _flatten_components(train_components)
+			val_indices = _flatten_components(val_components)
+		else:
+			dev_indices = _flatten_components(dev_components)
+			train_indices, val_indices = split_dev_pool_by_mode(
+				examples,
+				pool_indices=dev_indices,
+				seed=seed + fold_idx,
+				stratify_mode=stratify_mode,
+			)
+
+		splits_per_fold.append({"train": train_indices, "val": val_indices, "test": test_indices})
+
+	return splits_per_fold
+
+
+def _run_training_for_splits(
+	*,
+	args: argparse.Namespace,
+	dataset: DirectionJsonlDataset,
+	dataset_path: Path,
+	output_dir: Path,
+	device: Any,
+	use_bfloat16: bool,
+	train_indices: list[int],
+	val_indices: list[int],
+	test_indices: list[int],
+) -> dict[str, Any]:
+	train_indices = _truncate_indices(train_indices, args.max_train_examples)
+	val_indices = _truncate_indices(val_indices, args.max_val_examples)
+	test_indices = _truncate_indices(test_indices, args.max_test_examples)
+
+	train_examples = [dataset.records[index] for index in train_indices]
+	val_examples = [dataset.records[index] for index in val_indices]
+	test_examples = [dataset.records[index] for index in test_indices]
+
+	manifest_path = _write_split_artifacts(
+		output_dir=output_dir,
+		dataset_path=dataset_path,
+		seed=args.seed,
+		chunk_size=args.split_group_chunk_size,
+		examples=dataset.records,
+		train_examples=train_examples,
+		val_examples=val_examples,
+		test_examples=test_examples,
+		train_indices=train_indices,
+		val_indices=val_indices,
+		test_indices=test_indices,
+	)
+	print(f"Saved split artifacts to {manifest_path.parent}")
+
+	similarity_report = _build_split_similarity_report(
+		dataset_path=dataset_path,
+		seed=args.seed,
+		train_examples=train_examples,
+		val_examples=val_examples,
+		test_examples=test_examples,
+	)
+	_save_similarity_report(output_dir, similarity_report)
+
+	print("Split summary:")
+	_print_split_summary("train", train_examples)
+	_print_split_summary("val", val_examples)
+	_print_split_summary("test", test_examples)
+	_print_repeat_diversity_stats("train", train_examples)
+	_print_repeat_diversity_stats("val", val_examples, reference_examples=train_examples)
+	_print_repeat_diversity_stats("test", test_examples, reference_examples=train_examples)
+	_print_split_group_names("train", dataset.records, train_indices)
+	_print_split_group_names("val", dataset.records, val_indices)
+	_print_split_group_names("test", dataset.records, test_indices)
+	_print_group_overlap_report(
+		dataset.records,
+		{"train": train_indices, "val": val_indices, "test": test_indices},
+	)
+
+	augment_spacer_deletion_count = max(0, int(args.augment_spacer_deletion_count))
+	test_signatures = None
+	test_signatures_by_idx = None
+	test_token_sets = None
+	inverted_index = None
+
+	if args.augment_spacer_deletion:
+		if augment_spacer_deletion_count <= 0:
+			print("Spacer deletion augmentation requested, but the augmentation count is <= 0; skipping.")
+		else:
+			if test_indices:
+				test_signatures = {example_signature(dataset.records[index]) for index in test_indices}
+				test_signatures_by_idx = {
+					index: example_signature(dataset.records[index])
+					for index in test_indices
+				}
+				test_token_sets, inverted_index = build_test_similarity_index(
+					dataset.records,
+					list(test_indices),
+				)
+			else:
+				print("Spacer deletion augmentation requested, but no test split is present; similarity filtering will be skipped.")
+
+			seen_signatures = {example_signature(example) for example in dataset.records}
+			train_new_indices, train_aug_stats = materialize_subarray_augmentations(
+				base_dataset=dataset,
+				source_indices=list(train_indices),
+				seen_signatures=seen_signatures,
+				test_signatures=test_signatures,
+				test_signatures_by_idx=test_signatures_by_idx,
+				test_token_sets=test_token_sets,
+				inverted_index=inverted_index,
+				seed=args.seed,
+				mode="enumerate",
+				prob=1.0,
+				min_spacers=2,
+				max_per_array=augment_spacer_deletion_count,
+				split_name="train",
+				use_diversity=True,
+				similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
+				min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
+				target_additions=augment_spacer_deletion_count * len(train_indices),
+				balance_per_array=True,
+			)
+			train_indices = list(train_indices) + train_new_indices
+			train_examples = [dataset.records[index] for index in train_indices]
+			print(
+				"Spacer deletion augmentation summary: "
+				f"requested={augment_spacer_deletion_count} per array added={train_aug_stats['added']} "
+				f"blocked_overlap={train_aug_stats['blocked_overlap']} "
+				f"blocked_similarity={train_aug_stats['blocked_similarity']} "
+				f"skipped_short={train_aug_stats['skipped_short']}"
+			)
+
+	if args.augment_spacer_deletion and augment_spacer_deletion_count > 0 and val_indices:
+		seen_signatures = {example_signature(example) for example in dataset.records}
+		val_new_indices, val_aug_stats = materialize_subarray_augmentations(
+			base_dataset=dataset,
+			source_indices=list(val_indices),
+			seen_signatures=seen_signatures,
+			test_signatures=test_signatures,
+			test_signatures_by_idx=test_signatures_by_idx,
+			test_token_sets=test_token_sets,
+			inverted_index=inverted_index,
+			seed=args.seed,
+			mode="enumerate",
+			prob=1.0,
+			min_spacers=2,
+			max_per_array=augment_spacer_deletion_count,
+			split_name="val",
+			use_diversity=True,
+			similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
+			min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
+			target_additions=augment_spacer_deletion_count * len(val_indices),
+			balance_per_array=True,
+		)
+		val_indices = list(val_indices) + val_new_indices
+		val_examples = [dataset.records[index] for index in val_indices]
+		print(
+			"Spacer deletion augmentation (validation) summary: "
+			f"requested={augment_spacer_deletion_count} per array added={val_aug_stats['added']} "
+			f"blocked_overlap={val_aug_stats['blocked_overlap']} "
+			f"blocked_similarity={val_aug_stats['blocked_similarity']} "
+			f"skipped_short={val_aug_stats['skipped_short']}"
+		)
+
+	tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+	if tokenizer.pad_token is None:
+		if tokenizer.eos_token is not None:
+			tokenizer.pad_token = tokenizer.eos_token
+		elif tokenizer.unk_token is not None:
+			tokenizer.pad_token = tokenizer.unk_token
+		else:
+			raise ValueError("Carbon tokenizer does not define a pad, eos, or unk token.")
+	tokenizer.padding_side = "right"
+
+	model_kwargs: dict[str, Any] = {
+		"num_labels": 2,
+		"id2label": {0: "Reverse", 1: "Forward"},
+		"label2id": {"Reverse": 0, "Forward": 1},
+		"trust_remote_code": True,
+		"ignore_mismatched_sizes": True,
+	}
+	if args.load_in_4bit and args.load_in_8bit:
+		raise ValueError("Choose only one of --load_in_4bit or --load_in_8bit.")
+	if args.load_in_4bit:
+		model_kwargs["load_in_4bit"] = True
+	if args.load_in_8bit:
+		model_kwargs["load_in_8bit"] = True
+	if use_bfloat16:
+		model_kwargs["dtype"] = torch.bfloat16
+
+	model = AutoModelForSequenceClassification.from_pretrained(args.model_id, **model_kwargs)
+	model.config.pad_token_id = tokenizer.pad_token_id
+	if hasattr(model.config, "use_cache"):
+		model.config.use_cache = False
+	if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+		model.gradient_checkpointing_enable()
+	if args.freeze_backbone or args.lora_only_train:
+		_freeze_backbone(model)
+	if args.use_lora:
+		model = _apply_lora(
+			model,
+			task_type=args.lora_task_type,
+			preset=args.lora_preset,
+			explicit_modules=args.lora_target_modules,
+			r=args.lora_r,
+			alpha=args.lora_alpha,
+			dropout=args.lora_dropout,
+			bias=args.lora_bias,
+			use_kbit_training=args.lora_kbit_training,
+		)
+		if args.lora_only_train:
+			for name, parameter in model.named_parameters():
+				if "lora_" not in name and "classifier" not in name and "score" not in name:
+					parameter.requires_grad = False
+
+	model.to(device)
+
+	total = sum(p.numel() for p in model.parameters())
+	trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+	print(f"Trainable params: {trainable:,}")
+	print(f"Total params: {total:,}")
+	print(f"Trainable %: {100*trainable/total:.4f}%")
+
+	train_dataset = CarbonDirectionDataset(
+		train_examples,
+		tokenizer=tokenizer,
+		max_length=args.max_length,
+		include_flanks=args.include_flanks,
+		sequence_mode=args.sequence_mode,
+	)
+	val_dataset = CarbonDirectionDataset(
+		val_examples,
+		tokenizer=tokenizer,
+		max_length=args.max_length,
+		include_flanks=args.include_flanks,
+		sequence_mode=args.sequence_mode,
+	)
+	test_dataset = CarbonDirectionDataset(
+		test_examples,
+		tokenizer=tokenizer,
+		max_length=args.max_length,
+		include_flanks=args.include_flanks,
+		sequence_mode=args.sequence_mode,
+	)
+
+	collator = CarbonBatchCollator(tokenizer)
+	train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collator)
+	val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collator)
+	test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collator)
+
+	train_labels = [example.label for example in train_examples]
+	class_weights = _build_label_weights(train_labels).to(device)
+	loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
+
+	trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+	if not trainable_parameters:
+		raise ValueError("No trainable parameters remain after applying the current fine-tuning settings.")
+
+	optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+	total_steps = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)) * args.epochs)
+	warmup_steps = max(0, round(total_steps * args.warmup_ratio))
+	scheduler = None
+	if get_linear_schedule_with_warmup is not None:
+		scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
+	print(f"Training Carbon-500M from {args.model_id}")
+	print(f"Device: {device} | bf16={use_bfloat16} | max_length={args.max_length} | batch_size={args.batch_size}")
+	print(f"Loss: weighted cross-entropy | label_smoothing={args.label_smoothing}")
+	print(f"LoRA: enabled={args.use_lora} | r={args.lora_r} | alpha={args.lora_alpha} | dropout={args.lora_dropout} | preset={args.lora_preset} | target_modules={args.lora_target_modules or 'preset'}")
+	if device.type == "cuda":
+		hint = _cuda_memory_hint(device)
+		if hint:
+			print(hint)
+	print(f"Class weights: {[float(x) for x in class_weights.detach().cpu().tolist()]}")
+
+	if args.dry_run:
+		try:
+			sample_batch = next(iter(train_loader))
+			sample_batch = _batch_to_device(sample_batch, device)
+			autocast_context = torch.autocast("cuda", dtype=torch.bfloat16) if use_bfloat16 else nullcontext()
+			with torch.no_grad(), autocast_context:
+				outputs = model(input_ids=sample_batch.get("input_ids"), attention_mask=sample_batch.get("attention_mask"))
+			print(f"Dry run logits shape: {tuple(outputs.logits.shape)}")
+			return {
+				"best_epoch": 0,
+				"best_validation": {},
+				"test": {},
+				"test_subtype_accuracy": {},
+				"train_examples": len(train_examples),
+				"val_examples": len(val_examples),
+				"test_examples": len(test_examples),
+			}
+		except torch.cuda.OutOfMemoryError as exc:
+			raise RuntimeError(
+				"Carbon dry_run ran out of CUDA memory. Try one of: --cpu, --max_length 256, --batch_size 1, "
+				"--freeze_backbone, or free GPU memory before rerunning."
+			) from exc
+
+	best_val_metric = float("-inf")
+	best_val_metrics: dict[str, float] | None = None
+	best_epoch = 0
+	early_stopping_patience = max(0, int(args.early_stopping_patience))
+	early_stopping_min_delta = float(args.early_stopping_min_delta)
+	patience_counter = 0
+	autocast_context = torch.autocast("cuda", dtype=torch.bfloat16) if use_bfloat16 else nullcontext()
+
+	if device.type == "cuda":
+		torch.cuda.reset_peak_memory_stats(device)
+
+
+	for epoch in range(1, args.epochs + 1):
+		model.train()
+		optimizer.zero_grad(set_to_none=True)
+		running_loss = 0.0
+		batches_seen = 0
+		epoch_start = time.time()
+
+		try:
+			for step, batch in enumerate(train_loader, start=1):
+				batch = _batch_to_device(batch, device)
+				with autocast_context:
+					outputs = model(input_ids=batch.get("input_ids"), attention_mask=batch.get("attention_mask"))
+					loss = loss_fn(outputs.logits, batch["labels"]) / max(1, args.gradient_accumulation_steps)
+
+				loss.backward()
+				running_loss += float(loss.item()) * max(1, args.gradient_accumulation_steps)
+				batches_seen += 1
+
+				if step % args.gradient_accumulation_steps == 0 or step == len(train_loader):
+					torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=1.0)
+					optimizer.step()
+					if scheduler is not None:
+						scheduler.step()
+					optimizer.zero_grad(set_to_none=True)
+		except torch.cuda.OutOfMemoryError as exc:
+			raise RuntimeError(
+				"Carbon training ran out of CUDA memory. Try lower --max_length --batch_size 1 or --freeze_backbone, "
+				"alternatively try --cpu. If other GPU jobs are running, free memory and rerun."
+			) from exc
+
+		train_loss = _safe_divide(running_loss, batches_seen)
+		val_metrics = _evaluate_model(model, val_loader, device, loss_fn, use_bfloat16)
+		current_metric = val_metrics["mcc"]
+		if math.isnan(current_metric):
+			current_metric = val_metrics["f1"]
+
+		if device.type == "cuda":
+			peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+			print(f"Epoch {epoch:02d} | peak CUDA memory allocated so far: {peak_gb:.2f} GiB")
+
+
+		epoch_end = time.time()
+		epoch_duration = epoch_end - epoch_start
+		epoch_duration_minutes = int(epoch_duration // 60)
+		epoch_duration_seconds = int(epoch_duration % 60)
+
+		print(f"Epoch {epoch:02d} | time={epoch_duration_minutes:.2f}min:{epoch_duration_seconds:.2f}s | train_loss={train_loss:.4f} | val={_format_metrics(val_metrics)}")
+
+		if current_metric > best_val_metric + early_stopping_min_delta:
+			best_val_metric = current_metric
+			best_val_metrics = dict(val_metrics)
+			best_epoch = epoch
+			model.save_pretrained(output_dir)
+			tokenizer.save_pretrained(output_dir)
+			with (output_dir / "best_metrics.json").open("w") as fh:
+				json.dump(
+					{
+						"epoch": epoch,
+						"metric_name": "mcc",
+						"metric_value": current_metric,
+						"metrics": best_val_metrics,
+						"args": vars(args),
+					},
+					fh,
+					indent=2,
+					sort_keys=True,
+				)
+			patience_counter = 0
+		else:
+			patience_counter += 1
+			if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+				print(
+					f"Early stopping triggered after epoch {epoch}: validation metric {current_metric:.6f} did not improve by at least {early_stopping_min_delta:.6f} for {early_stopping_patience} consecutive epochs."
+				)
+				break
+
+	if best_val_metrics is None:
+		best_val_metrics = _evaluate_model(model, val_loader, device, loss_fn, use_bfloat16)
+
+	test_metrics, test_labels, test_predictions = _evaluate_model_with_outputs(
+		model,
+		test_loader,
+		device,
+		loss_fn,
+		use_bfloat16,
+	)
+	test_subtype_accuracy = _build_subtype_accuracy_report(test_examples, test_labels, test_predictions)
+	print(f"Best epoch: {best_epoch} | best_val={_format_metrics(best_val_metrics)}")
+	print(f"Test: {_format_metrics(test_metrics)}")
+	_print_subtype_accuracy_report("Test subtype accuracy:", test_subtype_accuracy)
+
+	with (output_dir / "training_summary.json").open("w") as fh:
+		json.dump(
+			{
+				"args": vars(args),
+				"best_epoch": best_epoch,
+				"best_validation": best_val_metrics,
+				"test": test_metrics,
+				"test_subtype_accuracy": test_subtype_accuracy,
+				"train_examples": len(train_examples),
+				"val_examples": len(val_examples),
+				"test_examples": len(test_examples),
+			},
+			fh,
+			indent=2,
+			sort_keys=True,
+		)
+
+	return {
+		"best_epoch": best_epoch,
+		"best_validation": best_val_metrics,
+		"test": test_metrics,
+		"test_subtype_accuracy": test_subtype_accuracy,
+		"train_examples": len(train_examples),
+		"val_examples": len(val_examples),
+		"test_examples": len(test_examples),
+	}
 
 
 def _build_label_weights(labels: list[int]) -> Any:
@@ -1299,7 +2129,7 @@ def main() -> int:
 	parser.add_argument("--jsonl", default="/tmp/direction_no_aug.jsonl")
 	parser.add_argument("--output_dir", default="direction_learning/carbon-model/outputs/carbon-500m-direction")
 	parser.add_argument("--model_id", default=DEFAULT_MODEL_ID)
-	parser.add_argument("--sequence_mode", choices=["interleaved", "spacers_only"], default="interleaved")
+	parser.add_argument("--sequence_mode", choices=["interleaved", "spacers_only", "repeats_only"], default="interleaved")
 	parser.add_argument("--include_flanks", action="store_true")
 	parser.add_argument("--stratify_mode", choices=["label", "cas_subtype", "cas_subtype_and_label"], default="cas_subtype_and_label")
 	parser.add_argument(
@@ -1336,7 +2166,24 @@ def main() -> int:
 		default="both",
 		help="Optimize split search for both val+test leakage balance (default), test leakage only, train_all->test leakage (train+val as reference), or all split pairs (all_pairs / all-pairs / all_pais).",
 	)
+	parser.add_argument(
+		"--split_by_repeats",
+		action="store_true",
+		help="Split the dataset by repeat diversity. Test set will contain examples with highly diverse repeats (high edit distance between repeats).",
+	)
+	parser.add_argument(
+		"--load_splits_dir",
+		default="",
+		help="Load a pre-built train/val/test split from this directory (expects train.jsonl, val.jsonl, test.jsonl "
+		"as written by a previous run's splits/ folder) instead of computing a new split from --jsonl.",
+	)
 	parser.add_argument("--test_fraction", type=float, default=0.15)
+	parser.add_argument(
+		"--cross_validation",
+		type=int,
+		default=1,
+		help="K-fold cross-validation. Use 1 to disable (default). Use >=2 to run k folds.",
+	)
 	parser.add_argument("--max_length", type=int, default=512)
 	parser.add_argument("--batch_size", type=int, default=2)
 	parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
@@ -1345,6 +2192,12 @@ def main() -> int:
 	parser.add_argument("--early_stopping_min_delta", type=float, default=0.0, help="Minimum validation improvement required to count as an improvement for early stopping.")
 	parser.add_argument("--learning_rate", type=float, default=2e-5)
 	parser.add_argument("--weight_decay", type=float, default=0.05)
+	parser.add_argument(
+		"--label_smoothing",
+		type=float,
+		default=0.0,
+		help="Label smoothing factor for the cross-entropy loss, from 0.0 (disabled) to 1.0.",
+	)
 	parser.add_argument("--warmup_ratio", type=float, default=0.06)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--num_workers", type=int, default=0)
@@ -1388,6 +2241,8 @@ def main() -> int:
 	parser.add_argument("--shuffle_labels", action="store_true", help="Randomly shuffle labels as a control to test for memorization.")
 
 	args = parser.parse_args()
+	if not 0.0 <= args.label_smoothing <= 1.0:
+		parser.error("--label_smoothing must be between 0.0 and 1.0")
 	_require_runtime()
 
 	random.seed(args.seed)
@@ -1400,6 +2255,44 @@ def main() -> int:
 
 	output_dir = Path(args.output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
+
+	if args.load_splits_dir:
+		if args.cross_validation > 1:
+			raise ValueError("--load_splits_dir is incompatible with --cross_validation.")
+
+		splits_dir = Path(args.load_splits_dir)
+		print(f"Loading pre-built split from: {splits_dir}")
+		prebuilt = _load_prebuilt_splits(splits_dir)
+		dataset_path = splits_dir
+
+		combined_records = prebuilt["train"] + prebuilt["val"] + prebuilt["test"]
+		dataset = DirectionJsonlDataset.__new__(DirectionJsonlDataset)
+		dataset.jsonl_path = splits_dir
+		dataset.include_flanks = args.include_flanks
+		dataset.records = combined_records
+		if len(dataset) == 0:
+			raise ValueError("The loaded split is empty.")
+		print(dataset.records[0])
+
+		train_indices = list(range(0, len(prebuilt["train"])))
+		val_indices = list(range(len(prebuilt["train"]), len(prebuilt["train"]) + len(prebuilt["val"])))
+		test_indices = list(range(len(prebuilt["train"]) + len(prebuilt["val"]), len(combined_records)))
+		print(
+			f"[load_splits_dir] sizes: train={len(train_indices)} val={len(val_indices)} test={len(test_indices)}"
+		)
+
+		_run_training_for_splits(
+			args=args,
+			dataset=dataset,
+			dataset_path=dataset_path,
+			output_dir=output_dir,
+			device=device,
+			use_bfloat16=use_bfloat16,
+			train_indices=train_indices,
+			val_indices=val_indices,
+			test_indices=test_indices,
+		)
+		return 0
 
 	dataset_path = _resolve_jsonl_path(args.jsonl)
 	print(f"Loading dataset: {dataset_path}")
@@ -1435,386 +2328,123 @@ def main() -> int:
 
 	
 
-	splits = _build_splits(
+	if args.cross_validation <= 1:
+		splits = _build_splits(
+			dataset.records,
+			seed=args.seed,
+			test_fraction=args.test_fraction,
+			stratify_mode=args.stratify_mode,
+			split_group=args.split_group,
+			split_optimize_trials=args.split_optimize_trials,
+			split_optimize_k=args.split_optimize_k,
+			split_optimize_target=args.split_optimize_target,
+			split_size_aware=args.split_size_aware,
+			split_size_weight=args.split_size_weight,
+			split_by_repeats=args.split_by_repeats,
+		)
+		_run_training_for_splits(
+			args=args,
+			dataset=dataset,
+			dataset_path=dataset_path,
+			output_dir=output_dir,
+			device=device,
+			use_bfloat16=use_bfloat16,
+			train_indices=splits["train"],
+			val_indices=splits["val"],
+			test_indices=splits["test"],
+		)
+		return 0
+
+	if args.cross_validation < 2:
+		raise ValueError("--cross_validation must be >= 2 for cross-validation mode")
+
+	if args.split_optimize_trials > 1:
+		print("[cross_validation] note: --split_optimize_trials is ignored in cross-validation mode.")
+
+	print(f"[cross_validation] running {args.cross_validation}-fold cross-validation")
+	fold_splits = _build_cross_validation_splits(
 		dataset.records,
 		seed=args.seed,
-		test_fraction=args.test_fraction,
+		k_folds=args.cross_validation,
 		stratify_mode=args.stratify_mode,
 		split_group=args.split_group,
-		split_optimize_trials=args.split_optimize_trials,
-		split_optimize_k=args.split_optimize_k,
-		split_optimize_target=args.split_optimize_target,
-		split_size_aware=args.split_size_aware,
-		split_size_weight=args.split_size_weight,
-	)
-	train_indices = _truncate_indices(splits["train"], args.max_train_examples)
-	val_indices = _truncate_indices(splits["val"], args.max_val_examples)
-	test_indices = _truncate_indices(splits["test"], args.max_test_examples)
-
-	train_examples = [dataset.records[index] for index in train_indices]
-	val_examples = [dataset.records[index] for index in val_indices]
-	test_examples = [dataset.records[index] for index in test_indices]
-
-	manifest_path = _write_split_artifacts(
-		output_dir=output_dir,
-		dataset_path=dataset_path,
-		seed=args.seed,
-		chunk_size=args.split_group_chunk_size,
-		examples=dataset.records,
-		train_examples=train_examples,
-		val_examples=val_examples,
-		test_examples=test_examples,
-		train_indices=train_indices,
-		val_indices=val_indices,
-		test_indices=test_indices,
-	)
-	print(f"Saved split artifacts to {manifest_path.parent}")
-
-	similarity_report = _build_split_similarity_report(
-		dataset_path=dataset_path,
-		seed=args.seed,
-		train_examples=train_examples,
-		val_examples=val_examples,
-		test_examples=test_examples,
-	)
-	_save_similarity_report(output_dir, similarity_report)
-
-	print("Split summary:")
-	_print_split_summary("train", train_examples)
-	_print_split_summary("val", val_examples)
-	_print_split_summary("test", test_examples)
-	_print_split_group_names("train", dataset.records, train_indices)
-	_print_split_group_names("val", dataset.records, val_indices)
-	_print_split_group_names("test", dataset.records, test_indices)
-	_print_group_overlap_report(
-		dataset.records,
-		{"train": train_indices, "val": val_indices, "test": test_indices},
+		size_aware=args.split_size_aware,
 	)
 
-	augment_spacer_deletion_count = max(0, int(args.augment_spacer_deletion_count))
-	if args.augment_spacer_deletion:
-		if augment_spacer_deletion_count <= 0:
-			print("Spacer deletion augmentation requested, but the augmentation count is <= 0; skipping.")
-		else:
-			test_signatures = None
-			test_signatures_by_idx = None
-			test_token_sets = None
-			inverted_index = None
-			if test_indices:
-				test_signatures = {example_signature(dataset.records[index]) for index in test_indices}
-				test_signatures_by_idx = {
-					index: example_signature(dataset.records[index])
-					for index in test_indices
-				}
-				test_token_sets, inverted_index = build_test_similarity_index(
-					dataset.records,
-					list(test_indices),
-				)
-			else:
-				print("Spacer deletion augmentation requested, but no test split is present; similarity filtering will be skipped.")
-
-			seen_signatures = {example_signature(example) for example in dataset.records}
-			train_new_indices, train_aug_stats = materialize_subarray_augmentations(
-				base_dataset=dataset,
-				source_indices=list(train_indices),
-				seen_signatures=seen_signatures,
-				test_signatures=test_signatures,
-				test_signatures_by_idx=test_signatures_by_idx,
-				test_token_sets=test_token_sets,
-				inverted_index=inverted_index,
-				seed=args.seed,
-				mode="enumerate",
-				prob=1.0,
-				min_spacers=2,
-				max_per_array=augment_spacer_deletion_count,
-				split_name="train",
-				use_diversity=True,
-				similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
-				min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
-				target_additions=augment_spacer_deletion_count * len(train_indices),
-				balance_per_array=True,
-			)
-			train_indices = list(train_indices) + train_new_indices
-			train_examples = [dataset.records[index] for index in train_indices]
-			print(
-				"Spacer deletion augmentation summary: "
-				f"requested={augment_spacer_deletion_count} per array added={train_aug_stats['added']} "
-				f"blocked_overlap={train_aug_stats['blocked_overlap']} "
-				f"blocked_similarity={train_aug_stats['blocked_similarity']} "
-				f"skipped_short={train_aug_stats['skipped_short']}"
-			)
-
-	# Augment validation set with same augmentation count
-	if args.augment_spacer_deletion and augment_spacer_deletion_count > 0 and val_indices:
-		seen_signatures = {example_signature(example) for example in dataset.records}
-		val_new_indices, val_aug_stats = materialize_subarray_augmentations(
-			base_dataset=dataset,
-			source_indices=list(val_indices),
-			seen_signatures=seen_signatures,
-			test_signatures=test_signatures,
-			test_signatures_by_idx=test_signatures_by_idx,
-			test_token_sets=test_token_sets,
-			inverted_index=inverted_index,
-			seed=args.seed,
-			mode="enumerate",
-			prob=1.0,
-			min_spacers=2,
-			max_per_array=augment_spacer_deletion_count,
-			split_name="val",
-			use_diversity=True,
-			similarity_metric=AUGMENT_SPACER_DELETION_SIMILARITY_METRIC,
-			min_distance=AUGMENT_SPACER_DELETION_MIN_DISTANCE,
-			target_additions=augment_spacer_deletion_count * len(val_indices),
-			balance_per_array=True,
+	fold_results: list[dict[str, Any]] = []
+	for fold_index, splits in enumerate(fold_splits, start=1):
+		fold_output_dir = output_dir / f"fold_{fold_index:02d}"
+		fold_output_dir.mkdir(parents=True, exist_ok=True)
+		print(f"\n[cross_validation] fold {fold_index}/{args.cross_validation} -> {fold_output_dir}")
+		result = _run_training_for_splits(
+			args=args,
+			dataset=dataset,
+			dataset_path=dataset_path,
+			output_dir=fold_output_dir,
+			device=device,
+			use_bfloat16=use_bfloat16,
+			train_indices=splits["train"],
+			val_indices=splits["val"],
+			test_indices=splits["test"],
 		)
-		val_indices = list(val_indices) + val_new_indices
-		val_examples = [dataset.records[index] for index in val_indices]
-		print(
-			"Spacer deletion augmentation (validation) summary: "
-			f"requested={augment_spacer_deletion_count} per array added={val_aug_stats['added']} "
-			f"blocked_overlap={val_aug_stats['blocked_overlap']} "
-			f"blocked_similarity={val_aug_stats['blocked_similarity']} "
-			f"skipped_short={val_aug_stats['skipped_short']}"
-		)
-
-	tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-	if tokenizer.pad_token is None:
-		if tokenizer.eos_token is not None:
-			tokenizer.pad_token = tokenizer.eos_token
-		elif tokenizer.unk_token is not None:
-			tokenizer.pad_token = tokenizer.unk_token
-		else:
-			raise ValueError("Carbon tokenizer does not define a pad, eos, or unk token.")
-	tokenizer.padding_side = "right"
-
-	model_kwargs: dict[str, Any] = {
-		"num_labels": 2,
-		"id2label": {0: "Reverse", 1: "Forward"},
-		"label2id": {"Reverse": 0, "Forward": 1},
-		"trust_remote_code": True,
-		"ignore_mismatched_sizes": True,
-	}
-	if args.load_in_4bit and args.load_in_8bit:
-		raise ValueError("Choose only one of --load_in_4bit or --load_in_8bit.")
-	if args.load_in_4bit:
-		model_kwargs["load_in_4bit"] = True
-	if args.load_in_8bit:
-		model_kwargs["load_in_8bit"] = True
-	if use_bfloat16:
-		model_kwargs["dtype"] = torch.bfloat16
-
-	model = AutoModelForSequenceClassification.from_pretrained(args.model_id, **model_kwargs)
-	model.config.pad_token_id = tokenizer.pad_token_id
-	if hasattr(model.config, "use_cache"):
-		model.config.use_cache = False
-	if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-		model.gradient_checkpointing_enable()
-	if args.freeze_backbone or args.lora_only_train:
-		_freeze_backbone(model)
-	if args.use_lora:
-		model = _apply_lora(
-			model,
-			task_type=args.lora_task_type,
-			preset=args.lora_preset,
-			explicit_modules=args.lora_target_modules,
-			r=args.lora_r,
-			alpha=args.lora_alpha,
-			dropout=args.lora_dropout,
-			bias=args.lora_bias,
-			use_kbit_training=args.lora_kbit_training,
-		)
-		if args.lora_only_train:
-			for name, parameter in model.named_parameters():
-				if "lora_" not in name and "classifier" not in name and "score" not in name:
-					parameter.requires_grad = False
-
-	model.to(device)
-
-	# output params to see if lora is working
-	total = sum(p.numel() for p in model.parameters())
-	trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-	print(f"Trainable params: {trainable:,}")
-	print(f"Total params: {total:,}")
-	print(f"Trainable %: {100*trainable/total:.4f}%")
-
-	train_dataset = CarbonDirectionDataset(
-		train_examples,
-		tokenizer=tokenizer,
-		max_length=args.max_length,
-		include_flanks=args.include_flanks,
-		sequence_mode=args.sequence_mode,
-	)
-	val_dataset = CarbonDirectionDataset(
-		val_examples,
-		tokenizer=tokenizer,
-		max_length=args.max_length,
-		include_flanks=args.include_flanks,
-		sequence_mode=args.sequence_mode,
-	)
-	test_dataset = CarbonDirectionDataset(
-		test_examples,
-		tokenizer=tokenizer,
-		max_length=args.max_length,
-		include_flanks=args.include_flanks,
-		sequence_mode=args.sequence_mode,
-	)
-
-	collator = CarbonBatchCollator(tokenizer)
-	train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collator)
-	val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collator)
-	test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collator)
-
-	train_labels = [example.label for example in train_examples]
-	class_weights = _build_label_weights(train_labels).to(device)
-	loss_fn = nn.CrossEntropyLoss(weight=class_weights)
-
-	trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-	if not trainable_parameters:
-		raise ValueError("No trainable parameters remain after applying the current fine-tuning settings.")
-
-	optimizer = torch.optim.AdamW(trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
-	total_steps = max(1, math.ceil(len(train_loader) / max(1, args.gradient_accumulation_steps)) * args.epochs)
-	warmup_steps = max(0, round(total_steps * args.warmup_ratio))
-	scheduler = None
-	if get_linear_schedule_with_warmup is not None:
-		scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-
-	print(f"Training Carbon-500M from {args.model_id}")
-	print(f"Device: {device} | bf16={use_bfloat16} | max_length={args.max_length} | batch_size={args.batch_size}")
-	print(f"LoRA: enabled={args.use_lora} | r={args.lora_r} | alpha={args.lora_alpha} | dropout={args.lora_dropout} | preset={args.lora_preset} | target_modules={args.lora_target_modules or 'preset'}")
-	if device.type == "cuda":
-		hint = _cuda_memory_hint(device)
-		if hint:
-			print(hint)
-	print(f"Class weights: {[float(x) for x in class_weights.detach().cpu().tolist()]}")
-
-	if args.dry_run:
-		try:
-			sample_batch = next(iter(train_loader))
-			sample_batch = _batch_to_device(sample_batch, device)
-			autocast_context = torch.autocast("cuda", dtype=torch.bfloat16) if use_bfloat16 else nullcontext()
-			with torch.no_grad(), autocast_context:
-				outputs = model(input_ids=sample_batch.get("input_ids"), attention_mask=sample_batch.get("attention_mask"))
-			print(f"Dry run logits shape: {tuple(outputs.logits.shape)}")
-			return 0
-		except torch.cuda.OutOfMemoryError as exc:
-			raise RuntimeError(
-				"Carbon dry_run ran out of CUDA memory. Try one of: --cpu, --max_length 256, --batch_size 1, "
-				"--freeze_backbone, or free GPU memory before rerunning."
-			) from exc
-
-	best_val_metric = float("-inf")
-	best_val_metrics: dict[str, float] | None = None
-	best_epoch = 0
-	early_stopping_patience = max(0, int(args.early_stopping_patience))
-	early_stopping_min_delta = float(args.early_stopping_min_delta)
-	patience_counter = 0
-	autocast_context = torch.autocast("cuda", dtype=torch.bfloat16) if use_bfloat16 else nullcontext()
-
-	for epoch in range(1, args.epochs + 1):
-		model.train()
-		optimizer.zero_grad(set_to_none=True)
-		running_loss = 0.0
-		batches_seen = 0
-		epoch_start = time.time()
-
-		try:
-			for step, batch in enumerate(train_loader, start=1):
-				batch = _batch_to_device(batch, device)
-				with autocast_context:
-					outputs = model(input_ids=batch.get("input_ids"), attention_mask=batch.get("attention_mask"))
-					loss = loss_fn(outputs.logits, batch["labels"]) / max(1, args.gradient_accumulation_steps)
-
-				loss.backward()
-				running_loss += float(loss.item()) * max(1, args.gradient_accumulation_steps)
-				batches_seen += 1
-
-				if step % args.gradient_accumulation_steps == 0 or step == len(train_loader):
-					torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=1.0)
-					optimizer.step()
-					if scheduler is not None:
-						scheduler.step()
-					optimizer.zero_grad(set_to_none=True)
-		except torch.cuda.OutOfMemoryError as exc:
-			raise RuntimeError(
-				"Carbon training ran out of CUDA memory. Try --max_length 256, --batch_size 1, --freeze_backbone, "
-				"or --cpu. If other GPU jobs are running, free memory and rerun."
-			) from exc
-
-		train_loss = _safe_divide(running_loss, batches_seen)
-		val_metrics = _evaluate_model(model, val_loader, device, loss_fn, use_bfloat16)
-		current_metric = val_metrics["mcc"]
-		if math.isnan(current_metric):
-			current_metric = val_metrics["f1"]
-		
-		epoch_end = time.time()
-		epoch_duration = epoch_end - epoch_start
-		epoch_duration_minutes = int(epoch_duration // 60)
-		epoch_duration_seconds = int(epoch_duration % 60)
-
-		print(f"Epoch {epoch:02d} | time={epoch_duration_minutes:.2f}min:{epoch_duration_seconds:.2f}s | train_loss={train_loss:.4f} | val={_format_metrics(val_metrics)}")
-
-		if current_metric > best_val_metric + early_stopping_min_delta:
-			best_val_metric = current_metric
-			best_val_metrics = dict(val_metrics)
-			best_epoch = epoch
-			model.save_pretrained(output_dir)
-			tokenizer.save_pretrained(output_dir)
-			with (output_dir / "best_metrics.json").open("w") as fh:
-				json.dump(
-					{
-						"epoch": epoch,
-						"metric_name": "mcc",
-						"metric_value": current_metric,
-						"metrics": best_val_metrics,
-						"args": vars(args),
-					},
-					fh,
-					indent=2,
-					sort_keys=True,
-				)
-			patience_counter = 0
-		else:
-			patience_counter += 1
-			if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
-				print(
-					f"Early stopping triggered after epoch {epoch}: validation metric {current_metric:.6f} did not improve by at least {early_stopping_min_delta:.6f} for {early_stopping_patience} consecutive epochs."
-				)
-				break
-
-	if best_val_metrics is None:
-		best_val_metrics = _evaluate_model(model, val_loader, device, loss_fn, use_bfloat16)
-
-	test_metrics, test_labels, test_predictions = _evaluate_model_with_outputs(
-		model,
-		test_loader,
-		device,
-		loss_fn,
-		use_bfloat16,
-	)
-	test_subtype_accuracy = _build_subtype_accuracy_report(test_examples, test_labels, test_predictions)
-	print(f"Best epoch: {best_epoch} | best_val={_format_metrics(best_val_metrics)}")
-	print(f"Test: {_format_metrics(test_metrics)}")
-	_print_subtype_accuracy_report("Test subtype accuracy:", test_subtype_accuracy)
-
-	with (output_dir / "training_summary.json").open("w") as fh:
-		json.dump(
+		fold_results.append(
 			{
-				"args": vars(args),
-				"best_epoch": best_epoch,
-				"best_validation": best_val_metrics,
-				"test": test_metrics,
-				"test_subtype_accuracy": test_subtype_accuracy,
-				"train_examples": len(train_examples),
-				"val_examples": len(val_examples),
-				"test_examples": len(test_examples),
-			},
-			fh,
-			indent=2,
-			sort_keys=True,
+				"fold": fold_index,
+				"output_dir": str(fold_output_dir),
+				"train_indices": len(splits["train"]),
+				"val_indices": len(splits["val"]),
+				"test_indices": len(splits["test"]),
+				"best_epoch": result["best_epoch"],
+				"best_validation": result["best_validation"],
+				"test": result["test"],
+				"test_subtype_accuracy": result["test_subtype_accuracy"],
+			}
 		)
 
+	metric_keys = ["accuracy", "precision", "recall", "f1", "mcc", "auroc", "loss"]
+	aggregates: dict[str, dict[str, float]] = {}
+	for key in metric_keys:
+		values = [float(row["test"].get(key, float("nan"))) for row in fold_results]
+		valid_values = [value for value in values if not math.isnan(value)]
+		if valid_values:
+			aggregates[key] = {
+				"mean": float(np.mean(valid_values)),
+				"std": float(np.std(valid_values)),
+				"min": float(np.min(valid_values)),
+				"max": float(np.max(valid_values)),
+				"n": float(len(valid_values)),
+			}
+		else:
+			aggregates[key] = {
+				"mean": float("nan"),
+				"std": float("nan"),
+				"min": float("nan"),
+				"max": float("nan"),
+				"n": 0.0,
+			}
+
+	cv_summary = {
+		"args": vars(args),
+		"cross_validation_folds": args.cross_validation,
+		"fold_results": fold_results,
+		"test_metric_aggregates": aggregates,
+	}
+
+	with (output_dir / "cross_validation_summary.json").open("w") as fh:
+		json.dump(cv_summary, fh, indent=2, sort_keys=True)
+
+	print("\n[cross_validation] aggregate test metrics")
+	for key in metric_keys:
+		stats = aggregates[key]
+		if math.isnan(stats["mean"]):
+			print(f"  {key}: n/a")
+		else:
+			print(
+				f"  {key}: mean={stats['mean']:.4f} std={stats['std']:.4f} "
+				f"min={stats['min']:.4f} max={stats['max']:.4f}"
+			)
+
+	print(f"[cross_validation] wrote summary to {output_dir / 'cross_validation_summary.json'}")
 	return 0
 
 
